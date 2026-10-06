@@ -1,8 +1,16 @@
 [package]
 name = "hip-sys"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 description = "Raw FFI bindings to AMD HIP runtime, rocBLAS, and hipRAND"
 license = "MIT OR Apache-2.0"
+build = "build.rs"
 
-[build-dependencies]
+[features]
+default = []
+hiprand = []
+
+[[test]]
+name = "hiprand_test"
+path = "tests/hiprand_test.rs"
+required-features = ["hiprand"]

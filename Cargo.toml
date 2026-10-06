@@ -1,3 +1,3 @@
 [workspace]
-members = ["hip-sys", "hip-runtime", "candle-core", "candle-backend"]
+members = ["hip-sys", "hip-runtime", "candle-core", "candle-nn", "candle-backend"]
 resolver = "2"

@@ -44,7 +44,7 @@
 //! - [candle-examples](https://docs.rs/candle-examples/). Examples of Candle in Use.
 //! - [candle-onnx](https://docs.rs/candle-onnx/). Loading and using ONNX models.
 //! - [candle-pyo3](https://docs.rs/candle-pyo3/). Access to Candle from Python.
-//! - [candle-transformers](https://docs.rs/candle-transformers/). Candle implemntation of many published transformer models.
+//! - [candle-transformers](https://docs.rs/candle-transformers/). Candle implementation of many published transformer models.
 //!
 
 #[cfg(feature = "accelerate")]
@@ -62,22 +62,32 @@ mod device;
 pub mod display;
 mod dtype;
 pub mod dummy_cuda_backend;
+pub mod dummy_dtype;
 mod dummy_metal_backend;
 #[cfg(not(feature = "rocm"))]
-mod dummy_rocm_backend;
+pub mod dummy_rocm_backend;
+#[cfg(feature = "opencl")]
+pub mod opencl_backend;
+#[cfg(not(feature = "opencl"))]
+pub mod dummy_opencl_backend;
+#[cfg(feature = "vulkan")]
+pub mod vulkan_backend;
+#[cfg(not(feature = "vulkan"))]
+pub mod dummy_vulkan_backend;
 pub mod error;
 mod indexer;
 pub mod layout;
 #[cfg(feature = "metal")]
 pub mod metal_backend;
-#[cfg(feature = "rocm")]
-pub mod rocm_backend;
 #[cfg(feature = "mkl")]
 mod mkl;
+pub mod nditer;
 pub mod npy;
 pub mod op;
 pub mod pickle;
 pub mod quantized;
+#[cfg(feature = "rocm")]
+pub mod rocm_backend;
 pub mod safetensors;
 pub mod scalar;
 pub mod shape;
@@ -95,12 +105,16 @@ mod variable;
 pub use cuda_backend::cudnn;
 
 pub use cpu_backend::{CpuStorage, CpuStorageRef};
-pub use custom_op::{CustomOp1, CustomOp2, CustomOp3, InplaceOp1, InplaceOp2, InplaceOp3, UgIOp1};
+#[cfg(feature = "ug")]
+pub use custom_op::UgIOp1;
+pub use custom_op::{CustomOp1, CustomOp2, CustomOp3, InplaceOp1, InplaceOp2, InplaceOp3};
 pub use device::{Device, DeviceLocation, NdArray};
 pub use dtype::{DType, DTypeParseError, FloatDType, IntDType, WithDType};
+pub use dummy_dtype::{F4, F6E2M3, F6E3M2, F8E8M0};
 pub use error::{Context, Error, Result};
 pub use indexer::{IndexOp, TensorIndexer};
 pub use layout::Layout;
+pub use nditer::NdIter;
 pub use shape::{Shape, D};
 pub use storage::Storage;
 pub use streaming::{StreamTensor, StreamingBinOp, StreamingModule};
@@ -119,14 +133,28 @@ pub use cuda::{CudaDevice, CudaStorage};
 #[cfg(feature = "metal")]
 pub use metal_backend::{MetalDevice, MetalError, MetalStorage};
 
+#[cfg(feature = "rocm")]
+pub use rocm_backend as rocm;
+
+#[cfg(not(feature = "rocm"))]
+pub use dummy_rocm_backend as rocm;
+
+pub use rocm::{RocmDevice, RocmStorage};
+
 #[cfg(not(feature = "metal"))]
 pub use dummy_metal_backend::{MetalDevice, MetalError, MetalStorage};
 
-#[cfg(feature = "rocm")]
-pub use rocm_backend::{RocmDevice, RocmStorage};
+#[cfg(feature = "opencl")]
+pub use opencl_backend::{OpenClDevice, OpenClStorage};
 
-#[cfg(not(feature = "rocm"))]
-pub use dummy_rocm_backend::{RocmDevice, RocmStorage};
+#[cfg(not(feature = "opencl"))]
+pub use dummy_opencl_backend::{OpenClDevice, OpenClStorage};
+
+#[cfg(feature = "vulkan")]
+pub use vulkan_backend::{VulkanDevice, VulkanStorage};
+
+#[cfg(not(feature = "vulkan"))]
+pub use dummy_vulkan_backend::{VulkanDevice, VulkanStorage};
 
 #[cfg(feature = "mkl")]
 extern crate intel_mkl_src;
