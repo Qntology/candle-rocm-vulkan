@@ -21,7 +21,32 @@ macro_rules! test_device {
         fn $test_metal() -> Result<()> {
             $fn_name(&Device::new_metal(0)?)
         }
+
+        #[cfg(any(feature = "rocm", feature = "vulkan"))]
+        mod $test_cuda {
+            #[allow(unused_imports)]
+            use super::*;
+            #[cfg(feature = "rocm")]
+            #[test]
+            fn rocm() -> Result<()> {
+                super::$fn_name(&Device::new_rocm(0)?)
+            }
+            #[cfg(feature = "vulkan")]
+            #[test]
+            fn vulkan() -> Result<()> {
+                super::$fn_name(&Device::new_vulkan(0)?)
+            }
+        }
     };
+}
+
+pub fn assert_tensor_eq(t1: &Tensor, t2: &Tensor) -> Result<()> {
+    assert_eq!(t1.shape(), t2.shape());
+    // Default U8 may not be large enough to hold the sum (`t.sum_all` defaults to the dtype of `t`)
+    let eq_tensor = t1.eq(t2)?.to_dtype(crate::DType::U32)?;
+    let all_equal = eq_tensor.sum_all()?;
+    assert_eq!(all_equal.to_scalar::<u32>()?, eq_tensor.elem_count() as u32);
+    Ok(())
 }
 
 pub fn to_vec0_round(t: &Tensor, digits: i32) -> Result<f32> {

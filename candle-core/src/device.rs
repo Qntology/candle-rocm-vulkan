@@ -10,15 +10,19 @@ pub enum DeviceLocation {
     Cuda { gpu_id: usize },
     Metal { gpu_id: usize },
     Rocm { gpu_id: usize },
+    OpenCl { gpu_id: usize },
+    Vulkan { gpu_id: usize },
 }
 
-/// Cpu, Cuda, Metal, or Rocm
+/// Cpu, Cuda, Metal, Rocm, OpenCL, or Vulkan
 #[derive(Debug, Clone)]
 pub enum Device {
     Cpu,
     Cuda(crate::CudaDevice),
     Metal(crate::MetalDevice),
     Rocm(crate::RocmDevice),
+    OpenCl(crate::OpenClDevice),
+    Vulkan(crate::VulkanDevice),
 }
 
 pub trait NdArray {
@@ -105,7 +109,63 @@ impl<S: WithDType, const N1: usize, const N2: usize, const N3: usize, const N4: 
     }
 }
 
-impl<S: NdArray> NdArray for Vec<S> {
+impl<S: WithDType> NdArray for Vec<S> {
+    fn shape(&self) -> Result<Shape> {
+        Ok(Shape::from(self.len()))
+    }
+
+    fn to_cpu_storage(&self) -> CpuStorage {
+        S::to_cpu_storage(self.as_slice())
+    }
+}
+
+impl<S: WithDType> NdArray for Vec<&[S]> {
+    fn shape(&self) -> Result<Shape> {
+        if self.is_empty() {
+            crate::bail!("empty array")
+        }
+        let n = self.len();
+        let m = self[0].len();
+        for v in self.iter() {
+            if v.len() != m {
+                crate::bail!("two elements have different len {m} {}", v.len())
+            }
+        }
+        Ok(Shape::from((n, m)))
+    }
+
+    fn to_cpu_storage(&self) -> CpuStorage {
+        let data = self.iter().copied().flatten().copied().collect::<Vec<_>>();
+        S::to_cpu_storage_owned(data)
+    }
+}
+
+impl<S: WithDType> NdArray for Vec<Vec<S>> {
+    fn shape(&self) -> Result<Shape> {
+        if self.is_empty() {
+            crate::bail!("empty array")
+        }
+        let n = self.len();
+        let m = self[0].len();
+        for v in self.iter() {
+            if v.len() != m {
+                crate::bail!("two elements have different len {m} {}", v.len())
+            }
+        }
+        Ok(Shape::from((n, m)))
+    }
+
+    fn to_cpu_storage(&self) -> CpuStorage {
+        let len: usize = self.iter().map(|v| v.len()).sum();
+        let mut dst = Vec::with_capacity(len);
+        for v in self.iter() {
+            dst.extend(v.iter().copied());
+        }
+        S::to_cpu_storage_owned(dst)
+    }
+}
+
+impl<S: WithDType> NdArray for Vec<Vec<Vec<S>>> {
     fn shape(&self) -> Result<Shape> {
         if self.is_empty() {
             crate::bail!("empty array")
@@ -122,9 +182,57 @@ impl<S: NdArray> NdArray for Vec<S> {
     }
 
     fn to_cpu_storage(&self) -> CpuStorage {
-        // This allocates intermediary memory and shouldn't be necessary.
-        let storages = self.iter().map(|v| v.to_cpu_storage()).collect::<Vec<_>>();
-        CpuStorage::concat(storages.as_slice()).unwrap()
+        if self.is_empty() {
+            return S::to_cpu_storage_owned(vec![]);
+        }
+        let len: usize = self
+            .iter()
+            .map(|v| v.iter().map(|v| v.len()).sum::<usize>())
+            .sum();
+        let mut dst = Vec::with_capacity(len);
+        for v1 in self.iter() {
+            for v2 in v1.iter() {
+                dst.extend(v2.iter().copied());
+            }
+        }
+        S::to_cpu_storage_owned(dst)
+    }
+}
+
+impl<S: WithDType> NdArray for Vec<Vec<Vec<Vec<S>>>> {
+    fn shape(&self) -> Result<Shape> {
+        if self.is_empty() {
+            crate::bail!("empty array")
+        }
+        let shape0 = self[0].shape()?;
+        let n = self.len();
+        for v in self.iter() {
+            let shape = v.shape()?;
+            if shape != shape0 {
+                crate::bail!("two elements have different shapes {shape:?} {shape0:?}")
+            }
+        }
+        Ok(Shape::from([[n].as_slice(), shape0.dims()].concat()))
+    }
+
+    fn to_cpu_storage(&self) -> CpuStorage {
+        let len: usize = self
+            .iter()
+            .map(|v| {
+                v.iter()
+                    .map(|v| v.iter().map(|v| v.len()).sum::<usize>())
+                    .sum::<usize>()
+            })
+            .sum();
+        let mut dst = Vec::with_capacity(len);
+        for v1 in self.iter() {
+            for v2 in v1.iter() {
+                for v3 in v2.iter() {
+                    dst.extend(v3.iter().copied());
+                }
+            }
+        }
+        S::to_cpu_storage_owned(dst)
     }
 }
 
@@ -133,28 +241,78 @@ impl Device {
         Ok(Self::Cuda(crate::CudaDevice::new(ordinal)?))
     }
 
-    pub fn new_rocm(ordinal: usize) -> Result<Self> {
-        Ok(Self::Rocm(crate::RocmDevice::new(ordinal)?))
+    pub fn new_opencl(ordinal: usize) -> Result<Self> {
+        Ok(Self::OpenCl(crate::OpenClDevice::new(ordinal)?))
+    }
+
+    pub fn new_vulkan(ordinal: usize) -> Result<Self> {
+        Ok(Self::Vulkan(crate::VulkanDevice::new(ordinal)?))
     }
 
     pub fn as_cuda_device(&self) -> Result<&crate::CudaDevice> {
         match self {
             Self::Cuda(d) => Ok(d),
-            _ => crate::bail!("expected a cuda device, got {:?}", self.location()),
+            Self::Cpu => crate::bail!("expected a cuda device, got cpu"),
+            Self::Metal(_) => crate::bail!("expected a cuda device, got Metal"),
+            Self::Rocm(_) => crate::bail!("expected a cuda device, got rocm"),
+            Self::OpenCl(_) => crate::bail!("expected a cuda device, got OpenCl"),
+            Self::Vulkan(_) => crate::bail!("expected a cuda device, got Vulkan"),
+        }
+    }
+
+    pub fn as_opencl_device(&self) -> Result<&crate::OpenClDevice> {
+        match self {
+            Self::OpenCl(d) => Ok(d),
+            Self::Cpu => crate::bail!("expected an opencl device, got cpu"),
+            Self::Cuda(_) => crate::bail!("expected an opencl device, got cuda"),
+            Self::Metal(_) => crate::bail!("expected an opencl device, got Metal"),
+            Self::Rocm(_) => crate::bail!("expected an opencl device, got rocm"),
+            Self::Vulkan(_) => crate::bail!("expected an opencl device, got Vulkan"),
+        }
+    }
+
+    pub fn as_vulkan_device(&self) -> Result<&crate::VulkanDevice> {
+        match self {
+            Self::Vulkan(d) => Ok(d),
+            Self::Cpu => crate::bail!("expected a vulkan device, got cpu"),
+            Self::Cuda(_) => crate::bail!("expected a vulkan device, got cuda"),
+            Self::Metal(_) => crate::bail!("expected a vulkan device, got Metal"),
+            Self::Rocm(_) => crate::bail!("expected a vulkan device, got rocm"),
+            Self::OpenCl(_) => crate::bail!("expected a vulkan device, got OpenCl"),
         }
     }
 
     pub fn as_metal_device(&self) -> Result<&crate::MetalDevice> {
         match self {
+            Self::Cuda(_) => crate::bail!("expected a metal device, got cuda"),
+            Self::Cpu => crate::bail!("expected a metal device, got cpu"),
             Self::Metal(d) => Ok(d),
-            _ => crate::bail!("expected a metal device, got {:?}", self.location()),
+            Self::Rocm(_) => crate::bail!("expected a metal device, got rocm"),
+            Self::OpenCl(_) => crate::bail!("expected a metal device, got OpenCl"),
+            Self::Vulkan(_) => crate::bail!("expected a metal device, got Vulkan"),
         }
+    }
+
+    pub fn new_rocm(ordinal: usize) -> Result<Self> {
+        Ok(Self::Rocm(crate::RocmDevice::new(ordinal)?))
     }
 
     pub fn as_rocm_device(&self) -> Result<&crate::RocmDevice> {
         match self {
             Self::Rocm(d) => Ok(d),
-            _ => crate::bail!("expected a rocm device, got {:?}", self.location()),
+            Self::Cpu => crate::bail!("expected a rocm device, got cpu"),
+            Self::Cuda(_) => crate::bail!("expected a rocm device, got cuda"),
+            Self::Metal(_) => crate::bail!("expected a rocm device, got metal"),
+            Self::OpenCl(_) => crate::bail!("expected a rocm device, got opencl"),
+            Self::Vulkan(_) => crate::bail!("expected a rocm device, got vulkan"),
+        }
+    }
+
+    pub fn rocm_if_available(ordinal: usize) -> Result<Self> {
+        if crate::utils::rocm_is_available() && crate::rocm::device_count() > ordinal {
+            Self::new_rocm(ordinal)
+        } else {
+            Ok(Self::Cpu)
         }
     }
 
@@ -166,12 +324,41 @@ impl Device {
         Ok(Self::Metal(crate::MetalDevice::new(ordinal)?))
     }
 
+    /// Run `f` with device specific context.
+    ///
+    /// On CPU this installs candle's private rayon thread pool for the
+    /// duration of `f`, keeping worker threads warm across the many short
+    /// parallel sections in a model forward pass. Currently noop for other backends.
+    pub fn with_context<F, R>(&self, f: F) -> R
+    where
+        F: FnOnce() -> R + Send,
+        R: Send,
+    {
+        match self {
+            Self::Cpu => crate::utils::with_threadpool(f),
+            _ => f(),
+        }
+    }
+
     pub fn set_seed(&self, seed: u64) -> Result<()> {
         match self {
             Self::Cpu => CpuDevice.set_seed(seed),
             Self::Cuda(c) => c.set_seed(seed),
             Self::Metal(m) => m.set_seed(seed),
             Self::Rocm(r) => r.set_seed(seed),
+            Self::OpenCl(o) => o.set_seed(seed),
+            Self::Vulkan(v) => v.set_seed(seed),
+        }
+    }
+
+    pub fn get_current_seed(&self) -> Result<u64> {
+        match self {
+            Self::Cpu => CpuDevice.get_current_seed(),
+            Self::Cuda(c) => c.get_current_seed(),
+            Self::Metal(m) => m.get_current_seed(),
+            Self::Rocm(r) => r.get_current_seed(),
+            Self::OpenCl(o) => o.get_current_seed(),
+            Self::Vulkan(v) => v.get_current_seed(),
         }
     }
 
@@ -181,6 +368,8 @@ impl Device {
             (Self::Cuda(lhs), Self::Cuda(rhs)) => lhs.same_device(rhs),
             (Self::Metal(lhs), Self::Metal(rhs)) => lhs.same_device(rhs),
             (Self::Rocm(lhs), Self::Rocm(rhs)) => lhs.same_device(rhs),
+            (Self::OpenCl(lhs), Self::OpenCl(rhs)) => lhs.same_device(rhs),
+            (Self::Vulkan(lhs), Self::Vulkan(rhs)) => lhs.same_device(rhs),
             _ => false,
         }
     }
@@ -189,8 +378,10 @@ impl Device {
         match self {
             Self::Cpu => DeviceLocation::Cpu,
             Self::Cuda(device) => device.location(),
-            Self::Metal(device) => device.location(),
-            Self::Rocm(device) => device.location(),
+            Device::Metal(device) => device.location(),
+            Device::Rocm(device) => device.location(),
+            Device::OpenCl(device) => device.location(),
+            Device::Vulkan(device) => device.location(),
         }
     }
 
@@ -210,10 +401,20 @@ impl Device {
         matches!(self, Self::Rocm(_))
     }
 
+    pub fn is_opencl(&self) -> bool {
+        matches!(self, Self::OpenCl(_))
+    }
+
+    pub fn is_vulkan(&self) -> bool {
+        matches!(self, Self::Vulkan(_))
+    }
+
     pub fn supports_bf16(&self) -> bool {
         match self {
-            Self::Cuda(_) | Self::Metal(_) => true,
-            Self::Cpu | Self::Rocm(_) => false,
+            Self::Cuda(_) | Self::Metal(_) | Self::Rocm(_) => true,
+            Self::Cpu => false,
+            Self::OpenCl(_) => false,
+            Self::Vulkan(_) => false,
         }
     }
 
@@ -229,6 +430,37 @@ impl Device {
     pub fn cuda_if_available(ordinal: usize) -> Result<Self> {
         if crate::utils::cuda_is_available() {
             Self::new_cuda(ordinal)
+        } else {
+            Ok(Self::Cpu)
+        }
+    }
+
+    pub fn metal_if_available(ordinal: usize) -> Result<Self> {
+        if crate::utils::metal_is_available() {
+            Self::new_metal(ordinal)
+        } else {
+            Ok(Self::Cpu)
+        }
+    }
+
+    pub fn opencl_if_available(ordinal: usize) -> Result<Self> {
+        if crate::utils::opencl_is_available() {
+            Self::new_opencl(ordinal)
+        } else {
+            Ok(Self::Cpu)
+        }
+    }
+
+    pub fn vulkan_if_available(ordinal: usize) -> Result<Self> {
+        if crate::utils::vulkan_is_available() {
+            match Self::new_vulkan(ordinal) {
+                Ok(d) => Ok(d),
+                Err(_) => {
+                    // No usable Vulkan loader/ICD/hardware at runtime: fall back
+                    // to CPU rather than failing the caller.
+                    Ok(Self::Cpu)
+                }
+            }
         } else {
             Ok(Self::Cpu)
         }
@@ -263,6 +495,14 @@ impl Device {
             Device::Rocm(device) => {
                 let storage = device.rand_uniform(shape, dtype, lo, up)?;
                 Ok(Storage::Rocm(storage))
+            }
+            Device::OpenCl(device) => {
+                let storage = device.rand_uniform(shape, dtype, lo, up)?;
+                Ok(Storage::OpenCl(storage))
+            }
+            Device::Vulkan(device) => {
+                let storage = device.rand_uniform(shape, dtype, lo, up)?;
+                Ok(Storage::Vulkan(storage))
             }
         }
     }
@@ -306,6 +546,14 @@ impl Device {
                 let storage = device.rand_normal(shape, dtype, mean, std)?;
                 Ok(Storage::Rocm(storage))
             }
+            Device::OpenCl(device) => {
+                let storage = device.rand_normal(shape, dtype, mean, std)?;
+                Ok(Storage::OpenCl(storage))
+            }
+            Device::Vulkan(device) => {
+                let storage = device.rand_normal(shape, dtype, mean, std)?;
+                Ok(Storage::Vulkan(storage))
+            }
         }
     }
 
@@ -316,27 +564,6 @@ impl Device {
         shape: &Shape,
     ) -> Result<Storage> {
         self.rand_normal_f64(mean.to_f64(), std.to_f64(), shape, T::DTYPE)
-    }
-
-    pub(crate) fn ones(&self, shape: &Shape, dtype: DType) -> Result<Storage> {
-        match self {
-            Device::Cpu => {
-                let storage = CpuDevice.ones_impl(shape, dtype)?;
-                Ok(Storage::Cpu(storage))
-            }
-            Device::Cuda(device) => {
-                let storage = device.ones_impl(shape, dtype)?;
-                Ok(Storage::Cuda(storage))
-            }
-            Device::Metal(device) => {
-                let storage = device.ones_impl(shape, dtype)?;
-                Ok(Storage::Metal(storage))
-            }
-            Device::Rocm(device) => {
-                let storage = device.ones_impl(shape, dtype)?;
-                Ok(Storage::Rocm(storage))
-            }
-        }
     }
 
     pub(crate) fn zeros(&self, shape: &Shape, dtype: DType) -> Result<Storage> {
@@ -356,6 +583,14 @@ impl Device {
             Device::Rocm(device) => {
                 let storage = device.zeros_impl(shape, dtype)?;
                 Ok(Storage::Rocm(storage))
+            }
+            Device::OpenCl(device) => {
+                let storage = device.zeros_impl(shape, dtype)?;
+                Ok(Storage::OpenCl(storage))
+            }
+            Device::Vulkan(device) => {
+                let storage = device.zeros_impl(shape, dtype)?;
+                Ok(Storage::Vulkan(storage))
             }
         }
     }
@@ -378,6 +613,14 @@ impl Device {
                 let storage = device.alloc_uninit(shape, dtype)?;
                 Ok(Storage::Rocm(storage))
             }
+            Device::OpenCl(device) => {
+                let storage = device.alloc_uninit(shape, dtype)?;
+                Ok(Storage::OpenCl(storage))
+            }
+            Device::Vulkan(device) => {
+                let storage = device.alloc_uninit(shape, dtype)?;
+                Ok(Storage::Vulkan(storage))
+            }
         }
     }
 
@@ -395,6 +638,14 @@ impl Device {
             Device::Rocm(device) => {
                 let storage = device.storage_from_slice(data)?;
                 Ok(Storage::Rocm(storage))
+            }
+            Device::OpenCl(device) => {
+                let storage = device.storage_from_slice(data)?;
+                Ok(Storage::OpenCl(storage))
+            }
+            Device::Vulkan(device) => {
+                let storage = device.storage_from_slice(data)?;
+                Ok(Storage::Vulkan(storage))
             }
         }
     }
@@ -417,6 +668,16 @@ impl Device {
                 let storage = device.storage_from_cpu_storage_owned(storage)?;
                 Ok(Storage::Rocm(storage))
             }
+            Device::OpenCl(device) => {
+                let storage = array.to_cpu_storage();
+                let storage = device.storage_from_cpu_storage_owned(storage)?;
+                Ok(Storage::OpenCl(storage))
+            }
+            Device::Vulkan(device) => {
+                let storage = array.to_cpu_storage();
+                let storage = device.storage_from_cpu_storage_owned(storage)?;
+                Ok(Storage::Vulkan(storage))
+            }
         }
     }
 
@@ -438,6 +699,16 @@ impl Device {
                 let storage = device.storage_from_cpu_storage_owned(storage)?;
                 Ok(Storage::Rocm(storage))
             }
+            Device::OpenCl(device) => {
+                let storage = S::to_cpu_storage_owned(data);
+                let storage = device.storage_from_cpu_storage_owned(storage)?;
+                Ok(Storage::OpenCl(storage))
+            }
+            Device::Vulkan(device) => {
+                let storage = S::to_cpu_storage_owned(data);
+                let storage = device.storage_from_cpu_storage_owned(storage)?;
+                Ok(Storage::Vulkan(storage))
+            }
         }
     }
 
@@ -447,6 +718,8 @@ impl Device {
             Self::Cuda(d) => d.synchronize(),
             Self::Metal(d) => d.synchronize(),
             Self::Rocm(d) => d.synchronize(),
+            Self::OpenCl(d) => d.synchronize(),
+            Self::Vulkan(d) => d.synchronize(),
         }
     }
 }

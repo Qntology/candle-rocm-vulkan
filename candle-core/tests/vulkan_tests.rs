@@ -1,0 +1,1083 @@
+#![cfg(feature = "vulkan")]
+use candle_core::backend::BackendDevice;
+use candle_core::quantized::{gguf_file, GgmlDType, QMatMul, QTensor};
+use candle_core::vulkan_backend::shaders;
+use candle_core::{DType, Device, IndexOp, Module, Result, Tensor, D};
+use std::sync::Mutex;
+
+static MODE_LOCK: Mutex<()> = Mutex::new(());
+
+fn vulkan() -> Device {
+    Device::new_vulkan(0).expect("vulkan device")
+}
+
+fn with_modes(f: impl Fn(&Device) -> Result<()>) -> Result<()> {
+    let _guard = MODE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let dev = vulkan();
+    for native in [false, true] {
+        shaders::set_native_override(Some(native));
+        shaders::set_native_thresholds(Some(0), Some(0));
+        let res = f(&dev);
+        shaders::set_native_override(None);
+        shaders::set_native_thresholds(None, None);
+        res.map_err(|e| e.context(format!("native kernels: {native}")))?;
+    }
+    Ok(())
+}
+
+fn tol(dtype: DType) -> f64 {
+    match dtype {
+        DType::F64 => 1e-9,
+        DType::F32 => 1e-4,
+        DType::F16 => 2e-2,
+        DType::BF16 => 6e-2,
+        _ => 0.0,
+    }
+}
+
+fn assert_close(a: &Tensor, b: &Tensor, what: &str) -> Result<()> {
+    assert_eq!(a.dims(), b.dims(), "{what}: shape mismatch");
+    assert_eq!(a.dtype(), b.dtype(), "{what}: dtype mismatch");
+    let t = tol(a.dtype());
+    let va = a
+        .to_device(&Device::Cpu)?
+        .to_dtype(DType::F64)?
+        .flatten_all()?
+        .to_vec1::<f64>()?;
+    let vb = b
+        .to_device(&Device::Cpu)?
+        .to_dtype(DType::F64)?
+        .flatten_all()?
+        .to_vec1::<f64>()?;
+    for (i, (x, y)) in va.iter().zip(vb.iter()).enumerate() {
+        if (x.is_nan() && y.is_nan()) || x == y {
+            continue;
+        }
+        let diff = (x - y).abs();
+        let scale = x.abs().max(y.abs()).max(1.0);
+        assert!(
+            diff <= t * scale,
+            "{what}: mismatch at {i}: vulkan={x} cpu={y} (dtype {:?})",
+            a.dtype()
+        );
+    }
+    Ok(())
+}
+
+fn randn(shape: &[usize], dtype: DType) -> Result<Tensor> {
+    Tensor::randn(0f32, 1f32, shape, &Device::Cpu)?.to_dtype(dtype)
+}
+
+fn rand_pos(shape: &[usize], dtype: DType) -> Result<Tensor> {
+    Tensor::rand(0.1f32, 2f32, shape, &Device::Cpu)?.to_dtype(dtype)
+}
+
+fn ints(shape: &[usize], dtype: DType, modulo: u32) -> Result<Tensor> {
+    let n: usize = shape.iter().product();
+    let v: Vec<u32> = (0..n as u32).map(|i| (i * 7919 + 13) % modulo).collect();
+    Tensor::from_vec(v, shape, &Device::Cpu)?.to_dtype(dtype)
+}
+
+#[test]
+fn transfer_roundtrip() -> Result<()> {
+    let dev = vulkan();
+    for dtype in [
+        DType::U8,
+        DType::U32,
+        DType::I16,
+        DType::I32,
+        DType::I64,
+        DType::BF16,
+        DType::F16,
+        DType::F32,
+        DType::F64,
+        DType::F8E4M3,
+    ] {
+        let t = ints(&[3, 5, 7], DType::U32, 100)?.to_dtype(dtype)?;
+        let g = t.to_device(&dev)?;
+        assert!(g.device().is_vulkan());
+        let back = g.to_device(&Device::Cpu)?;
+        assert_eq!(
+            t.to_dtype(DType::F64)?.flatten_all()?.to_vec1::<f64>()?,
+            back.to_dtype(DType::F64)?.flatten_all()?.to_vec1::<f64>()?,
+            "{dtype:?}"
+        );
+        let g2 = g.copy()?;
+        assert_eq!(
+            g2.to_device(&Device::Cpu)?
+                .to_dtype(DType::F64)?
+                .flatten_all()?
+                .to_vec1::<f64>()?,
+            t.to_dtype(DType::F64)?.flatten_all()?.to_vec1::<f64>()?,
+            "{dtype:?} copy"
+        );
+    }
+    let raw = candle_core::CpuStorage::F4(vec![1u8, 2, 3, 250]);
+    let st = dev.as_vulkan_device()?.storage_from_cpu_storage(&raw)?;
+    assert_eq!(st.dtype, DType::F4);
+    match candle_core::backend::BackendStorage::to_cpu_storage(&st)? {
+        candle_core::CpuStorage::F4(v) => assert_eq!(v, vec![1u8, 2, 3, 250]),
+        _ => panic!("unexpected storage"),
+    }
+    let z = Tensor::zeros((4, 3), DType::F32, &dev)?;
+    assert_eq!(z.sum_all()?.to_scalar::<f32>()?, 0.0);
+    let o = Tensor::ones((4, 3), DType::BF16, &dev)?;
+    assert_eq!(o.to_dtype(DType::F32)?.sum_all()?.to_scalar::<f32>()?, 12.0);
+    let f = Tensor::full(2.5f64, (2, 2), &dev)?;
+    assert_eq!(f.to_vec2::<f64>()?, vec![vec![2.5, 2.5], vec![2.5, 2.5]]);
+    let e = Tensor::zeros((0, 3), DType::F32, &dev)?;
+    assert_eq!(e.dims(), &[0, 3]);
+    assert_eq!(e.to_device(&Device::Cpu)?.elem_count(), 0);
+    Ok(())
+}
+
+#[test]
+fn unary_ops() -> Result<()> {
+    with_modes(|dev| {
+        for dtype in [DType::F32, DType::F64, DType::F16, DType::BF16] {
+            let x = randn(&[4, 6, 5], dtype)?;
+            let p = rand_pos(&[4, 6, 5], dtype)?;
+            let xg = x.to_device(dev)?;
+            let pg = p.to_device(dev)?;
+            let xt = x.transpose(0, 2)?;
+            let xgt = xg.transpose(0, 2)?;
+            macro_rules! check {
+                ($name:literal, $f:expr) => {{
+                    let f = $f;
+                    assert_close(&f(&xg)?, &f(&x)?, concat!($name, " contiguous"))?;
+                    assert_close(&f(&xgt)?, &f(&xt)?, concat!($name, " strided"))?;
+                }};
+            }
+            check!("exp", |t: &Tensor| t.exp());
+            check!("sin", |t: &Tensor| t.sin());
+            check!("cos", |t: &Tensor| t.cos());
+            check!("tanh", |t: &Tensor| t.tanh());
+            check!("neg", |t: &Tensor| t.neg());
+            check!("sqr", |t: &Tensor| t.sqr());
+            check!("gelu", |t: &Tensor| t.gelu());
+            check!("gelu_erf", |t: &Tensor| t.gelu_erf());
+            check!("erf", |t: &Tensor| t.erf());
+            check!("silu", |t: &Tensor| t.silu());
+            check!("abs", |t: &Tensor| t.abs());
+            check!("ceil", |t: &Tensor| t.ceil());
+            check!("floor", |t: &Tensor| t.floor());
+            check!("round", |t: &Tensor| t.round());
+            check!("relu", |t: &Tensor| t.relu());
+            check!("sign", |t: &Tensor| t.sign());
+            check!("affine", |t: &Tensor| t.affine(1.5, -0.25));
+            check!("elu", |t: &Tensor| t.elu(0.7));
+            assert_close(&pg.log()?, &p.log()?, "log")?;
+            assert_close(&pg.sqrt()?, &p.sqrt()?, "sqrt")?;
+            assert_close(&pg.recip()?, &p.recip()?, "recip")?;
+            assert_close(&pg.powf(1.7)?, &p.powf(1.7)?, "powf")?;
+        }
+        let r = Tensor::new(
+            &[-2.5f32, -1.5, -0.5, 0.5, 1.5, 2.5, 0.49999997, -0.49999997],
+            &Device::Cpu,
+        )?;
+        assert_close(&r.to_device(dev)?.round()?, &r.round()?, "round halves")?;
+        let wide = randn(&[3, 70000], DType::F32)?.affine(30.0, 0.0)?;
+        let wg = wide.to_device(dev)?;
+        assert_close(&wg.tanh()?, &wide.tanh()?, "tanh wide range")?;
+        assert_close(&wg.gelu()?, &wide.gelu()?, "gelu wide range")?;
+        assert_close(&wg.silu()?, &wide.silu()?, "silu wide range")?;
+        let i = ints(&[5, 4], DType::I64, 50)?;
+        assert_close(
+            &i.to_device(dev)?.affine(2.0, 1.0)?,
+            &i.affine(2.0, 1.0)?,
+            "affine i64",
+        )?;
+        Ok(())
+    })
+}
+
+#[test]
+fn binary_and_cmp_ops() -> Result<()> {
+    with_modes(|dev| {
+        for dtype in [
+            DType::F32,
+            DType::F64,
+            DType::F16,
+            DType::BF16,
+            DType::U8,
+            DType::U32,
+            DType::I64,
+            DType::I32,
+            DType::I16,
+        ] {
+            let (a, b) = if dtype.is_float() {
+                (randn(&[3, 4, 5], dtype)?, rand_pos(&[3, 1, 5], dtype)?)
+            } else {
+                (
+                    ints(&[3, 4, 5], dtype, 10)?,
+                    ints(&[3, 1, 5], dtype, 5)?.affine(1.0, 1.0)?,
+                )
+            };
+            let ag = a.to_device(dev)?;
+            let bg = b.to_device(dev)?;
+            assert_close(&ag.broadcast_add(&bg)?, &a.broadcast_add(&b)?, "add")?;
+            if dtype.is_float() {
+                assert_close(&ag.broadcast_sub(&bg)?, &a.broadcast_sub(&b)?, "sub")?;
+            }
+            assert_close(&ag.broadcast_mul(&bg)?, &a.broadcast_mul(&b)?, "mul")?;
+            assert_close(&ag.broadcast_div(&bg)?, &a.broadcast_div(&b)?, "div")?;
+            assert_close(
+                &ag.broadcast_maximum(&bg)?,
+                &a.broadcast_maximum(&b)?,
+                "maximum",
+            )?;
+            assert_close(
+                &ag.broadcast_minimum(&bg)?,
+                &a.broadcast_minimum(&b)?,
+                "minimum",
+            )?;
+            assert_close(&ag.broadcast_lt(&bg)?, &a.broadcast_lt(&b)?, "lt")?;
+            assert_close(&ag.broadcast_ge(&bg)?, &a.broadcast_ge(&b)?, "ge")?;
+            assert_close(&ag.broadcast_eq(&bg)?, &a.broadcast_eq(&b)?, "eq")?;
+            let at = a.transpose(1, 2)?;
+            let agt = ag.transpose(1, 2)?;
+            let bt = b.transpose(1, 2)?;
+            let bgt = bg.transpose(1, 2)?;
+            assert_close(
+                &agt.broadcast_mul(&bgt)?,
+                &at.broadcast_mul(&bt)?,
+                "mul strided",
+            )?;
+            assert_close(&(&agt + &agt)?, &(&at + &at)?, "add strided same")?;
+            let an = a.narrow(1, 1, 2)?;
+            let agn = ag.narrow(1, 1, 2)?;
+            assert_close(&(&agn * &agn)?, &(&an * &an)?, "mul narrowed")?;
+        }
+        let x = randn(&[2, 3, 4, 5, 6, 7, 3], DType::F32)?;
+        let y = randn(&[1, 3, 1, 5, 1, 7, 1], DType::F32)?;
+        let (xg, yg) = (x.to_device(dev)?, y.to_device(dev)?);
+        let xp = x.permute(vec![6usize, 0, 5, 1, 4, 2, 3])?;
+        let xgp = xg.permute(vec![6usize, 0, 5, 1, 4, 2, 3])?;
+        let yp = y.permute(vec![6usize, 0, 5, 1, 4, 2, 3])?;
+        let ygp = yg.permute(vec![6usize, 0, 5, 1, 4, 2, 3])?;
+        assert_close(
+            &xgp.broadcast_add(&ygp)?,
+            &xp.broadcast_add(&yp)?,
+            "rank 7 broadcast",
+        )?;
+        Ok(())
+    })
+}
+
+#[test]
+fn reductions() -> Result<()> {
+    with_modes(|dev| {
+        for dtype in [
+            DType::F32,
+            DType::F64,
+            DType::F16,
+            DType::BF16,
+            DType::U32,
+            DType::I64,
+            DType::U8,
+        ] {
+            let x = if dtype.is_float() {
+                randn(&[3, 37, 300], dtype)?
+            } else {
+                ints(&[3, 37, 300], dtype, 3)?
+            };
+            let xg = x.to_device(dev)?;
+            for d in 0..3 {
+                assert_close(&xg.max_keepdim(d)?, &x.max_keepdim(d)?, "max")?;
+                assert_close(&xg.min_keepdim(d)?, &x.min_keepdim(d)?, "min")?;
+                assert_close(&xg.argmax_keepdim(d)?, &x.argmax_keepdim(d)?, "argmax")?;
+                assert_close(&xg.argmin_keepdim(d)?, &x.argmin_keepdim(d)?, "argmin")?;
+                if dtype != DType::U8 {
+                    let s1 = xg.sum_keepdim(d)?;
+                    if dtype == DType::F32 || dtype == DType::F64 {
+                        let a = s1
+                            .to_device(&Device::Cpu)?
+                            .to_dtype(DType::F64)?
+                            .flatten_all()?
+                            .to_vec1::<f64>()?;
+                        let b = x
+                            .to_dtype(DType::F64)?
+                            .sum_keepdim(d)?
+                            .flatten_all()?
+                            .to_vec1::<f64>()?;
+                        for (i, (va, vb)) in a.iter().zip(b.iter()).enumerate() {
+                            let rel = (va - vb).abs() / vb.abs().max(1.0);
+                            assert!(
+                                rel <= tol(dtype),
+                                "sum {dtype:?} dim {d} at {i}: vulkan={va} exact={vb}"
+                            );
+                        }
+                    } else {
+                        assert_close(&s1, &x.sum_keepdim(d)?, "sum")?;
+                    }
+                }
+            }
+            let xt = x.transpose(0, 2)?;
+            let xgt = xg.transpose(0, 2)?;
+            assert_close(&xgt.max_keepdim(1)?, &xt.max_keepdim(1)?, "max strided")?;
+            assert_close(
+                &xgt.argmax_keepdim(2)?,
+                &xt.argmax_keepdim(2)?,
+                "argmax strided",
+            )?;
+        }
+        let x = randn(&[2, 3], DType::F32)?;
+        let xg = x.to_device(dev)?;
+        assert_close(
+            &xg.sum_keepdim((0, 1))?,
+            &x.sum_keepdim((0, 1))?,
+            "sum all small",
+        )?;
+        let big = randn(&[1, 151936], DType::F32)?;
+        let bigg = big.to_device(dev)?;
+        assert_close(
+            &bigg.argmax_keepdim(1)?,
+            &big.argmax_keepdim(1)?,
+            "argmax vocab",
+        )?;
+        assert_close(&bigg.max_keepdim(1)?, &big.max_keepdim(1)?, "max vocab")?;
+        let rows = randn(&[70000, 3], DType::F32)?;
+        assert_close(
+            &rows.to_device(dev)?.max_keepdim(1)?,
+            &rows.max_keepdim(1)?,
+            "many rows",
+        )?;
+        let off = randn(&[5, 64], DType::F32)?;
+        let offg = off.to_device(dev)?.narrow(0, 2, 3)?;
+        assert_close(
+            &offg.sum_keepdim(1)?,
+            &off.narrow(0, 2, 3)?.sum_keepdim(1)?,
+            "offset rows",
+        )?;
+        let neg = Tensor::full(-3.0f32, (4, 9), &Device::Cpu)?;
+        assert_close(
+            &neg.to_device(dev)?.max_keepdim(1)?,
+            &neg.max_keepdim(1)?,
+            "all negative max",
+        )?;
+        Ok(())
+    })
+}
+
+#[test]
+fn casts() -> Result<()> {
+    let dev = vulkan();
+    let dtypes = [
+        DType::U8,
+        DType::U32,
+        DType::I16,
+        DType::I32,
+        DType::I64,
+        DType::BF16,
+        DType::F16,
+        DType::F32,
+        DType::F64,
+        DType::F8E4M3,
+    ];
+    let base = Tensor::new(
+        &[[0.0f32, 1.5, -2.25, 300.7], [65535.0, 7.0, -0.5, 1e10]],
+        &Device::Cpu,
+    )?;
+    for &src in dtypes.iter() {
+        let s = if src.is_float() {
+            base.to_dtype(src)?
+        } else {
+            base.abs()?.to_dtype(DType::U8)?.to_dtype(src)?
+        };
+        let sg = s.to_device(&dev)?;
+        for &dst in dtypes.iter() {
+            let a = sg.to_dtype(dst)?;
+            let b = s.to_dtype(dst)?;
+            assert_close(&a, &b, &format!("cast {src:?}->{dst:?}"))?;
+            let a = sg.t()?.to_dtype(dst)?;
+            let b = s.t()?.to_dtype(dst)?;
+            assert_close(&a, &b, &format!("cast strided {src:?}->{dst:?}"))?;
+        }
+    }
+    assert!(base.to_device(&dev)?.to_dtype(DType::F4).is_err());
+    Ok(())
+}
+
+#[test]
+fn where_and_indexing() -> Result<()> {
+    with_modes(|dev| {
+        for dtype in [DType::F32, DType::BF16, DType::F64, DType::U32, DType::U8] {
+            let a = ints(&[4, 6], DType::U32, 9)?.to_dtype(dtype)?;
+            let b = ints(&[1, 6], DType::U32, 5)?.to_dtype(dtype)?;
+            let c = ints(&[4, 1], DType::U32, 2)?.to_dtype(DType::U8)?;
+            let (ag, bg, cg) = (a.to_device(dev)?, b.to_device(dev)?, c.to_device(dev)?);
+            let r = c
+                .broadcast_as((4, 6))?
+                .where_cond(&a, &b.broadcast_as((4, 6))?)?;
+            let rg = cg
+                .broadcast_as((4, 6))?
+                .where_cond(&ag, &bg.broadcast_as((4, 6))?)?;
+            assert_close(&rg, &r, "where")?;
+            for ids_dtype in [DType::U32, DType::I64, DType::U8] {
+                let ids = Tensor::new(&[3u32, 0, 2, 2, 1], &Device::Cpu)?.to_dtype(ids_dtype)?;
+                let idsg = ids.to_device(dev)?;
+                assert_close(
+                    &ag.index_select(&idsg, 0)?,
+                    &a.index_select(&ids, 0)?,
+                    "index_select 0",
+                )?;
+                assert_close(
+                    &ag.index_select(&idsg, 1)?,
+                    &a.index_select(&ids, 1)?,
+                    "index_select 1",
+                )?;
+                let gids = ints(&[4, 3], DType::U32, 6)?.to_dtype(ids_dtype)?;
+                let gidsg = gids.to_device(dev)?;
+                assert_close(&ag.gather(&gidsg, 1)?, &a.gather(&gids, 1)?, "gather")?;
+                if dtype.is_float() || dtype == DType::U32 {
+                    let src = ints(&[4, 3], DType::U32, 4)?.to_dtype(dtype)?;
+                    let srcg = src.to_device(dev)?;
+                    let sids = Tensor::new(
+                        &[[0u32, 1, 2], [3, 4, 5], [5, 0, 1], [2, 2, 3]],
+                        &Device::Cpu,
+                    )?
+                    .to_dtype(ids_dtype)?;
+                    let sidsg = sids.to_device(dev)?;
+                    assert_close(
+                        &ag.scatter(&sidsg, &srcg, 1)?,
+                        &a.scatter(&sids, &src, 1)?,
+                        "scatter",
+                    )?;
+                    assert_close(
+                        &ag.scatter_add(&sidsg, &srcg, 1)?,
+                        &a.scatter_add(&sids, &src, 1)?,
+                        "scatter_add",
+                    )?;
+                    let ia_ids = Tensor::new(&[1u32, 1, 3], &Device::Cpu)?.to_dtype(ids_dtype)?;
+                    let ia_idsg = ia_ids.to_device(dev)?;
+                    let src2 = ints(&[3, 6], DType::U32, 3)?.to_dtype(dtype)?;
+                    let src2g = src2.to_device(dev)?;
+                    assert_close(
+                        &ag.index_add(&ia_idsg, &src2g, 0)?,
+                        &a.index_add(&ia_ids, &src2, 0)?,
+                        "index_add",
+                    )?;
+                    let t = a.zeros_like()?;
+                    let tg = ag.zeros_like()?;
+                    t.scatter_set(&sids, &src, 1)?;
+                    tg.scatter_set(&sidsg, &srcg, 1)?;
+                    assert_close(&tg, &t, "scatter_set in place")?;
+                }
+            }
+        }
+        let mask = Tensor::new(&[[1u8, 0, 1], [0, 0, 1]], &Device::Cpu)?;
+        let x = randn(&[2, 3], DType::F32)?;
+        let filled =
+            mask.where_cond(&x, &Tensor::full(f32::NEG_INFINITY, (2, 3), &Device::Cpu)?)?;
+        let filledg = mask.to_device(dev)?.where_cond(
+            &x.to_device(dev)?,
+            &Tensor::full(f32::NEG_INFINITY, (2, 3), dev)?,
+        )?;
+        assert_close(&filledg, &filled, "masked fill")?;
+        Ok(())
+    })
+}
+
+#[test]
+fn copies_and_cat() -> Result<()> {
+    with_modes(|dev| {
+        for dtype in [DType::F32, DType::F16, DType::I64, DType::U8, DType::F64] {
+            let a = ints(&[3, 4, 5], DType::U32, 97)?.to_dtype(dtype)?;
+            let b = ints(&[3, 2, 5], DType::U32, 31)?.to_dtype(dtype)?;
+            let (ag, bg) = (a.to_device(dev)?, b.to_device(dev)?);
+            assert_close(
+                &Tensor::cat(&[&ag, &bg], 1)?,
+                &Tensor::cat(&[&a, &b], 1)?,
+                "cat 1",
+            )?;
+            assert_close(
+                &Tensor::cat(&[&ag, &ag], 2)?,
+                &Tensor::cat(&[&a, &a], 2)?,
+                "cat 2",
+            )?;
+            assert_close(
+                &Tensor::cat(&[&ag, &ag], 0)?,
+                &Tensor::cat(&[&a, &a], 0)?,
+                "cat 0",
+            )?;
+            assert_close(
+                &ag.transpose(0, 2)?.contiguous()?,
+                &a.transpose(0, 2)?.contiguous()?,
+                "contiguous",
+            )?;
+            assert_close(
+                &ag.narrow(1, 1, 2)?.contiguous()?,
+                &a.narrow(1, 1, 2)?.contiguous()?,
+                "narrow",
+            )?;
+            assert_close(&ag.i((.., 2..4, 1))?, &a.i((.., 2..4, 1))?, "index op")?;
+            let x = Tensor::stack(&[&ag, &ag], 0)?;
+            let y = Tensor::stack(&[&a, &a], 0)?;
+            assert_close(&x, &y, "stack")?;
+            let s = ag.zeros_like()?;
+            s.slice_set(&bg, 1, 1)?;
+            let sc = a.zeros_like()?;
+            sc.slice_set(&b, 1, 1)?;
+            assert_close(&s, &sc, "slice_set")?;
+            let big = ints(&[2, 3, 4, 5, 2, 3, 2, 2, 3, 2], DType::U32, 1000)?.to_dtype(dtype)?;
+            let bigg = big.to_device(dev)?;
+            let perm = big
+                .permute(vec![9usize, 0, 8, 1, 7, 2, 6, 3, 5, 4])?
+                .contiguous()?;
+            let permg = bigg
+                .permute(vec![9usize, 0, 8, 1, 7, 2, 6, 3, 5, 4])?
+                .contiguous()?;
+            assert_close(&permg, &perm, "high rank permute")?;
+        }
+        let mut cache = candle_core::Tensor::zeros((1, 2, 16, 4), DType::F32, dev)?;
+        let mut cache_cpu = candle_core::Tensor::zeros((1, 2, 16, 4), DType::F32, &Device::Cpu)?;
+        for step in 0..5 {
+            let kv = randn(&[1, 2, 1, 4], DType::F32)?;
+            cache.slice_set(&kv.to_device(dev)?, 2, step)?;
+            cache_cpu.slice_set(&kv, 2, step)?;
+        }
+        assert_close(
+            &cache.narrow(2, 0, 5)?,
+            &cache_cpu.narrow(2, 0, 5)?,
+            "kv cache slice_set",
+        )?;
+        cache = cache.narrow(2, 0, 5)?.contiguous()?;
+        cache_cpu = cache_cpu.narrow(2, 0, 5)?.contiguous()?;
+        assert_close(&cache, &cache_cpu, "kv cache narrow")?;
+        Ok(())
+    })
+}
+
+fn mm_ref(a: &Tensor, b: &Tensor) -> Result<Tensor> {
+    let dt = a.dtype();
+    if dt == DType::BF16 || dt == DType::F16 {
+        a.to_dtype(DType::F32)?
+            .matmul(&b.to_dtype(DType::F32)?)?
+            .to_dtype(dt)
+    } else {
+        a.matmul(b)
+    }
+}
+
+fn bmm_ref(a: &Tensor, b: &Tensor) -> Result<Tensor> {
+    let dt = a.dtype();
+    if dt == DType::BF16 || dt == DType::F16 {
+        a.to_dtype(DType::F32)?
+            .broadcast_matmul(&b.to_dtype(DType::F32)?)?
+            .to_dtype(dt)
+    } else {
+        a.broadcast_matmul(b)
+    }
+}
+
+#[test]
+fn matmuls() -> Result<()> {
+    with_modes(|dev| {
+        for dtype in [DType::F32, DType::F64, DType::F16, DType::BF16] {
+            let a = randn(&[2, 3, 7, 5], dtype)?;
+            let b = randn(&[2, 3, 5, 4], dtype)?;
+            let (ag, bg) = (a.to_device(dev)?, b.to_device(dev)?);
+            assert_close(&ag.matmul(&bg)?, &mm_ref(&a, &b)?, "matmul batched")?;
+            let bt = randn(&[2, 3, 4, 5], dtype)?;
+            let btg = bt.to_device(dev)?;
+            assert_close(
+                &ag.matmul(&btg.transpose(2, 3)?)?,
+                &mm_ref(&a, &bt.transpose(2, 3)?)?,
+                "matmul rhs transposed",
+            )?;
+            let at = randn(&[2, 3, 5, 7], dtype)?;
+            let atg = at.to_device(dev)?;
+            assert_close(
+                &atg.transpose(2, 3)?.matmul(&bg)?,
+                &mm_ref(&at.transpose(2, 3)?, &b)?,
+                "matmul lhs transposed",
+            )?;
+            let w = randn(&[9, 5], dtype)?;
+            let wg = w.to_device(dev)?;
+            let x = randn(&[4, 6, 5], dtype)?;
+            let xg = x.to_device(dev)?;
+            assert_close(
+                &xg.broadcast_matmul(&wg.t()?)?,
+                &bmm_ref(&x, &w.t()?)?,
+                "linear broadcast",
+            )?;
+            let p = randn(&[3, 8, 6], dtype)?;
+            let pg = p.to_device(dev)?;
+            let pt = pg.permute((1, 0, 2))?;
+            let pc = p.permute((1, 0, 2))?;
+            let v = randn(&[8, 6, 2], dtype)?;
+            let vg = v.to_device(dev)?;
+            assert_close(&pt.matmul(&vg)?, &mm_ref(&pc, &v)?, "matmul permuted lhs")?;
+            let v1 = randn(&[5], dtype)?;
+            let m1 = randn(&[3, 5], dtype)?;
+            assert_close(
+                &m1.to_device(dev)?
+                    .matmul(&v1.to_device(dev)?.unsqueeze(1)?)?,
+                &mm_ref(&m1, &v1.unsqueeze(1)?)?,
+                "matvec",
+            )?;
+        }
+        let (m, k, n) = (130, 70, 150);
+        let a = randn(&[m, k], DType::F32)?;
+        let b = randn(&[k, n], DType::F32)?;
+        assert_close(
+            &a.to_device(dev)?.matmul(&b.to_device(dev)?)?,
+            &a.matmul(&b)?,
+            "matmul tile edges",
+        )?;
+        let q = randn(&[1, 4, 9, 16], DType::F32)?;
+        let kc = randn(&[1, 4, 32, 16], DType::F32)?;
+        let kg = kc.to_device(dev)?.narrow(2, 0, 11)?;
+        let kcn = kc.narrow(2, 0, 11)?;
+        assert_close(
+            &q.to_device(dev)?.matmul(&kg.transpose(2, 3)?)?,
+            &q.matmul(&kcn.transpose(2, 3)?)?,
+            "attention scores over a narrowed cache",
+        )?;
+        let a3 = randn(&[4, 33, 20], DType::F32)?;
+        let b2 = randn(&[20, 17], DType::F32)?;
+        assert_close(
+            &a3.to_device(dev)?.broadcast_matmul(&b2.to_device(dev)?)?,
+            &a3.broadcast_matmul(&b2)?,
+            "broadcast rhs batch",
+        )?;
+        let ai = ints(&[3, 4], DType::U32, 5)?.to_dtype(DType::I64)?;
+        let bi = ints(&[4, 2], DType::U32, 5)?.to_dtype(DType::I64)?;
+        assert!(ai.matmul(&bi).is_err());
+        assert!(ai.to_device(dev)?.matmul(&bi.to_device(dev)?).is_err());
+        let z = randn(&[3, 0], DType::F32)?;
+        let zz = randn(&[0, 4], DType::F32)?;
+        assert_close(
+            &z.to_device(dev)?.matmul(&zz.to_device(dev)?)?,
+            &z.matmul(&zz)?,
+            "k = 0",
+        )?;
+        Ok(())
+    })
+}
+
+struct CpuOnlyDouble;
+
+impl candle_core::CustomOp1 for CpuOnlyDouble {
+    fn name(&self) -> &'static str {
+        "cpu-only-double"
+    }
+
+    fn cpu_fwd(
+        &self,
+        s: &candle_core::CpuStorage,
+        l: &candle_core::Layout,
+    ) -> Result<(candle_core::CpuStorage, candle_core::Shape)> {
+        let v = s.as_slice::<f32>()?;
+        let out: Vec<f32> = match l.contiguous_offsets() {
+            Some((a, b)) => v[a..b].iter().map(|x| x * 2.0).collect(),
+            None => candle_core::bail!("contiguous only"),
+        };
+        Ok((candle_core::CpuStorage::F32(out), l.shape().clone()))
+    }
+}
+
+struct InplaceAddOne;
+
+impl candle_core::InplaceOp1 for InplaceAddOne {
+    fn name(&self) -> &'static str {
+        "inplace-add-one"
+    }
+
+    fn cpu_fwd(&self, s: &mut candle_core::CpuStorage, _: &candle_core::Layout) -> Result<()> {
+        match s {
+            candle_core::CpuStorage::F32(v) => v.iter_mut().for_each(|x| *x += 1.0),
+            _ => candle_core::bail!("f32 only"),
+        }
+        Ok(())
+    }
+}
+
+#[test]
+fn custom_ops_stay_on_device() -> Result<()> {
+    let dev = vulkan();
+    let x = randn(&[3, 4], DType::F32)?;
+    let xg = x.to_device(&dev)?.narrow(1, 1, 3)?.contiguous()?;
+    let y = xg.apply_op1_no_bwd(&CpuOnlyDouble)?;
+    assert!(y.device().is_vulkan());
+    assert_close(&y, &(x.narrow(1, 1, 3)?.contiguous()? * 2.0)?, "custom op")?;
+    let z = (&y + &xg)?;
+    assert!(z.device().is_vulkan());
+    let w = x.to_device(&dev)?;
+    w.inplace_op1(&InplaceAddOne)?;
+    assert_close(&w, &(x.clone() + 1.0)?, "inplace op")?;
+    Ok(())
+}
+
+#[test]
+fn rand_seeded() -> Result<()> {
+    let dev = vulkan();
+    for dtype in [DType::F32, DType::F64, DType::F16, DType::BF16] {
+        dev.set_seed(42)?;
+        assert_eq!(dev.get_current_seed()?, 42);
+        let a = Tensor::randn(0f32, 1f32, (64,), &dev)?
+            .to_dtype(dtype)?
+            .to_dtype(DType::F32)?
+            .to_vec1::<f32>()?;
+        dev.set_seed(42)?;
+        let b = Tensor::randn(0f32, 1f32, (64,), &dev)?
+            .to_dtype(dtype)?
+            .to_dtype(DType::F32)?
+            .to_vec1::<f32>()?;
+        assert_eq!(a, b);
+    }
+    let u = Tensor::rand(0f32, 1f32, (1000,), &dev)?;
+    let m = u.mean_all()?.to_scalar::<f32>()?;
+    assert!((m - 0.5).abs() < 0.1);
+    let h = Tensor::rand(0f64, 1f64, (8,), &dev)?.to_dtype(DType::F16)?;
+    assert_eq!(h.dtype(), DType::F16);
+    assert!(Tensor::rand(0f32, 1f32, (8,), &dev)?
+        .to_dtype(DType::U32)
+        .is_ok());
+    Ok(())
+}
+
+#[test]
+fn quantized_dequantize_and_matmul() -> Result<()> {
+    with_modes(|dev| {
+        let types = [
+            GgmlDType::Q4_0,
+            GgmlDType::Q4_1,
+            GgmlDType::Q5_0,
+            GgmlDType::Q5_1,
+            GgmlDType::Q8_0,
+            GgmlDType::Q2K,
+            GgmlDType::Q3K,
+            GgmlDType::Q4K,
+            GgmlDType::Q5K,
+            GgmlDType::Q6K,
+            GgmlDType::Q8K,
+            GgmlDType::F16,
+            GgmlDType::BF16,
+            GgmlDType::F32,
+        ];
+        let (n, k) = (40, 512);
+        let w = randn(&[n, k], DType::F32)?;
+        for dtype in types {
+            let q_cpu = QTensor::quantize(&w, dtype)?;
+            let deq_cpu = q_cpu.dequantize(&Device::Cpu)?;
+            let q_gpu = QTensor::quantize_onto(&w, dtype, dev)?;
+            assert!(q_gpu.device().is_vulkan());
+            assert_eq!(q_gpu.dtype(), dtype);
+            assert_eq!(q_gpu.storage_size_in_bytes(), q_cpu.storage_size_in_bytes());
+            assert_eq!(
+                q_gpu.data()?.as_ref(),
+                q_cpu.data()?.as_ref(),
+                "{dtype:?} data"
+            );
+            let deq_gpu = q_gpu.dequantize(dev)?;
+            assert!(deq_gpu.device().is_vulkan());
+            assert_eq!(
+                deq_gpu
+                    .to_device(&Device::Cpu)?
+                    .flatten_all()?
+                    .to_vec1::<f32>()?,
+                deq_cpu.flatten_all()?.to_vec1::<f32>()?,
+                "{dtype:?} dequant"
+            );
+            let dq16 = q_gpu.dequantize_f16(dev)?;
+            assert_close(&dq16, &deq_cpu.to_dtype(DType::F16)?, "dequantize_f16")?;
+
+            let mm_cpu = QMatMul::from_qtensor(QTensor::quantize(&w, dtype)?)?;
+            let mm_gpu = QMatMul::from_qtensor(QTensor::quantize_onto(&w, dtype, dev)?)?;
+            for rows in [1usize, 3, 8, 9, 33] {
+                let x = randn(&[1, rows, k], DType::F32)?;
+                let r_cpu = mm_cpu.forward(&x)?;
+                let r_gpu = mm_gpu.forward(&x.to_device(dev)?)?;
+                assert!(r_gpu.device().is_vulkan());
+                let diff = (r_gpu.to_device(&Device::Cpu)? - &r_cpu)?
+                    .abs()?
+                    .max_all()?
+                    .to_scalar::<f32>()?;
+                assert!(diff < 1e-3, "{dtype:?} qmatmul rows {rows}: diff {diff}");
+                if matches!(mm_cpu, QMatMul::QTensor(_)) {
+                    let r_mixed = mm_cpu.forward(&x.to_device(dev)?)?;
+                    assert!(r_mixed.device().is_vulkan());
+                    let diff = (r_mixed.to_device(&Device::Cpu)? - &r_cpu)?
+                        .abs()?
+                        .max_all()?
+                        .to_scalar::<f32>()?;
+                    assert!(
+                        diff < 1e-3,
+                        "{dtype:?} cpu weights, vulkan input, rows {rows}: diff {diff}"
+                    );
+                }
+                let xs = randn(&[rows, 2 * k], DType::F32)?.narrow(1, 3, k)?;
+                let r_s = mm_gpu.forward(&xs.to_device(dev)?)?;
+                let r_s_ref = mm_cpu.forward(&xs.contiguous()?)?;
+                let diff = (r_s.to_device(&Device::Cpu)? - &r_s_ref)?
+                    .abs()?
+                    .max_all()?
+                    .to_scalar::<f32>()?;
+                assert!(
+                    diff < 1e-3,
+                    "{dtype:?} strided input rows {rows}: diff {diff}"
+                );
+            }
+            if !matches!(dtype, GgmlDType::F16 | GgmlDType::BF16 | GgmlDType::F32) {
+                let x16 = randn(&[2, k], DType::F16)?;
+                let r16 = mm_gpu.forward(&x16.to_device(dev)?)?;
+                assert_eq!(r16.dtype(), DType::F16);
+                let r16_ref = mm_cpu
+                    .forward(&x16.to_dtype(DType::F32)?)?
+                    .to_dtype(DType::F16)?;
+                assert_close(&r16, &r16_ref, "qmatmul f16 input")?;
+                let ids = Tensor::new(&[[3u32, 0], [39, 7]], &Device::Cpu)?;
+                let e_gpu = q_gpu.embedding(&ids.to_device(dev)?)?;
+                let e_cpu = q_cpu.embedding(&ids)?;
+                assert_close(&e_gpu, &e_cpu, "quantized embedding")?;
+            }
+        }
+        Ok(())
+    })
+}
+
+#[test]
+fn gguf_load_on_device() -> Result<()> {
+    let dev = vulkan();
+    let w1 = randn(&[64, 256], DType::F32)?;
+    let w2 = randn(&[32], DType::F32)?;
+    let q1 = QTensor::quantize(&w1, GgmlDType::Q4K)?;
+    let q2 = QTensor::quantize(&w2, GgmlDType::F32)?;
+    let mut buf = std::io::Cursor::new(Vec::new());
+    gguf_file::write(
+        &mut buf,
+        &[("general.name", &gguf_file::Value::String("t".to_string()))],
+        &[("blk.0.w", &q1), ("blk.0.b", &q2)],
+    )?;
+    buf.set_position(0);
+    let content = gguf_file::Content::read(&mut buf)?;
+    let t1 = content.tensor(&mut buf, "blk.0.w", &dev)?;
+    let t2 = content.tensor(&mut buf, "blk.0.b", &dev)?;
+    assert!(t1.device().is_vulkan());
+    assert_eq!(t1.dtype(), GgmlDType::Q4K);
+    assert_eq!(t2.dtype(), GgmlDType::F32);
+    assert_eq!(t1.storage_size_in_bytes(), q1.storage_size_in_bytes());
+    assert_eq!(
+        t1.dequantize(&Device::Cpu)?
+            .flatten_all()?
+            .to_vec1::<f32>()?,
+        q1.dequantize(&Device::Cpu)?
+            .flatten_all()?
+            .to_vec1::<f32>()?
+    );
+    let mm = QMatMul::from_qtensor(t1)?;
+    assert!(matches!(mm, QMatMul::QTensor(_)));
+    let x = randn(&[2, 256], DType::F32)?;
+    let r = mm.forward(&x.to_device(&dev)?)?;
+    let r_ref = QMatMul::from_qtensor(q1)?.forward(&x)?;
+    let diff = (r.to_device(&Device::Cpu)? - r_ref)?
+        .abs()?
+        .max_all()?
+        .to_scalar::<f32>()?;
+    assert!(diff < 1e-4, "gguf qmatmul diff {diff}");
+    let b = t2.dequantize(&dev)?;
+    assert!(b.device().is_vulkan());
+    assert_close(&b, &w2, "f32 gguf tensor")?;
+    Ok(())
+}
+
+#[test]
+fn device_info() -> Result<()> {
+    let dev = vulkan();
+    let v = dev.as_vulkan_device()?;
+    let (free, total) = v.mem_info()?;
+    assert!(total > 0 && free <= total);
+    assert!(!v.name().is_empty());
+    assert!(candle_core::vulkan_backend::device_count()? >= 1);
+    let d2 = Device::new_vulkan(0)?;
+    assert!(d2.same_device(&dev));
+    let x = Tensor::new(&[1f32, 2., 3.], &dev)?;
+    let y = Tensor::new(&[1f32, 2., 3.], &d2)?;
+    assert_eq!((x + y)?.to_vec1::<f32>()?, vec![2., 4., 6.]);
+    dev.synchronize()?;
+    let s = format!("{}", Tensor::new(&[1f32], &dev)?);
+    assert!(s.contains("vulkan:0"), "{s}");
+    let big = Tensor::zeros((1024, 1024), DType::F32, &dev)?;
+    assert!(v.allocated_bytes() >= 4 * 1024 * 1024);
+    drop(big);
+    assert!(Device::new_vulkan(1000).is_err());
+    let _ = D::Minus1;
+    Ok(())
+}
+
+#[test]
+fn conv_and_pool() -> Result<()> {
+    let dev = vulkan();
+    for dtype in [DType::F32, DType::F16, DType::BF16] {
+        let x = randn(&[2, 4, 9], dtype)?;
+        let w = randn(&[6, 4, 3], dtype)?;
+        let r = x.to_device(&dev)?.conv1d(&w.to_device(&dev)?, 1, 1, 1, 1)?;
+        let r_ref = x
+            .to_dtype(DType::F32)?
+            .conv1d(&w.to_dtype(DType::F32)?, 1, 1, 1, 1)?
+            .to_dtype(dtype)?;
+        assert!(r.device().is_vulkan());
+        assert_close(&r, &r_ref, "conv1d")?;
+        let x2 = randn(&[1, 3, 7, 6], dtype)?;
+        let w2 = randn(&[5, 3, 3, 3], dtype)?;
+        let r2 = x2
+            .to_device(&dev)?
+            .transpose(2, 3)?
+            .conv2d(&w2.to_device(&dev)?, 1, 1, 1, 1)?;
+        let r2_ref = x2
+            .to_dtype(DType::F32)?
+            .transpose(2, 3)?
+            .conv2d(&w2.to_dtype(DType::F32)?, 1, 1, 1, 1)?
+            .to_dtype(dtype)?;
+        assert_close(&r2, &r2_ref, "conv2d strided input")?;
+        let ct = randn(&[1, 4, 5, 5], dtype)?;
+        let ctw = randn(&[4, 2, 3, 3], dtype)?;
+        let r3 = ct
+            .to_device(&dev)?
+            .conv_transpose2d(&ctw.to_device(&dev)?, 0, 0, 1, 1)?;
+        let r3_ref = ct
+            .to_dtype(DType::F32)?
+            .conv_transpose2d(&ctw.to_dtype(DType::F32)?, 0, 0, 1, 1)?
+            .to_dtype(dtype)?;
+        assert_close(&r3, &r3_ref, "conv_transpose2d")?;
+        let p = randn(&[1, 2, 8, 8], dtype)?;
+        assert_close(
+            &p.to_device(&dev)?.max_pool2d(2)?,
+            &p.max_pool2d(2)?,
+            "max_pool2d",
+        )?;
+        assert_close(
+            &p.to_device(&dev)?.avg_pool2d(2)?,
+            &p.avg_pool2d(2)?,
+            "avg_pool2d",
+        )?;
+        assert_close(
+            &p.to_device(&dev)?.upsample_nearest2d(16, 16)?,
+            &p.upsample_nearest2d(16, 16)?,
+            "upsample",
+        )?;
+    }
+    Ok(())
+}
+
+#[test]
+fn native_kernels_run() -> Result<()> {
+    let _guard = MODE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let dev = vulkan();
+    shaders::set_native_override(Some(true));
+    shaders::set_native_thresholds(Some(0), Some(0));
+    let start = shaders::native_exec_count();
+    let x = randn(&[64, 64], DType::F32)?.to_device(&dev)?;
+    let _ = x.exp()?;
+    let _ = x.affine(2.0, 1.0)?;
+    let _ = (&x + &x)?;
+    let _ = x.sum_keepdim(1)?;
+    let _ = x.matmul(&x)?;
+    let ran = shaders::native_exec_count() - start;
+    shaders::set_native_override(Some(false));
+    let start_off = shaders::native_exec_count();
+    let _ = x.exp()?;
+    let _ = x.matmul(&x)?;
+    let ran_off = shaders::native_exec_count() - start_off;
+    shaders::set_native_override(None);
+    shaders::set_native_thresholds(None, None);
+    assert_eq!(ran, 5, "native dispatches with kernels on");
+    assert_eq!(ran_off, 0, "native dispatches with kernels off");
+    Ok(())
+}
+
+#[test]
+fn buffer_pool_reuse_and_trim() -> Result<()> {
+    let dev = vulkan();
+    let v = dev.as_vulkan_device()?;
+    let a = Tensor::zeros((1000, 250), DType::F32, &dev)?;
+    let ptr = {
+        let (s, _) = a.storage_and_layout();
+        match &*s {
+            candle_core::Storage::Vulkan(s) => s.mapped as usize,
+            _ => unreachable!(),
+        }
+    };
+    drop(a);
+    let b = Tensor::ones((1000, 250), DType::F32, &dev)?;
+    let ptr_b = {
+        let (s, _) = b.storage_and_layout();
+        match &*s {
+            candle_core::Storage::Vulkan(s) => s.mapped as usize,
+            _ => unreachable!(),
+        }
+    };
+    let _ = (ptr, ptr_b);
+    assert_eq!(b.sum_all()?.to_scalar::<f32>()?, 250000.0);
+    let z = Tensor::zeros((1000, 250), DType::F32, &dev)?;
+    assert_eq!(z.sum_all()?.to_scalar::<f32>()?, 0.0);
+    drop(b);
+    drop(z);
+    // Other tests share the device and return buffers to the same pool while
+    // they run, so retry until a trim is observed with nothing released after it.
+    let mut emptied = false;
+    for _ in 0..200 {
+        v.trim_memory_pool()?;
+        if v.pooled_bytes() == 0 {
+            emptied = true;
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    assert!(emptied, "trim_memory_pool left {} pooled bytes", v.pooled_bytes());
+    Ok(())
+}
+
+#[test]
+fn many_live_buffers_keep_their_contents() -> Result<()> {
+    // With CANDLE_VULKAN_SLAB=1 every small buffer is a slot of a shared slab
+    // allocation; the contents of neighbouring slots must stay independent.
+    let dev = vulkan();
+    let v = dev.as_vulkan_device()?;
+    let before = v.live_allocations();
+    let mut ts = Vec::new();
+    for i in 0..300usize {
+        let n = 64 + (i % 7) * 1000;
+        ts.push(Tensor::full(i as f32, n, &dev)?);
+    }
+    let slabs = std::env::var("CANDLE_VULKAN_SLAB").map(|v| v == "1").unwrap_or(false);
+    if slabs {
+        let grown = v.live_allocations().saturating_sub(before);
+        assert!(grown < 60, "{grown} allocations for 300 buffers");
+    }
+    let sums: Vec<f32> = ts.iter().map(|t| t.sum_all()?.to_scalar::<f32>()).collect::<Result<_>>()?;
+    for (i, s) in sums.iter().enumerate() {
+        let n = 64 + (i % 7) * 1000;
+        assert_eq!(*s, (i * n) as f32, "buffer {i}");
+    }
+    let doubled = ts[17].affine(2.0, 1.0)?;
+    drop(ts);
+    assert_eq!(doubled.to_vec1::<f32>()?[0], 35.0);
+    v.trim_memory_pool()?;
+    Ok(())
+}
+
+#[test]
+fn dummy_dtypes_load_and_fail_fast() -> Result<()> {
+    let dev = vulkan();
+    let x = Tensor::ones((2, 3), DType::BF16, &dev)?;
+    assert!(x.to_dtype(DType::F4).is_err());
+    assert!(x.to_dtype(DType::F6E2M3).is_err());
+    assert!(x.to_dtype(DType::F8E8M0).is_err());
+    let raw = vec![0x12u8, 0x34, 0x56, 0x78];
+    let view = safetensors::tensor::TensorView::new(safetensors::Dtype::F4, vec![8], &raw)
+        .map_err(candle_core::Error::wrap)?;
+    let bytes =
+        safetensors::tensor::serialize([("w", view)], None).map_err(candle_core::Error::wrap)?;
+    let loaded = candle_core::safetensors::load_buffer(&bytes, &dev)?;
+    let w = &loaded["w"];
+    assert!(w.device().is_vulkan());
+    assert_eq!(w.dtype(), DType::F4);
+    let (s, _) = w.storage_and_layout();
+    match &*s {
+        candle_core::Storage::Vulkan(s) => assert_eq!(s.as_bytes(), raw.as_slice()),
+        _ => panic!("expected vulkan storage"),
+    }
+    Ok(())
+}

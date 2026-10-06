@@ -1,6 +1,11 @@
-use crate::backend::BackendStorage;
+#[allow(unused_imports)]
+use crate::backend::{BackendDevice, BackendStorage};
 use crate::op::{self, CmpOp, ReduceOp};
-use crate::{CpuStorage, CudaStorage, DType, Device, Error, Layout, MetalStorage, RocmStorage, Result, Shape};
+use crate::scalar::Scalar;
+use crate::{
+    CpuStorage, CudaStorage, DType, Device, Error, Layout, MetalStorage, OpenClStorage, Result,
+    RocmStorage, Shape, VulkanStorage,
+};
 use crate::{CustomOp1, CustomOp2, CustomOp3, InplaceOp1, InplaceOp2, InplaceOp3};
 
 // We do not want to implement Clone on Storage as cloning may fail because of
@@ -11,6 +16,8 @@ pub enum Storage {
     Cuda(CudaStorage),
     Metal(MetalStorage),
     Rocm(RocmStorage),
+    OpenCl(OpenClStorage),
+    Vulkan(VulkanStorage),
 }
 
 impl Storage {
@@ -29,6 +36,14 @@ impl Storage {
                 let storage = storage.try_clone(layout)?;
                 Ok(Self::Rocm(storage))
             }
+            Self::OpenCl(storage) => {
+                let storage = storage.try_clone(layout)?;
+                Ok(Self::OpenCl(storage))
+            }
+            Self::Vulkan(storage) => {
+                let storage = storage.try_clone(layout)?;
+                Ok(Self::Vulkan(storage))
+            }
         }
     }
 
@@ -38,6 +53,8 @@ impl Storage {
             Self::Cuda(storage) => Device::Cuda(storage.device().clone()),
             Self::Metal(storage) => Device::Metal(storage.device().clone()),
             Self::Rocm(storage) => Device::Rocm(storage.device().clone()),
+            Self::OpenCl(storage) => Device::OpenCl(storage.device().clone()),
+            Self::Vulkan(storage) => Device::Vulkan(storage.device().clone()),
         }
     }
 
@@ -47,6 +64,8 @@ impl Storage {
             Self::Cuda(storage) => storage.dtype(),
             Self::Metal(storage) => storage.dtype(),
             Self::Rocm(storage) => storage.dtype(),
+            Self::OpenCl(storage) => storage.dtype(),
+            Self::Vulkan(storage) => storage.dtype(),
         }
     }
 
@@ -55,7 +74,12 @@ impl Storage {
         let rhs_device = rhs.device();
         let lhs = lhs_device.location();
         let rhs = rhs_device.location();
-        let same_device = if self.device().is_metal() {
+        let same_device = if self.device().is_metal() || self.device().is_vulkan() {
+            // On Metal and Vulkan we require the device to be exactly the same
+            // rather than having the same location: two independently-created
+            // VulkanDevice/MetalDevice are distinct logical devices, and a buffer
+            // handle is only valid on the device that created it. In cuda this is
+            // not necessary as all CudaDevice on the same GPU share one stream.
             lhs_device.same_device(&rhs_device)
         } else {
             lhs == rhs
@@ -77,6 +101,17 @@ impl Storage {
         }
     }
 
+    pub(crate) fn const_set(&mut self, v: Scalar, l: &Layout) -> Result<()> {
+        match self {
+            Storage::Cpu(storage) => storage.const_set(v, l),
+            Storage::Cuda(storage) => storage.const_set(v, l),
+            Storage::Metal(storage) => storage.const_set(v, l),
+            Storage::Rocm(storage) => storage.const_set(v, l),
+            Storage::OpenCl(storage) => storage.const_set(v, l),
+            Storage::Vulkan(storage) => storage.const_set(v, l),
+        }
+    }
+
     pub(crate) fn affine(&self, layout: &Layout, mul: f64, add: f64) -> Result<Self> {
         match self {
             Storage::Cpu(storage) => {
@@ -94,6 +129,14 @@ impl Storage {
             Self::Rocm(storage) => {
                 let storage = storage.affine(layout, mul, add)?;
                 Ok(Self::Rocm(storage))
+            }
+            Self::OpenCl(storage) => {
+                let storage = storage.affine(layout, mul, add)?;
+                Ok(Self::OpenCl(storage))
+            }
+            Self::Vulkan(storage) => {
+                let storage = storage.affine(layout, mul, add)?;
+                Ok(Self::Vulkan(storage))
             }
         }
     }
@@ -116,6 +159,14 @@ impl Storage {
                 let storage = storage.powf(layout, alpha)?;
                 Ok(Self::Rocm(storage))
             }
+            Self::OpenCl(storage) => {
+                let storage = storage.powf(layout, alpha)?;
+                Ok(Self::OpenCl(storage))
+            }
+            Self::Vulkan(storage) => {
+                let storage = storage.powf(layout, alpha)?;
+                Ok(Self::Vulkan(storage))
+            }
         }
     }
 
@@ -136,6 +187,14 @@ impl Storage {
             Self::Rocm(storage) => {
                 let storage = storage.elu(layout, alpha)?;
                 Ok(Self::Rocm(storage))
+            }
+            Self::OpenCl(storage) => {
+                let storage = storage.elu(layout, alpha)?;
+                Ok(Self::OpenCl(storage))
+            }
+            Self::Vulkan(storage) => {
+                let storage = storage.elu(layout, alpha)?;
+                Ok(Self::Vulkan(storage))
             }
         }
     }
@@ -166,7 +225,17 @@ impl Storage {
                 let storage = lhs.cmp(op, rhs, lhs_layout, rhs_layout)?;
                 Ok(Self::Rocm(storage))
             }
+            (Self::OpenCl(lhs), Self::OpenCl(rhs)) => {
+                let storage = lhs.cmp(op, rhs, lhs_layout, rhs_layout)?;
+                Ok(Self::OpenCl(storage))
+            }
+            (Self::Vulkan(lhs), Self::Vulkan(rhs)) => {
+                let storage = lhs.cmp(op, rhs, lhs_layout, rhs_layout)?;
+                Ok(Self::Vulkan(storage))
+            }
             (lhs, rhs) => {
+                // Should not happen because of the same device check above but we're defensive
+                // anyway.
                 Err(Error::DeviceMismatchBinaryOp {
                     lhs: lhs.device().location(),
                     rhs: rhs.device().location(),
@@ -195,6 +264,14 @@ impl Storage {
                 let storage = storage.reduce_op(op, layout, s)?;
                 Ok(Self::Rocm(storage))
             }
+            Self::OpenCl(storage) => {
+                let storage = storage.reduce_op(op, layout, s)?;
+                Ok(Self::OpenCl(storage))
+            }
+            Self::Vulkan(storage) => {
+                let storage = storage.reduce_op(op, layout, s)?;
+                Ok(Self::Vulkan(storage))
+            }
         }
     }
 
@@ -216,6 +293,14 @@ impl Storage {
                 let storage = storage.to_dtype(layout, dtype)?;
                 Ok(Self::Rocm(storage))
             }
+            Self::OpenCl(storage) => {
+                let storage = storage.to_dtype(layout, dtype)?;
+                Ok(Self::OpenCl(storage))
+            }
+            Self::Vulkan(storage) => {
+                let storage = storage.to_dtype(layout, dtype)?;
+                Ok(Self::Vulkan(storage))
+            }
         }
     }
 
@@ -233,11 +318,19 @@ impl Storage {
                 let (storage, shape) = c.metal_fwd(storage, l)?;
                 Ok((Self::Metal(storage), shape))
             }
-            Self::Rocm(_storage) => {
-                // CustomOps fall back to CPU for now
-                let cpu_storage = self.to_cpu(l)?;
-                let (result, shape) = c.cpu_fwd(&cpu_storage, l)?;
-                Ok((Self::Cpu(result), shape))
+            Self::Rocm(storage) => {
+                let (storage, shape) = c.rocm_fwd(storage, l)?;
+                Ok((Self::Rocm(storage), shape))
+            }
+            Self::OpenCl(storage) => {
+                let cpu = storage.to_cpu_storage()?;
+                let (out, shape) = c.cpu_fwd(&cpu, l)?;
+                let dev = storage.device.clone();
+                Ok((Self::OpenCl(dev.storage_from_cpu_storage(&out)?), shape))
+            }
+            Self::Vulkan(storage) => {
+                let (storage, shape) = c.vulkan_fwd(storage, l)?;
+                Ok((Self::Vulkan(storage), shape))
             }
         }
     }
@@ -263,11 +356,20 @@ impl Storage {
                 let (s, shape) = c.metal_fwd(s1, l1, s2, l2)?;
                 Ok((Self::Metal(s), shape))
             }
-            (Self::Rocm(_), Self::Rocm(_)) => {
-                let cpu1 = self.to_cpu(l1)?;
-                let cpu2 = t2.to_cpu(l2)?;
-                let (s, shape) = c.cpu_fwd(&cpu1, l1, &cpu2, l2)?;
-                Ok((Self::Cpu(s), shape))
+            (Self::Rocm(s1), Self::Rocm(s2)) => {
+                let (s, shape) = c.rocm_fwd(s1, l1, s2, l2)?;
+                Ok((Self::Rocm(s), shape))
+            }
+            (Self::OpenCl(s1), Self::OpenCl(s2)) => {
+                let c1 = s1.to_cpu_storage()?;
+                let c2 = s2.to_cpu_storage()?;
+                let (s, shape) = c.cpu_fwd(&c1, l1, &c2, l2)?;
+                let dev = s1.device.clone();
+                Ok((Self::OpenCl(dev.storage_from_cpu_storage(&s)?), shape))
+            }
+            (Self::Vulkan(s1), Self::Vulkan(s2)) => {
+                let (s, shape) = c.vulkan_fwd(s1, l1, s2, l2)?;
+                Ok((Self::Vulkan(s), shape))
             }
             _ => unreachable!(),
         }
@@ -297,12 +399,21 @@ impl Storage {
                 let (s, shape) = c.metal_fwd(s1, l1, s2, l2, s3, l3)?;
                 Ok((Self::Metal(s), shape))
             }
-            (Self::Rocm(_), Self::Rocm(_), Self::Rocm(_)) => {
-                let cpu1 = self.to_cpu(l1)?;
-                let cpu2 = t2.to_cpu(l2)?;
-                let cpu3 = t3.to_cpu(l3)?;
-                let (s, shape) = c.cpu_fwd(&cpu1, l1, &cpu2, l2, &cpu3, l3)?;
-                Ok((Self::Cpu(s), shape))
+            (Self::Rocm(s1), Self::Rocm(s2), Self::Rocm(s3)) => {
+                let (s, shape) = c.rocm_fwd(s1, l1, s2, l2, s3, l3)?;
+                Ok((Self::Rocm(s), shape))
+            }
+            (Self::OpenCl(s1), Self::OpenCl(s2), Self::OpenCl(s3)) => {
+                let c1 = s1.to_cpu_storage()?;
+                let c2 = s2.to_cpu_storage()?;
+                let c3 = s3.to_cpu_storage()?;
+                let (s, shape) = c.cpu_fwd(&c1, l1, &c2, l2, &c3, l3)?;
+                let dev = s1.device.clone();
+                Ok((Self::OpenCl(dev.storage_from_cpu_storage(&s)?), shape))
+            }
+            (Self::Vulkan(s1), Self::Vulkan(s2), Self::Vulkan(s3)) => {
+                let (s, shape) = c.vulkan_fwd(s1, l1, s2, l2, s3, l3)?;
+                Ok((Self::Vulkan(s), shape))
             }
             _ => unreachable!(),
         }
@@ -313,7 +424,15 @@ impl Storage {
             Self::Cpu(storage) => c.cpu_fwd(storage, l),
             Self::Cuda(storage) => c.cuda_fwd(storage, l),
             Self::Metal(storage) => c.metal_fwd(storage, l),
-            Self::Rocm(_storage) => crate::bail!("inplace ops not yet supported on Rocm"),
+            Self::Rocm(storage) => c.rocm_fwd(storage, l),
+            Self::OpenCl(storage) => {
+                let mut cpu = storage.to_cpu_storage()?;
+                c.cpu_fwd(&mut cpu, l)?;
+                let dev = storage.device.clone();
+                *storage = dev.storage_from_cpu_storage(&cpu)?;
+                Ok(())
+            }
+            Self::Vulkan(storage) => c.vulkan_fwd(storage, l),
         }
     }
 
@@ -329,7 +448,16 @@ impl Storage {
             (Self::Cpu(s1), Self::Cpu(s2)) => c.cpu_fwd(s1, l1, s2, l2),
             (Self::Cuda(s1), Self::Cuda(s2)) => c.cuda_fwd(s1, l1, s2, l2),
             (Self::Metal(s1), Self::Metal(s2)) => c.metal_fwd(s1, l1, s2, l2),
-            (Self::Rocm(_), Self::Rocm(_)) => crate::bail!("inplace ops not yet supported on Rocm"),
+            (Self::Rocm(s1), Self::Rocm(s2)) => c.rocm_fwd(s1, l1, s2, l2),
+            (Self::OpenCl(s1), Self::OpenCl(s2)) => {
+                let mut c1 = s1.to_cpu_storage()?;
+                let c2 = s2.to_cpu_storage()?;
+                c.cpu_fwd(&mut c1, l1, &c2, l2)?;
+                let dev = s1.device.clone();
+                *s1 = dev.storage_from_cpu_storage(&c1)?;
+                Ok(())
+            }
+            (Self::Vulkan(s1), Self::Vulkan(s2)) => c.vulkan_fwd(s1, l1, s2, l2),
             _ => unreachable!(),
         }
     }
@@ -351,8 +479,18 @@ impl Storage {
             (Self::Metal(s1), Self::Metal(s2), Self::Metal(s3)) => {
                 c.metal_fwd(s1, l1, s2, l2, s3, l3)
             }
-            (Self::Rocm(_), Self::Rocm(_), Self::Rocm(_)) => {
-                crate::bail!("inplace ops not yet supported on Rocm")
+            (Self::Rocm(s1), Self::Rocm(s2), Self::Rocm(s3)) => c.rocm_fwd(s1, l1, s2, l2, s3, l3),
+            (Self::OpenCl(s1), Self::OpenCl(s2), Self::OpenCl(s3)) => {
+                let mut c1 = s1.to_cpu_storage()?;
+                let c2 = s2.to_cpu_storage()?;
+                let c3 = s3.to_cpu_storage()?;
+                c.cpu_fwd(&mut c1, l1, &c2, l2, &c3, l3)?;
+                let dev = s1.device.clone();
+                *s1 = dev.storage_from_cpu_storage(&c1)?;
+                Ok(())
+            }
+            (Self::Vulkan(s1), Self::Vulkan(s2), Self::Vulkan(s3)) => {
+                c.vulkan_fwd(s1, l1, s2, l2, s3, l3)
             }
             _ => unreachable!(),
         }
@@ -375,6 +513,14 @@ impl Storage {
             Self::Rocm(storage) => {
                 let storage = storage.unary_impl::<B>(layout)?;
                 Ok(Self::Rocm(storage))
+            }
+            Self::OpenCl(storage) => {
+                let storage = storage.unary_impl::<B>(layout)?;
+                Ok(Self::OpenCl(storage))
+            }
+            Self::Vulkan(storage) => {
+                let storage = storage.unary_impl::<B>(layout)?;
+                Ok(Self::Vulkan(storage))
             }
         }
     }
@@ -404,7 +550,17 @@ impl Storage {
                 let storage = lhs.binary_impl::<B>(rhs, lhs_layout, rhs_layout)?;
                 Ok(Self::Rocm(storage))
             }
+            (Self::OpenCl(lhs), Self::OpenCl(rhs)) => {
+                let storage = lhs.binary_impl::<B>(rhs, lhs_layout, rhs_layout)?;
+                Ok(Self::OpenCl(storage))
+            }
+            (Self::Vulkan(lhs), Self::Vulkan(rhs)) => {
+                let storage = lhs.binary_impl::<B>(rhs, lhs_layout, rhs_layout)?;
+                Ok(Self::Vulkan(storage))
+            }
             (lhs, rhs) => {
+                // Should not happen because of the same device check above but we're defensive
+                // anyway.
                 Err(Error::DeviceMismatchBinaryOp {
                     lhs: lhs.device().location(),
                     rhs: rhs.device().location(),
@@ -441,6 +597,14 @@ impl Storage {
                 let s = inp.conv1d(l, kernel, kernel_l, params)?;
                 Ok(Self::Rocm(s))
             }
+            (Storage::OpenCl(inp), Storage::OpenCl(kernel)) => {
+                let s = inp.conv1d(l, kernel, kernel_l, params)?;
+                Ok(Self::OpenCl(s))
+            }
+            (Storage::Vulkan(inp), Storage::Vulkan(kernel)) => {
+                let s = inp.conv1d(l, kernel, kernel_l, params)?;
+                Ok(Self::Vulkan(s))
+            }
             (lhs, rhs) => Err(Error::DeviceMismatchBinaryOp {
                 lhs: lhs.device().location(),
                 rhs: rhs.device().location(),
@@ -475,6 +639,14 @@ impl Storage {
             (Storage::Rocm(inp), Storage::Rocm(kernel)) => {
                 let s = inp.conv_transpose1d(l, kernel, kernel_l, params)?;
                 Ok(Self::Rocm(s))
+            }
+            (Storage::OpenCl(inp), Storage::OpenCl(kernel)) => {
+                let s = inp.conv_transpose1d(l, kernel, kernel_l, params)?;
+                Ok(Self::OpenCl(s))
+            }
+            (Storage::Vulkan(inp), Storage::Vulkan(kernel)) => {
+                let s = inp.conv_transpose1d(l, kernel, kernel_l, params)?;
+                Ok(Self::Vulkan(s))
             }
             (lhs, rhs) => Err(Error::DeviceMismatchBinaryOp {
                 lhs: lhs.device().location(),
@@ -511,6 +683,14 @@ impl Storage {
                 let s = inp.conv2d(l, kernel, kernel_l, params)?;
                 Ok(Self::Rocm(s))
             }
+            (Storage::OpenCl(inp), Storage::OpenCl(kernel)) => {
+                let s = inp.conv2d(l, kernel, kernel_l, params)?;
+                Ok(Self::OpenCl(s))
+            }
+            (Storage::Vulkan(inp), Storage::Vulkan(kernel)) => {
+                let s = inp.conv2d(l, kernel, kernel_l, params)?;
+                Ok(Self::Vulkan(s))
+            }
             (lhs, rhs) => Err(Error::DeviceMismatchBinaryOp {
                 lhs: lhs.device().location(),
                 rhs: rhs.device().location(),
@@ -546,6 +726,14 @@ impl Storage {
                 let s = inp.conv_transpose2d(l, kernel, kernel_l, params)?;
                 Ok(Self::Rocm(s))
             }
+            (Storage::OpenCl(inp), Storage::OpenCl(kernel)) => {
+                let s = inp.conv_transpose2d(l, kernel, kernel_l, params)?;
+                Ok(Self::OpenCl(s))
+            }
+            (Storage::Vulkan(inp), Storage::Vulkan(kernel)) => {
+                let s = inp.conv_transpose2d(l, kernel, kernel_l, params)?;
+                Ok(Self::Vulkan(s))
+            }
             (lhs, rhs) => Err(Error::DeviceMismatchBinaryOp {
                 lhs: lhs.device().location(),
                 rhs: rhs.device().location(),
@@ -578,6 +766,14 @@ impl Storage {
                 let storage = storage.avg_pool2d(layout, kernel_size, stride)?;
                 Ok(Self::Rocm(storage))
             }
+            Self::OpenCl(storage) => {
+                let storage = storage.avg_pool2d(layout, kernel_size, stride)?;
+                Ok(Self::OpenCl(storage))
+            }
+            Self::Vulkan(storage) => {
+                let storage = storage.avg_pool2d(layout, kernel_size, stride)?;
+                Ok(Self::Vulkan(storage))
+            }
         }
     }
 
@@ -604,6 +800,14 @@ impl Storage {
                 let storage = storage.max_pool2d(layout, kernel_size, stride)?;
                 Ok(Self::Rocm(storage))
             }
+            Self::OpenCl(storage) => {
+                let storage = storage.max_pool2d(layout, kernel_size, stride)?;
+                Ok(Self::OpenCl(storage))
+            }
+            Self::Vulkan(storage) => {
+                let storage = storage.max_pool2d(layout, kernel_size, stride)?;
+                Ok(Self::Vulkan(storage))
+            }
         }
     }
 
@@ -625,6 +829,14 @@ impl Storage {
                 let storage = storage.upsample_nearest1d(layout, sz)?;
                 Ok(Self::Rocm(storage))
             }
+            Self::OpenCl(storage) => {
+                let storage = storage.upsample_nearest1d(layout, sz)?;
+                Ok(Self::OpenCl(storage))
+            }
+            Self::Vulkan(storage) => {
+                let storage = storage.upsample_nearest1d(layout, sz)?;
+                Ok(Self::Vulkan(storage))
+            }
         }
     }
 
@@ -645,6 +857,57 @@ impl Storage {
             Self::Rocm(storage) => {
                 let storage = storage.upsample_nearest2d(layout, h, w)?;
                 Ok(Self::Rocm(storage))
+            }
+            Self::OpenCl(storage) => {
+                let storage = storage.upsample_nearest2d(layout, h, w)?;
+                Ok(Self::OpenCl(storage))
+            }
+            Self::Vulkan(storage) => {
+                let storage = storage.upsample_nearest2d(layout, h, w)?;
+                Ok(Self::Vulkan(storage))
+            }
+        }
+    }
+
+    pub(crate) fn upsample_bilinear2d(
+        &self,
+        layout: &Layout,
+        h: usize,
+        w: usize,
+        align_corners: bool,
+        scale_h: Option<f64>,
+        scale_w: Option<f64>,
+    ) -> Result<Self> {
+        match self {
+            Storage::Cpu(storage) => {
+                let storage =
+                    storage.upsample_bilinear2d(layout, h, w, align_corners, scale_h, scale_w)?;
+                Ok(Self::Cpu(storage))
+            }
+            Self::Cuda(storage) => {
+                let storage =
+                    storage.upsample_bilinear2d(layout, h, w, align_corners, scale_h, scale_w)?;
+                Ok(Self::Cuda(storage))
+            }
+            Self::Metal(storage) => {
+                let storage =
+                    storage.upsample_bilinear2d(layout, h, w, align_corners, scale_h, scale_w)?;
+                Ok(Self::Metal(storage))
+            }
+            Self::Rocm(storage) => {
+                let storage =
+                    storage.upsample_bilinear2d(layout, h, w, align_corners, scale_h, scale_w)?;
+                Ok(Self::Rocm(storage))
+            }
+            Self::OpenCl(storage) => {
+                let storage =
+                    storage.upsample_bilinear2d(layout, h, w, align_corners, scale_h, scale_w)?;
+                Ok(Self::OpenCl(storage))
+            }
+            Self::Vulkan(storage) => {
+                let storage =
+                    storage.upsample_bilinear2d(layout, h, w, align_corners, scale_h, scale_w)?;
+                Ok(Self::Vulkan(storage))
             }
         }
     }
@@ -676,6 +939,14 @@ impl Storage {
             (Self::Rocm(cond), Self::Rocm(t), Self::Rocm(f)) => {
                 let storage = cond.where_cond(layout, t, layout_t, f, layout_f)?;
                 Ok(Self::Rocm(storage))
+            }
+            (Self::OpenCl(cond), Self::OpenCl(t), Self::OpenCl(f)) => {
+                let storage = cond.where_cond(layout, t, layout_t, f, layout_f)?;
+                Ok(Self::OpenCl(storage))
+            }
+            (Self::Vulkan(cond), Self::Vulkan(t), Self::Vulkan(f)) => {
+                let storage = cond.where_cond(layout, t, layout_t, f, layout_f)?;
+                Ok(Self::Vulkan(storage))
             }
             (_, lhs, rhs) => Err(Error::DeviceMismatchBinaryOp {
                 lhs: lhs.device().location(),
@@ -711,40 +982,86 @@ impl Storage {
                 let storage = s.gather(l, indexes, indexes_l, d)?;
                 Ok(Self::Rocm(storage))
             }
+            (Self::OpenCl(s), Self::OpenCl(indexes)) => {
+                let storage = s.gather(l, indexes, indexes_l, d)?;
+                Ok(Self::OpenCl(storage))
+            }
+            (Self::Vulkan(s), Self::Vulkan(indexes)) => {
+                let storage = s.gather(l, indexes, indexes_l, d)?;
+                Ok(Self::Vulkan(storage))
+            }
             _ => unreachable!(),
         }
     }
 
-    pub(crate) fn scatter_add(
-        &self,
+    pub(crate) fn scatter_set(
+        &mut self,
         l: &Layout,
         indexes: &Self,
         indexes_l: &Layout,
         source: &Self,
         source_l: &Layout,
         d: usize,
-    ) -> Result<Self> {
+    ) -> Result<()> {
+        self.same_device(indexes, "scatter-set")?;
+        self.same_device(source, "scatter-set")?;
+        match (self, indexes, source) {
+            (Self::Cpu(s), Self::Cpu(indexes), Self::Cpu(source)) => {
+                s.scatter_set(l, indexes, indexes_l, source, source_l, d)?;
+            }
+            (Self::Cuda(s), Self::Cuda(indexes), Self::Cuda(source)) => {
+                s.scatter_set(l, indexes, indexes_l, source, source_l, d)?;
+            }
+            (Self::Metal(s), Self::Metal(indexes), Self::Metal(source)) => {
+                s.scatter_set(l, indexes, indexes_l, source, source_l, d)?;
+            }
+            (Self::Rocm(s), Self::Rocm(indexes), Self::Rocm(source)) => {
+                s.scatter_set(l, indexes, indexes_l, source, source_l, d)?;
+            }
+            (Self::OpenCl(s), Self::OpenCl(indexes), Self::OpenCl(source)) => {
+                s.scatter_set(l, indexes, indexes_l, source, source_l, d)?;
+            }
+            (Self::Vulkan(s), Self::Vulkan(indexes), Self::Vulkan(source)) => {
+                s.scatter_set(l, indexes, indexes_l, source, source_l, d)?;
+            }
+            _ => unreachable!(),
+        }
+        Ok(())
+    }
+
+    pub(crate) fn scatter_add(
+        &mut self,
+        l: &Layout,
+        indexes: &Self,
+        indexes_l: &Layout,
+        source: &Self,
+        source_l: &Layout,
+        d: usize,
+    ) -> Result<()> {
         self.same_device(indexes, "scatter-add")?;
         self.same_device(source, "scatter-add")?;
         match (self, indexes, source) {
             (Self::Cpu(s), Self::Cpu(indexes), Self::Cpu(source)) => {
-                let storage = s.scatter_add(l, indexes, indexes_l, source, source_l, d)?;
-                Ok(Self::Cpu(storage))
+                s.scatter_add_set(l, indexes, indexes_l, source, source_l, d)?;
             }
             (Self::Cuda(s), Self::Cuda(indexes), Self::Cuda(source)) => {
-                let storage = s.scatter_add(l, indexes, indexes_l, source, source_l, d)?;
-                Ok(Self::Cuda(storage))
+                s.scatter_add_set(l, indexes, indexes_l, source, source_l, d)?;
             }
             (Self::Metal(s), Self::Metal(indexes), Self::Metal(source)) => {
-                let storage = s.scatter_add(l, indexes, indexes_l, source, source_l, d)?;
-                Ok(Self::Metal(storage))
+                s.scatter_add_set(l, indexes, indexes_l, source, source_l, d)?;
             }
             (Self::Rocm(s), Self::Rocm(indexes), Self::Rocm(source)) => {
-                let storage = s.scatter_add(l, indexes, indexes_l, source, source_l, d)?;
-                Ok(Self::Rocm(storage))
+                s.scatter_add_set(l, indexes, indexes_l, source, source_l, d)?;
+            }
+            (Self::OpenCl(s), Self::OpenCl(indexes), Self::OpenCl(source)) => {
+                s.scatter_add_set(l, indexes, indexes_l, source, source_l, d)?;
+            }
+            (Self::Vulkan(s), Self::Vulkan(indexes), Self::Vulkan(source)) => {
+                s.scatter_add_set(l, indexes, indexes_l, source, source_l, d)?;
             }
             _ => unreachable!(),
         }
+        Ok(())
     }
 
     pub(crate) fn index_add(
@@ -775,6 +1092,14 @@ impl Storage {
                 let storage = s.index_add(l, indexes, indexes_l, source, source_l, d)?;
                 Ok(Self::Rocm(storage))
             }
+            (Self::OpenCl(s), Self::OpenCl(indexes), Self::OpenCl(source)) => {
+                let storage = s.index_add(l, indexes, indexes_l, source, source_l, d)?;
+                Ok(Self::OpenCl(storage))
+            }
+            (Self::Vulkan(s), Self::Vulkan(indexes), Self::Vulkan(source)) => {
+                let storage = s.index_add(l, indexes, indexes_l, source, source_l, d)?;
+                Ok(Self::Vulkan(storage))
+            }
             _ => unreachable!(),
         }
     }
@@ -803,6 +1128,14 @@ impl Storage {
             (Self::Rocm(lhs), Self::Rocm(rhs)) => {
                 let storage = lhs.index_select(rhs, lhs_l, rhs_l, d)?;
                 Ok(Self::Rocm(storage))
+            }
+            (Self::OpenCl(lhs), Self::OpenCl(rhs)) => {
+                let storage = lhs.index_select(rhs, lhs_l, rhs_l, d)?;
+                Ok(Self::OpenCl(storage))
+            }
+            (Self::Vulkan(lhs), Self::Vulkan(rhs)) => {
+                let storage = lhs.index_select(rhs, lhs_l, rhs_l, d)?;
+                Ok(Self::Vulkan(storage))
             }
             (lhs, rhs) => Err(Error::DeviceMismatchBinaryOp {
                 lhs: lhs.device().location(),
@@ -839,6 +1172,14 @@ impl Storage {
                 let storage = lhs.matmul(rhs, bmnk, lhs_layout, rhs_layout)?;
                 Ok(Self::Rocm(storage))
             }
+            (Self::OpenCl(lhs), Self::OpenCl(rhs)) => {
+                let storage = lhs.matmul(rhs, bmnk, lhs_layout, rhs_layout)?;
+                Ok(Self::OpenCl(storage))
+            }
+            (Self::Vulkan(lhs), Self::Vulkan(rhs)) => {
+                let storage = lhs.matmul(rhs, bmnk, lhs_layout, rhs_layout)?;
+                Ok(Self::Vulkan(storage))
+            }
             (lhs, rhs) => Err(Error::DeviceMismatchBinaryOp {
                 lhs: lhs.device().location(),
                 rhs: rhs.device().location(),
@@ -861,7 +1202,11 @@ impl Storage {
             (Self::Metal(src), Self::Metal(dst)) => {
                 Ok(src.copy_strided_src(dst, dst_offset, src_l)?)
             }
-            (Self::Rocm(src), Self::Rocm(dst)) => {
+            (Self::Rocm(src), Self::Rocm(dst)) => Ok(src.copy_strided_src(dst, dst_offset, src_l)?),
+            (Self::OpenCl(src), Self::OpenCl(dst)) => {
+                Ok(src.copy_strided_src(dst, dst_offset, src_l)?)
+            }
+            (Self::Vulkan(src), Self::Vulkan(dst)) => {
                 Ok(src.copy_strided_src(dst, dst_offset, src_l)?)
             }
             (lhs, rhs) => Err(Error::DeviceMismatchBinaryOp {
@@ -895,21 +1240,18 @@ impl Storage {
             (Self::Rocm(src), Self::Rocm(dst)) => {
                 Ok(src.copy2d(dst, d1, d2, src_s, dst_s, src_o, dst_o)?)
             }
+            (Self::OpenCl(src), Self::OpenCl(dst)) => {
+                Ok(src.copy2d(dst, d1, d2, src_s, dst_s, src_o, dst_o)?)
+            }
+            (Self::Vulkan(src), Self::Vulkan(dst)) => {
+                Ok(src.copy2d(dst, d1, d2, src_s, dst_s, src_o, dst_o)?)
+            }
             (lhs, rhs) => Err(Error::DeviceMismatchBinaryOp {
                 lhs: lhs.device().location(),
                 rhs: rhs.device().location(),
                 op: "copy2d",
             }
             .bt()),
-        }
-    }
-
-    fn to_cpu(&self, layout: &Layout) -> Result<CpuStorage> {
-        match self {
-            Self::Cpu(storage) => Ok(storage.clone()),
-            Self::Cuda(storage) => storage.to_cpu_storage(),
-            Self::Metal(storage) => storage.to_cpu_storage(),
-            Self::Rocm(storage) => storage.to_cpu_storage(),
         }
     }
 }

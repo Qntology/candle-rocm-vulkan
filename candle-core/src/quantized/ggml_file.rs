@@ -130,14 +130,32 @@ fn from_raw_data<T: super::GgmlType + Send + Sync + 'static>(
         Device::Cpu => QStorage::Cpu(Box::new(data.to_vec())),
         Device::Metal(metal) => super::metal::load_quantized(metal, data)?,
         Device::Cuda(cuda) => super::cuda::load_quantized(cuda, data)?,
-        Device::Rocm(_) => {
-            return Err(crate::Error::Msg("quantized GGML not supported on ROCm".to_string()))
+        Device::Rocm(rocm) => {
+            let bytes = unsafe {
+                std::slice::from_raw_parts(data.as_ptr() as *const u8, std::mem::size_of_val(data))
+            };
+            super::rocm::load_quantized(rocm, T::DTYPE, bytes)?
+        }
+        Device::OpenCl(d) => {
+            // M4 dense-on-OpenCl: dequantize the weight to f32 and hold it on the
+            // device (OpenClStorage).  `T` is a GgmlType so `T::to_float` gives
+            // the dequant; BLCK_SIZE is 1 for the f32/f16/bf16 scalars.
+            let n = data.len() * T::BLCK_SIZE;
+            let mut ys = vec![0f32; n];
+            T::to_float(data, &mut ys);
+            QStorage::OpenCl(crate::OpenClStorage::from_vec(ys, d)?)
+        }
+        Device::Vulkan(vulkan) => {
+            let bytes = unsafe {
+                std::slice::from_raw_parts(data.as_ptr() as *const u8, std::mem::size_of_val(data))
+            };
+            super::vulkan::load_quantized(vulkan, T::DTYPE, bytes)?
         }
     };
     super::QTensor::new(data, dims)
 }
 
-/// Creates a Tensor from a raw GGML tensor.
+/// Creates a [Tensor] from a raw GGML tensor.
 pub fn qtensor_from_ggml(
     ggml_dtype: GgmlDType,
     raw_data: &[u8],
@@ -156,6 +174,7 @@ pub fn qtensor_from_ggml(
     match ggml_dtype {
         GgmlDType::F32 => from_raw_data::<f32>(raw_data, size_in_bytes, dims, device),
         GgmlDType::F16 => from_raw_data::<half::f16>(raw_data, size_in_bytes, dims, device),
+        GgmlDType::BF16 => from_raw_data::<half::bf16>(raw_data, size_in_bytes, dims, device),
         GgmlDType::Q4_0 => {
             from_raw_data::<k_quants::BlockQ4_0>(raw_data, size_in_bytes, dims, device)
         }

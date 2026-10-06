@@ -1,6 +1,10 @@
+use crate::backend::{BackendDevice, BackendStorage};
 use crate::op::{BackpropOp, Op};
 use crate::tensor::from_storage;
-use crate::{CpuStorage, CudaStorage, Layout, MetalStorage, Result, Shape, Tensor};
+use crate::{
+    CpuStorage, CudaStorage, Layout, MetalStorage, Result, RocmStorage, Shape, Tensor,
+    VulkanStorage,
+};
 use std::sync::Arc;
 
 /// Unary ops that can be defined in user-land.
@@ -30,6 +34,30 @@ pub trait CustomOp1 {
         Err(crate::Error::Metal(
             format!("no metal implementation for {}", self.name()).into(),
         ))
+    }
+
+    /// The forward pass, as run on a rocm gpu device. The default implementation runs `cpu_fwd`
+    /// on a copy of the data and moves the result back to the device.
+    fn rocm_fwd(&self, storage: &RocmStorage, layout: &Layout) -> Result<(RocmStorage, Shape)> {
+        let cpu = storage.to_cpu_storage()?;
+        let (out, shape) = self.cpu_fwd(&cpu, layout)?;
+        Ok((storage.device().storage_from_cpu_storage_owned(out)?, shape))
+    }
+
+    /// The forward pass, as run on a vulkan device. Note that the storage can
+    /// use arbitrary strides, offsets etc so the associated layout should be
+    /// used to access it.
+    ///
+    /// The default falls back to a correct CPU round-trip (read to CPU, run
+    /// `cpu_fwd`, upload back); a backend with a native implementation should
+    /// override this to keep the computation on-device.
+    fn vulkan_fwd(
+        &self,
+        storage: &VulkanStorage,
+        layout: &Layout,
+    ) -> Result<(VulkanStorage, Shape)> {
+        let (out, shape) = storage.with_cpu_view(|cpu| self.cpu_fwd(cpu, layout))?;
+        Ok((storage.device().storage_from_cpu_storage_owned(out)?, shape))
     }
 
     /// This function takes as argument the argument `arg` used in the forward pass, the result
@@ -79,6 +107,36 @@ pub trait CustomOp2 {
         Err(crate::Error::Metal(
             format!("no metal implementation for {}", self.name()).into(),
         ))
+    }
+
+    /// The forward pass, as run on a rocm gpu device. The default implementation runs `cpu_fwd`
+    /// on a copy of the data and moves the result back to the device.
+    fn rocm_fwd(
+        &self,
+        s1: &RocmStorage,
+        l1: &Layout,
+        s2: &RocmStorage,
+        l2: &Layout,
+    ) -> Result<(RocmStorage, Shape)> {
+        let c1 = s1.to_cpu_storage()?;
+        let c2 = s2.to_cpu_storage()?;
+        let (out, shape) = self.cpu_fwd(&c1, l1, &c2, l2)?;
+        Ok((s1.device().storage_from_cpu_storage_owned(out)?, shape))
+    }
+
+    /// The forward pass, as run on a vulkan device. The default falls back to a
+    /// correct CPU round-trip; a backend with a native implementation overrides
+    /// it to keep the computation on-device.
+    fn vulkan_fwd(
+        &self,
+        s1: &VulkanStorage,
+        l1: &Layout,
+        s2: &VulkanStorage,
+        l2: &Layout,
+    ) -> Result<(VulkanStorage, Shape)> {
+        let (out, shape) =
+            s1.with_cpu_view(|c1| s2.with_cpu_view(|c2| self.cpu_fwd(c1, l1, c2, l2)))?;
+        Ok((s1.device().storage_from_cpu_storage_owned(out)?, shape))
     }
 
     fn bwd(
@@ -137,6 +195,44 @@ pub trait CustomOp3 {
         Err(crate::Error::Metal(
             format!("no metal implementation for {}", self.name()).into(),
         ))
+    }
+
+    /// The forward pass, as run on a rocm gpu device. The default implementation runs `cpu_fwd`
+    /// on a copy of the data and moves the result back to the device.
+    #[allow(clippy::too_many_arguments)]
+    fn rocm_fwd(
+        &self,
+        s1: &RocmStorage,
+        l1: &Layout,
+        s2: &RocmStorage,
+        l2: &Layout,
+        s3: &RocmStorage,
+        l3: &Layout,
+    ) -> Result<(RocmStorage, Shape)> {
+        let c1 = s1.to_cpu_storage()?;
+        let c2 = s2.to_cpu_storage()?;
+        let c3 = s3.to_cpu_storage()?;
+        let (out, shape) = self.cpu_fwd(&c1, l1, &c2, l2, &c3, l3)?;
+        Ok((s1.device().storage_from_cpu_storage_owned(out)?, shape))
+    }
+
+    /// The forward pass, as run on a vulkan device. The default falls back to a
+    /// correct CPU round-trip; a backend with a native implementation overrides
+    /// it to keep the computation on-device.
+    #[allow(clippy::too_many_arguments)]
+    fn vulkan_fwd(
+        &self,
+        s1: &VulkanStorage,
+        l1: &Layout,
+        s2: &VulkanStorage,
+        l2: &Layout,
+        s3: &VulkanStorage,
+        l3: &Layout,
+    ) -> Result<(VulkanStorage, Shape)> {
+        let (out, shape) = s1.with_cpu_view(|c1| {
+            s2.with_cpu_view(|c2| s3.with_cpu_view(|c3| self.cpu_fwd(c1, l1, c2, l2, c3, l3)))
+        })?;
+        Ok((s1.device().storage_from_cpu_storage_owned(out)?, shape))
     }
 
     fn bwd(
@@ -270,6 +366,22 @@ pub trait InplaceOp1 {
             format!("no metal implementation for {}", self.name()).into(),
         ))
     }
+
+    /// The forward pass, as run on a rocm gpu device. The default implementation runs `cpu_fwd`
+    /// on a copy of the data and writes the result back to the device.
+    fn rocm_fwd(&self, storage: &mut RocmStorage, layout: &Layout) -> Result<()> {
+        let mut cpu = storage.to_cpu_storage()?;
+        self.cpu_fwd(&mut cpu, layout)?;
+        storage.overwrite_from_cpu(&cpu)
+    }
+
+    /// The forward pass, as run on a vulkan device. The default implementation runs `cpu_fwd`
+    /// on a copy of the data and writes the result back to the device buffer.
+    fn vulkan_fwd(&self, storage: &mut VulkanStorage, layout: &Layout) -> Result<()> {
+        let mut cpu = storage.to_cpu_storage()?;
+        self.cpu_fwd(&mut cpu, layout)?;
+        storage.overwrite_from_cpu(&cpu)
+    }
 }
 
 pub trait InplaceOp2 {
@@ -300,6 +412,36 @@ pub trait InplaceOp2 {
         Err(crate::Error::Metal(
             format!("no metal implementation for {}", self.name()).into(),
         ))
+    }
+
+    /// The forward pass, as run on a rocm gpu device. The default implementation runs `cpu_fwd`
+    /// on a copy of the data and writes the result back to the device.
+    fn rocm_fwd(
+        &self,
+        s1: &mut RocmStorage,
+        l1: &Layout,
+        s2: &RocmStorage,
+        l2: &Layout,
+    ) -> Result<()> {
+        let mut c1 = s1.to_cpu_storage()?;
+        let c2 = s2.to_cpu_storage()?;
+        self.cpu_fwd(&mut c1, l1, &c2, l2)?;
+        s1.overwrite_from_cpu(&c1)
+    }
+
+    /// The forward pass, as run on a vulkan device. The default implementation runs `cpu_fwd`
+    /// on a copy of the data and writes the result back to the device buffer.
+    fn vulkan_fwd(
+        &self,
+        s1: &mut VulkanStorage,
+        l1: &Layout,
+        s2: &VulkanStorage,
+        l2: &Layout,
+    ) -> Result<()> {
+        let mut c1 = s1.to_cpu_storage()?;
+        let c2 = s2.to_cpu_storage()?;
+        self.cpu_fwd(&mut c1, l1, &c2, l2)?;
+        s1.overwrite_from_cpu(&c1)
     }
 }
 
@@ -349,6 +491,44 @@ pub trait InplaceOp3 {
             format!("no metal implementation for {}", self.name()).into(),
         ))
     }
+
+    /// The forward pass, as run on a rocm gpu device. The default implementation runs `cpu_fwd`
+    /// on a copy of the data and writes the result back to the device.
+    #[allow(clippy::too_many_arguments)]
+    fn rocm_fwd(
+        &self,
+        s1: &mut RocmStorage,
+        l1: &Layout,
+        s2: &RocmStorage,
+        l2: &Layout,
+        s3: &RocmStorage,
+        l3: &Layout,
+    ) -> Result<()> {
+        let mut c1 = s1.to_cpu_storage()?;
+        let c2 = s2.to_cpu_storage()?;
+        let c3 = s3.to_cpu_storage()?;
+        self.cpu_fwd(&mut c1, l1, &c2, l2, &c3, l3)?;
+        s1.overwrite_from_cpu(&c1)
+    }
+
+    /// The forward pass, as run on a vulkan device. The default implementation runs `cpu_fwd`
+    /// on a copy of the data and writes the result back to the device buffer.
+    #[allow(clippy::too_many_arguments)]
+    fn vulkan_fwd(
+        &self,
+        s1: &mut VulkanStorage,
+        l1: &Layout,
+        s2: &VulkanStorage,
+        l2: &Layout,
+        s3: &VulkanStorage,
+        l3: &Layout,
+    ) -> Result<()> {
+        let mut c1 = s1.to_cpu_storage()?;
+        let c2 = s2.to_cpu_storage()?;
+        let c3 = s3.to_cpu_storage()?;
+        self.cpu_fwd(&mut c1, l1, &c2, l2, &c3, l3)?;
+        s1.overwrite_from_cpu(&c1)
+    }
 }
 
 impl Tensor {
@@ -376,27 +556,32 @@ impl Tensor {
     }
 }
 
+#[cfg(feature = "ug")]
 pub struct UgIOp1 {
     name: &'static str,
     #[cfg(feature = "cuda")]
     func: cudarc::driver::CudaFunction,
     #[cfg(feature = "metal")]
-    func: metal::ComputePipelineState,
+    func: candle_metal_kernels::metal::ComputePipeline,
 }
 
+#[cfg(feature = "ug")]
 impl UgIOp1 {
     #[allow(unused)]
-    #[cfg(not(target_arch = "wasm32"))]
+    #[cfg(all(not(target_arch = "wasm32"), not(target_os = "ios")))]
     pub fn new(
         name: &'static str,
-        kernel: ug::lang::ssa::Kernel,
+        kernel: candle_ug::lang::ssa::Kernel,
         device: &crate::Device,
     ) -> Result<Self> {
         #[cfg(feature = "cuda")]
         {
             let device = device.as_cuda_device()?;
             let func = device.compile(name, kernel)?;
-            Ok(Self { name, func })
+            Ok(Self {
+                name,
+                func: func.into_cuda_function(),
+            })
         }
         #[cfg(feature = "metal")]
         {
@@ -411,6 +596,7 @@ impl UgIOp1 {
     }
 }
 
+#[cfg(feature = "ug")]
 impl InplaceOp1 for UgIOp1 {
     fn name(&self) -> &'static str {
         self.name
@@ -423,7 +609,7 @@ impl InplaceOp1 for UgIOp1 {
     #[cfg(feature = "metal")]
     fn metal_fwd(&self, sto: &mut MetalStorage, layout: &Layout) -> Result<()> {
         use crate::backend::BackendStorage;
-        use candle_metal_kernels::utils::EncoderProvider;
+        use objc2_metal;
 
         let elem_count = layout.shape().elem_count();
         if sto.dtype() != crate::DType::F32 {
@@ -431,26 +617,21 @@ impl InplaceOp1 for UgIOp1 {
             crate::bail!("input is not a f32 tensor")
         }
         let device = sto.device();
-        println!("here");
-        let command_buffer = device.command_buffer()?;
-        let command_buffer = &command_buffer;
-        let encoder = command_buffer.encoder();
-        let encoder = encoder.as_ref();
+        let encoder = device.command_encoder()?;
         encoder.set_compute_pipeline_state(&self.func);
-        let (g, b) = if elem_count % 32 == 0 {
+        candle_metal_kernels::debug_group!(encoder, "{}", self.name);
+        let (g, b) = if elem_count.is_multiple_of(32) {
             (elem_count / 32, 32)
         } else {
             (elem_count, 1)
         };
-        let grid_dims = metal::MTLSize {
-            width: g as u64,
+        let grid_dims = objc2_metal::MTLSize {
+            width: g,
             height: 1,
             depth: 1,
         };
-        let group_dims = candle_metal_kernels::utils::get_block_dims(b as u64, 1, 1);
-        candle_metal_kernels::utils::set_param(encoder, 0, (sto.buffer(), 0usize));
-
-        encoder.use_resource(sto.buffer(), metal::MTLResourceUsage::Write);
+        let group_dims = candle_metal_kernels::utils::get_block_dims(b, 1, 1);
+        encoder.set_output_buffer(0, Some(sto.buffer()), 0);
         encoder.dispatch_threads(grid_dims, group_dims);
 
         Ok(())
@@ -459,16 +640,16 @@ impl InplaceOp1 for UgIOp1 {
     #[cfg(feature = "cuda")]
     fn cuda_fwd(&self, sto: &mut CudaStorage, layout: &Layout) -> Result<()> {
         use crate::cuda_backend::WrapErr;
-        use cudarc::driver::LaunchAsync;
+        use cudarc::driver::PushKernelArg;
 
         let elem_count = layout.shape().elem_count();
+        let stream = sto.device.cuda_stream();
         // TODO: support more dtypes.
         let sto = sto.as_cuda_slice::<f32>()?;
         let sto = match layout.contiguous_offsets() {
             None => crate::bail!("input has to be contiguous"),
             Some((o1, o2)) => sto.slice(o1..o2),
         };
-        let params = (&sto,);
         let (g, b) = if elem_count % 32 == 0 {
             (elem_count / 32, 32)
         } else {
@@ -479,7 +660,9 @@ impl InplaceOp1 for UgIOp1 {
             block_dim: (b as u32, 1, 1),
             shared_mem_bytes: 0,
         };
-        unsafe { self.func.clone().launch(cfg, params) }.w()?;
+        let mut builder = stream.launch_builder(&self.func);
+        builder.arg(&sto);
+        unsafe { builder.launch(cfg) }.w()?;
         Ok(())
     }
 }
