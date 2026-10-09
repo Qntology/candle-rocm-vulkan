@@ -135,6 +135,8 @@ impl QVulkanStorage {
     }
 
     pub fn from_bytes(device: &VulkanDevice, dtype: GgmlDType, bytes: &[u8]) -> Result<Self> {
+        let mut _p = crate::vulkan_backend::prof::scope("qtensor", if dtype == GgmlDType::Q8_0 { "load_q8" } else { "load_other(host)" });
+        _p.work(bytes.len());
         if dtype == GgmlDType::Q8_0 && qgpu::want_q8_on_gpu(device, bytes.len()) {
             match GpuQ8::from_ggml(device, bytes) {
                 Ok(g) => {
@@ -215,6 +217,7 @@ impl QVulkanStorage {
     }
 
     pub fn dequantize(&self, elem_count: usize) -> Result<VulkanStorage> {
+        let _p = crate::vulkan_backend::prof::scope("qtensor", "dequantize");
         let elem_count = elem_count.min(self.elem_count());
         if let Some(g) = &self.gpu {
             match g.dequantize(elem_count, DType::F32, &self.device) {
@@ -369,6 +372,8 @@ impl QVulkanStorage {
         layout: &Layout,
     ) -> Result<(VulkanStorage, Shape)> {
         let (dst_shape, mkn) = qmatmul_shapes(self_shape, layout)?;
+        let mut _p = crate::vulkan_backend::prof::scope("qtensor", "matmul_gpu");
+        _p.work(2 * mkn.0 * mkn.1 * mkn.2);
         if let Some(g) = &self.gpu {
             match g.matmul(mkn, storage, layout) {
                 Ok(out) => {
@@ -382,6 +387,7 @@ impl QVulkanStorage {
                 Err(e) => qgpu::note_fallback("q8 matmul", &e),
             }
         }
+        _p.rename("qtensor", "matmul_cpu");
         let dtype = self.dtype;
         self.with_host_bytes(|weights| {
             qmatmul(storage, layout, &dst_shape, mkn, |lhs, dst| {

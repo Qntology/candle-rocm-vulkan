@@ -1013,6 +1013,16 @@ impl QMatMul {
     }
 
     pub fn forward_via_f16(&self, xs: &Tensor) -> Result<Tensor> {
+        // Vulkan keeps tensors in host visible memory and runs the quantized matmul on
+        // GPU kernels that read the blocks directly. Dequantizing here would rebuild the
+        // whole f16 weight in host memory on every call and run the f16 matmul on the
+        // CPU (measured: 2.3 ms dequant + CPU GEMV per projection, ~90% of decode time).
+        // The quantized path takes the f16 input and returns f16, like this function.
+        if let Self::QTensor(t) = self {
+            if t.device().is_vulkan() {
+                return crate::Module::forward(self, xs);
+            }
+        }
         let w = self.dequantize_f16()?;
         let in_dtype = xs.dtype();
         let w = match *xs.dims() {

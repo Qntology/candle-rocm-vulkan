@@ -99,6 +99,8 @@ mod tensor;
 mod tensor_cat;
 pub mod test_utils;
 pub mod utils;
+/// Host side helpers for the gated delta rule (CPU / Vulkan).
+pub mod delta_rule;
 mod variable;
 
 #[cfg(feature = "cudnn")]

@@ -484,7 +484,28 @@ fn run(
         let submit = [vk::SubmitInfo::default().command_buffers(&cmds)];
         d.queue_submit(ctx.queue, &submit, exec.fence)
             .map_err(|e| vk_err(dev, "queue_submit", e))?;
-        let wait = d.wait_for_fences(&[exec.fence], true, u64::MAX);
+        // Short jobs finish long before the OS wakes a thread blocked in
+        // vkWaitForFences: poll the fence first (see `spin_us`).
+        let mut done = false;
+        let spin = spin_us();
+        if spin > 0 {
+            let t0 = std::time::Instant::now();
+            while t0.elapsed().as_micros() < spin as u128 {
+                match d.get_fence_status(exec.fence) {
+                    Ok(true) => {
+                        done = true;
+                        break;
+                    }
+                    Ok(false) => std::hint::spin_loop(),
+                    Err(_) => break,
+                }
+            }
+        }
+        let wait = if done {
+            Ok(())
+        } else {
+            d.wait_for_fences(&[exec.fence], true, u64::MAX)
+        };
         let reset = d.reset_fences(&[exec.fence]);
         wait.map_err(|e| vk_err(dev, "wait_for_fences", e))?;
         reset.map_err(|e| vk_err(dev, "reset_fences", e))?;
@@ -522,7 +543,21 @@ pub(crate) enum Op<'a> {
 
 /// Records `ops` into one command buffer, submits it and waits for completion. A host
 /// barrier is appended so results are readable through mapped memory on return.
+/// How long `run_ops` polls the fence before blocking, in microseconds
+/// (`CANDLE_VULKAN_SPIN_US`, default 1000, 0 disables polling).
+fn spin_us() -> u64 {
+    static V: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *V.get_or_init(|| {
+        std::env::var("CANDLE_VULKAN_SPIN_US")
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .unwrap_or(1000)
+    })
+}
+
 pub(crate) fn run_ops(dev: &VulkanDevice, ops: &[Op<'_>]) -> Result<()> {
+    let mut _p = super::prof::scope("gpu", "submit_wait");
+    _p.work(ops.len());
     let limits = dev.limits();
     let mut dispatches = 0u32;
     for op in ops {
@@ -698,7 +733,28 @@ pub(crate) fn run_ops(dev: &VulkanDevice, ops: &[Op<'_>]) -> Result<()> {
         let submit = [vk::SubmitInfo::default().command_buffers(&cmds)];
         d.queue_submit(ctx.queue, &submit, exec.fence)
             .map_err(|e| vk_err(dev, "queue_submit", e))?;
-        let wait = d.wait_for_fences(&[exec.fence], true, u64::MAX);
+        // Short jobs finish long before the OS wakes a thread blocked in
+        // vkWaitForFences: poll the fence first (see `spin_us`).
+        let mut done = false;
+        let spin = spin_us();
+        if spin > 0 {
+            let t0 = std::time::Instant::now();
+            while t0.elapsed().as_micros() < spin as u128 {
+                match d.get_fence_status(exec.fence) {
+                    Ok(true) => {
+                        done = true;
+                        break;
+                    }
+                    Ok(false) => std::hint::spin_loop(),
+                    Err(_) => break,
+                }
+            }
+        }
+        let wait = if done {
+            Ok(())
+        } else {
+            d.wait_for_fences(&[exec.fence], true, u64::MAX)
+        };
         let reset = d.reset_fences(&[exec.fence]);
         wait.map_err(|e| vk_err(dev, "wait_for_fences", e))?;
         reset.map_err(|e| vk_err(dev, "reset_fences", e))?;

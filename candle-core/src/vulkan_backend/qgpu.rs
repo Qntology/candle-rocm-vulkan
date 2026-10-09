@@ -428,6 +428,8 @@ const STAGING_CHUNK: usize = 32 << 20;
 
 /// Copies `data` into `dst` at `offset` (directly when mapped, else through staging).
 pub(crate) fn write(dev: &VulkanDevice, dst: &GpuBuf, offset: usize, data: &[u8]) -> Result<()> {
+    let mut _p = super::prof::scope("gpu", "write(staging)");
+    _p.work(data.len());
     if data.is_empty() {
         return Ok(());
     }
@@ -461,6 +463,8 @@ pub(crate) fn write(dev: &VulkanDevice, dst: &GpuBuf, offset: usize, data: &[u8]
 
 /// Copies `out.len()` bytes of `src` starting at `offset` into `out`.
 pub(crate) fn read(dev: &VulkanDevice, src: &GpuBuf, offset: usize, out: &mut [u8]) -> Result<()> {
+    let mut _p = super::prof::scope("gpu", "read(staging)");
+    _p.work(out.len());
     if out.is_empty() {
         return Ok(());
     }
@@ -862,6 +866,8 @@ impl GpuQ8 {
     /// Moves GGML `Q8_0` blocks into GPU memory, or fails when no GPU memory kind has
     /// room (the caller keeps the CPU layout then).
     pub(crate) fn from_ggml(dev: &VulkanDevice, bytes: &[u8]) -> Result<Self> {
+        let mut _p = super::prof::scope("q8", "upload(repack+copy)");
+        _p.work(bytes.len());
         if !bytes.len().is_multiple_of(Q8_BLOCK_BYTES) {
             crate::bail!("vulkan q8: {} bytes are not whole Q8_0 blocks", bytes.len())
         }
@@ -891,6 +897,7 @@ impl GpuQ8 {
 
     /// The GGML `Q8_0` bytes of this tensor (downloads them from the GPU).
     pub(crate) fn to_ggml(&self) -> Result<Vec<u8>> {
+        let _p = super::prof::scope("q8", "download");
         let nb = self.nblocks;
         let mut packed = vec![0u8; self.d_off + nb * 4];
         read(&self.buf.dev, &self.buf, 0, &mut packed)?;
@@ -937,6 +944,8 @@ impl GpuQ8 {
         layout: &Layout,
     ) -> Result<VulkanStorage> {
         let dev = x.device.clone();
+        let mut _p = super::prof::scope("q8", if m <= GEMV_MAX_M { "gemv" } else { "gemm" });
+        _p.work(2 * m * n * k);
         if !k.is_multiple_of(32) || self.nblocks * 32 != n * k {
             crate::bail!("vulkan q8 matmul: weights do not hold {n}x{k} values")
         }
@@ -1043,6 +1052,7 @@ impl GpuQ8 {
 
     /// Rows `ids` of the `(rows, hidden)` table, as f32.
     pub(crate) fn embedding(&self, rows: usize, hidden: usize, ids: &[u32], dev: &VulkanDevice) -> Result<VulkanStorage> {
+        let _p = super::prof::scope("q8", "gather");
         if !hidden.is_multiple_of(32) || self.nblocks * 32 != rows * hidden {
             crate::bail!("vulkan q8 embedding: table does not hold {rows}x{hidden} values")
         }
@@ -1073,6 +1083,7 @@ impl GpuQ8 {
 
     /// The first `elem_count` values as f32 or f16.
     pub(crate) fn dequantize(&self, elem_count: usize, dtype: DType, dev: &VulkanDevice) -> Result<VulkanStorage> {
+        let _p = super::prof::scope("q8", "dequant");
         let elem_count = elem_count.min(self.nblocks * 32);
         let half = match dtype {
             DType::F32 => false,
@@ -1352,6 +1363,8 @@ fn mirror_of(rhs: &VulkanStorage) -> Option<Arc<GpuBuf>> {
         return None;
     }
     let bytes = rhs.as_bytes();
+    let mut _p = super::prof::scope("gpu", "mirror_create");
+    _p.work(bytes.len());
     let size = bytes.len().max(4).div_ceil(4) * 4;
     let buf = match GpuBuf::new(&rhs.device, size, Use::Weights) {
         Ok(b) => b,
