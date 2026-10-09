@@ -3,8 +3,8 @@ name = "candle-rocm"
 version = "0.2.0"
 edition = "2021"
 description = "ROCm/HIP backend for candle ML framework"
-license = "MIT OR Apache-2.0"
-repository = "https://github.com/Nu11ified/candle-rocm"
+license = "Apache-2.0"
+repository = "https://github.com/Qntology/candle-rocm-vulkan"
 
 [dependencies]
 candle-core = { path = "../candle-core", features = ["rocm"] }

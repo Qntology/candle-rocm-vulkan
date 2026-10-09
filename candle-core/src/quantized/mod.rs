@@ -1013,6 +1013,11 @@ impl QMatMul {
     }
 
     pub fn forward_via_f16(&self, xs: &Tensor) -> Result<Tensor> {
+        if let Self::QTensor(t) = self {
+            if t.device().is_vulkan() {
+                return crate::Module::forward(self, xs);
+            }
+        }
         let w = self.dequantize_f16()?;
         let in_dtype = xs.dtype();
         let w = match *xs.dims() {

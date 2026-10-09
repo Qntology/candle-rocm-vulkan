@@ -12,32 +12,6 @@ use hip_sys::hip_runtime::hipFunction_t;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, OnceLock};
 
-/// Snapshot of the GPU memory state, split by who owns the bytes.
-#[derive(Debug, Clone, Copy, Default)]
-pub struct MemoryReport {
-    /// Free / total device memory as reported by the driver.
-    pub free: usize,
-    pub total: usize,
-    /// Bytes held by live tensors (application side).
-    pub live_bytes: usize,
-    pub live_allocs: usize,
-    pub peak_bytes: usize,
-    /// Default stream-ordered pool: bytes reserved from the driver / handed out to tensors.
-    pub pool_reserved: u64,
-    pub pool_used: u64,
-    pub pool_reserved_high: u64,
-}
-
-impl MemoryReport {
-    /// Driver-side bytes in use that no live tensor accounts for (context, kernel code objects,
-    /// rocBLAS workspace, pool cache, other processes ...).
-    pub fn unattributed_used(&self) -> usize {
-        self.total
-            .saturating_sub(self.free)
-            .saturating_sub(self.live_bytes)
-    }
-}
-
 struct RngState {
     seed: Option<u64>,
     rng: Option<rand::rngs::StdRng>,
@@ -84,7 +58,6 @@ impl RocmDevice {
             && hip_runtime::memory::stream_ordered_alloc_supported();
         let trim_on_sync = env_flag("CANDLE_ROCM_TRIM_ON_SYNC", true);
         if stream_ordered && env_flag("CANDLE_ROCM_POOL_RELEASE_ZERO", true) {
-            // Make the pool give memory back at every synchronization instead of caching it.
             let _ = hip_runtime::memory::set_pool_release_threshold(ordinal as i32, 0);
         }
         let modules = Module::ALL.iter().map(|_| OnceLock::new()).collect();
@@ -148,38 +121,13 @@ impl RocmDevice {
         Ok(())
     }
 
-    /// Memory snapshot split into application-owned and driver-side bytes.
-    pub fn memory_report(&self) -> Result<MemoryReport> {
-        let (free, total) = self.mem_info()?;
-        let a = hip_runtime::memory::alloc_stats();
-        let pool = if self.inner.stream_ordered {
-            hip_runtime::memory::pool_stats(self.inner.ordinal as i32).unwrap_or_default()
-        } else {
-            Default::default()
-        };
-        Ok(MemoryReport {
-            free,
-            total,
-            live_bytes: a.live_bytes,
-            live_allocs: a.live_allocs,
-            peak_bytes: a.peak_bytes,
-            pool_reserved: pool.reserved_current,
-            pool_used: pool.used_current,
-            pool_reserved_high: pool.reserved_high,
-        })
-    }
-
-    /// Hands back everything that can be handed back without destroying the device context:
-    /// synchronizes, trims the stream-ordered pool and re-creates the rocBLAS handle (its
-    /// internal workspace only grows and is otherwise kept for the lifetime of the handle).
-    /// Must not be called while another thread is running GEMMs it still needs the result of.
     pub fn release_cached_resources(&self) -> Result<()> {
         self.inner.hip.synchronize().w()?;
         self.trim_memory_pool()?;
         {
             let mut blas = self.inner.blas.lock().unwrap();
             let fresh = RocBlas::new().w()?;
-            *blas = fresh; // drops (destroys) the old handle and its workspace
+            *blas = fresh;
         }
         self.trim_memory_pool()?;
         self.inner.hip.synchronize().w()

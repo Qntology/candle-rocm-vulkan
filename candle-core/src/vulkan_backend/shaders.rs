@@ -29,6 +29,7 @@ use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock};
 
 const MAX_BINDINGS: u32 = 8;
+pub(crate) const MAX_SETS: u32 = 32;
 const MAX_RANK: usize = 6;
 const WG: u32 = 256;
 
@@ -267,7 +268,7 @@ impl Kernel {
 }
 
 /// Returns the cached kernel `key`, compiling `source()` on first use.
-fn kernel(
+pub(crate) fn kernel(
     dev: &VulkanDevice,
     key: &str,
     bindings: u32,
@@ -325,12 +326,12 @@ impl ExecState {
         };
         let sizes = [vk::DescriptorPoolSize {
             ty: vk::DescriptorType::STORAGE_BUFFER,
-            descriptor_count: MAX_BINDINGS,
+            descriptor_count: MAX_BINDINGS * MAX_SETS,
         }];
         let desc_pool = match unsafe {
             device.create_descriptor_pool(
                 &vk::DescriptorPoolCreateInfo::default()
-                    .max_sets(1)
+                    .max_sets(MAX_SETS)
                     .pool_sizes(&sizes),
                 None,
             )
@@ -482,12 +483,269 @@ fn run(
         let submit = [vk::SubmitInfo::default().command_buffers(&cmds)];
         d.queue_submit(ctx.queue, &submit, exec.fence)
             .map_err(|e| vk_err(dev, "queue_submit", e))?;
-        let wait = d.wait_for_fences(&[exec.fence], true, u64::MAX);
+        let mut done = false;
+        let spin = spin_us();
+        if spin > 0 {
+            let t0 = std::time::Instant::now();
+            while t0.elapsed().as_micros() < spin as u128 {
+                match d.get_fence_status(exec.fence) {
+                    Ok(true) => {
+                        done = true;
+                        break;
+                    }
+                    Ok(false) => std::hint::spin_loop(),
+                    Err(_) => break,
+                }
+            }
+        }
+        let wait = if done {
+            Ok(())
+        } else {
+            d.wait_for_fences(&[exec.fence], true, u64::MAX)
+        };
         let reset = d.reset_fences(&[exec.fence]);
         wait.map_err(|e| vk_err(dev, "wait_for_fences", e))?;
         reset.map_err(|e| vk_err(dev, "reset_fences", e))?;
     }
     NATIVE_EXEC.fetch_add(1, Ordering::Relaxed);
+    Ok(())
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct Bind {
+    pub(crate) buffer: vk::Buffer,
+    pub(crate) offset: u64,
+    pub(crate) range: u64,
+}
+
+pub(crate) enum Op<'a> {
+    Copy {
+        src: vk::Buffer,
+        src_off: u64,
+        dst: vk::Buffer,
+        dst_off: u64,
+        size: u64,
+    },
+    Dispatch {
+        kernel: &'a Kernel,
+        binds: Vec<Bind>,
+        push: Vec<u8>,
+        groups: [u32; 3],
+    },
+    Barrier,
+}
+
+fn spin_us() -> u64 {
+    static V: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *V.get_or_init(|| {
+        std::env::var("CANDLE_VULKAN_SPIN_US")
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .unwrap_or(1000)
+    })
+}
+
+pub(crate) fn run_ops(dev: &VulkanDevice, ops: &[Op<'_>]) -> Result<()> {
+    let limits = dev.limits();
+    let mut dispatches = 0u32;
+    for op in ops {
+        if let Op::Dispatch {
+            kernel,
+            binds,
+            push,
+            groups,
+        } = op
+        {
+            dispatches += 1;
+            if binds.len() as u32 != kernel.bindings || push.len() as u32 != kernel.push_size {
+                crate::bail!("vulkan dispatch: binding/push constant mismatch")
+            }
+            if push.len() as u32 > limits.max_push_constants_size {
+                crate::bail!("vulkan dispatch: push constants exceed the device limit")
+            }
+            for (i, g) in groups.iter().enumerate() {
+                if *g == 0 || *g > limits.max_workgroup_count[i] {
+                    crate::bail!("vulkan dispatch: {g} workgroups on axis {i} out of range")
+                }
+            }
+            for b in binds {
+                if b.range == 0 || b.range > limits.max_storage_buffer_range {
+                    crate::bail!(
+                        "vulkan dispatch: binding of {} bytes outside maxStorageBufferRange",
+                        b.range
+                    )
+                }
+            }
+        }
+    }
+    if dispatches > MAX_SETS {
+        crate::bail!("vulkan run_ops: {dispatches} dispatches exceed {MAX_SETS} per submission")
+    }
+    if ops.is_empty() {
+        return Ok(());
+    }
+    let ctx = dev.ctx();
+    let d = dev.device();
+    let exec = ctx
+        .exec
+        .lock()
+        .map_err(|_| Error::Msg("vulkan: exec state poisoned".into()))?;
+    let all_writes = vk::AccessFlags::SHADER_WRITE | vk::AccessFlags::TRANSFER_WRITE;
+    let all_stages = vk::PipelineStageFlags::COMPUTE_SHADER | vk::PipelineStageFlags::TRANSFER;
+    unsafe {
+        d.reset_descriptor_pool(exec.desc_pool, vk::DescriptorPoolResetFlags::empty())
+            .map_err(|e| vk_err(dev, "reset_descriptor_pool", e))?;
+        let cmd = exec.cmd;
+        d.reset_command_buffer(cmd, vk::CommandBufferResetFlags::empty())
+            .map_err(|e| vk_err(dev, "reset_command_buffer", e))?;
+        d.begin_command_buffer(
+            cmd,
+            &vk::CommandBufferBeginInfo::default()
+                .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT),
+        )
+        .map_err(|e| vk_err(dev, "begin_command_buffer", e))?;
+        for op in ops {
+            match op {
+                Op::Copy {
+                    src,
+                    src_off,
+                    dst,
+                    dst_off,
+                    size,
+                } => {
+                    if *size > 0 {
+                        d.cmd_copy_buffer(
+                            cmd,
+                            *src,
+                            *dst,
+                            &[vk::BufferCopy {
+                                src_offset: *src_off,
+                                dst_offset: *dst_off,
+                                size: *size,
+                            }],
+                        );
+                    }
+                }
+                Op::Barrier => {
+                    let b = [vk::MemoryBarrier::default()
+                        .src_access_mask(all_writes)
+                        .dst_access_mask(
+                            vk::AccessFlags::SHADER_READ
+                                | vk::AccessFlags::SHADER_WRITE
+                                | vk::AccessFlags::TRANSFER_READ
+                                | vk::AccessFlags::TRANSFER_WRITE,
+                        )];
+                    d.cmd_pipeline_barrier(
+                        cmd,
+                        all_stages,
+                        all_stages,
+                        vk::DependencyFlags::empty(),
+                        &b,
+                        &[],
+                        &[],
+                    );
+                }
+                Op::Dispatch {
+                    kernel,
+                    binds,
+                    push,
+                    groups,
+                } => {
+                    let set_layouts = [kernel.set_layout];
+                    let set = d
+                        .allocate_descriptor_sets(
+                            &vk::DescriptorSetAllocateInfo::default()
+                                .descriptor_pool(exec.desc_pool)
+                                .set_layouts(&set_layouts),
+                        )
+                        .map_err(|e| vk_err(dev, "allocate_descriptor_sets", e))?[0];
+                    let infos: Vec<[vk::DescriptorBufferInfo; 1]> = binds
+                        .iter()
+                        .map(|b| {
+                            [vk::DescriptorBufferInfo {
+                                buffer: b.buffer,
+                                offset: b.offset,
+                                range: b.range,
+                            }]
+                        })
+                        .collect();
+                    let writes: Vec<_> = infos
+                        .iter()
+                        .enumerate()
+                        .map(|(i, info)| {
+                            vk::WriteDescriptorSet::default()
+                                .dst_set(set)
+                                .dst_binding(i as u32)
+                                .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                                .buffer_info(info)
+                        })
+                        .collect();
+                    d.update_descriptor_sets(&writes, &[]);
+                    d.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::COMPUTE, kernel.pipeline);
+                    d.cmd_bind_descriptor_sets(
+                        cmd,
+                        vk::PipelineBindPoint::COMPUTE,
+                        kernel.layout,
+                        0,
+                        &[set],
+                        &[],
+                    );
+                    if !push.is_empty() {
+                        d.cmd_push_constants(
+                            cmd,
+                            kernel.layout,
+                            vk::ShaderStageFlags::COMPUTE,
+                            0,
+                            push,
+                        );
+                    }
+                    d.cmd_dispatch(cmd, groups[0], groups[1], groups[2]);
+                }
+            }
+        }
+        let host = [vk::MemoryBarrier::default()
+            .src_access_mask(all_writes)
+            .dst_access_mask(vk::AccessFlags::HOST_READ | vk::AccessFlags::HOST_WRITE)];
+        d.cmd_pipeline_barrier(
+            cmd,
+            all_stages,
+            vk::PipelineStageFlags::HOST,
+            vk::DependencyFlags::empty(),
+            &host,
+            &[],
+            &[],
+        );
+        d.end_command_buffer(cmd)
+            .map_err(|e| vk_err(dev, "end_command_buffer", e))?;
+        let cmds = [cmd];
+        let submit = [vk::SubmitInfo::default().command_buffers(&cmds)];
+        d.queue_submit(ctx.queue, &submit, exec.fence)
+            .map_err(|e| vk_err(dev, "queue_submit", e))?;
+        let mut done = false;
+        let spin = spin_us();
+        if spin > 0 {
+            let t0 = std::time::Instant::now();
+            while t0.elapsed().as_micros() < spin as u128 {
+                match d.get_fence_status(exec.fence) {
+                    Ok(true) => {
+                        done = true;
+                        break;
+                    }
+                    Ok(false) => std::hint::spin_loop(),
+                    Err(_) => break,
+                }
+            }
+        }
+        let wait = if done {
+            Ok(())
+        } else {
+            d.wait_for_fences(&[exec.fence], true, u64::MAX)
+        };
+        let reset = d.reset_fences(&[exec.fence]);
+        wait.map_err(|e| vk_err(dev, "wait_for_fences", e))?;
+        reset.map_err(|e| vk_err(dev, "reset_fences", e))?;
+    }
+    NATIVE_EXEC.fetch_add(dispatches as usize, Ordering::Relaxed);
     Ok(())
 }
 
@@ -575,7 +833,7 @@ fn collapse(dims: &[usize], strides: &[&[usize]]) -> Option<(Vec<usize>, Vec<Vec
 }
 
 /// Largest element index reachable through `layout` (plus one).
-fn span(layout: &Layout) -> usize {
+pub(crate) fn span(layout: &Layout) -> usize {
     let mut max = layout.start_offset();
     for (d, s) in layout.dims().iter().zip(layout.stride().iter()) {
         if *d == 0 {
@@ -1005,7 +1263,7 @@ pub(crate) fn reduce(
 /// A and B staged in shared memory. A and B are read through arbitrary
 /// row/column strides (transposed operands need no copy) and up to two batch
 /// dims with their own strides (0 for broadcast batches). C is row major.
-const GLSL_MATMUL: &str = r#"#version 450
+pub(crate) const GLSL_MATMUL: &str = r#"#version 450
 layout(local_size_x = 16, local_size_y = 16) in;
 layout(set = 0, binding = 0) readonly buffer A { float a[]; };
 layout(set = 0, binding = 1) readonly buffer B { float b[]; };
@@ -1092,7 +1350,7 @@ void main() {
 /// Batch dims (in front of the last two) of a matmul operand as
 /// `(outer, inner, outer_stride, inner_stride)`; a batch that collapses to a
 /// single linear dim is reported as `(1, batch, 0, stride)`.
-fn batch_strides(layout: &Layout, batch: usize) -> Option<(usize, usize, usize, usize)> {
+pub(crate) fn batch_strides(layout: &Layout, batch: usize) -> Option<(usize, usize, usize, usize)> {
     let dims = layout.dims();
     let stride = layout.stride();
     let r = dims.len();
@@ -1114,7 +1372,7 @@ fn batch_strides(layout: &Layout, batch: usize) -> Option<(usize, usize, usize, 
 
 /// Expresses both operands' batch dims with one `(outer, inner)` split.
 /// Returns `(inner, a_outer, a_inner, b_outer, b_inner)` strides.
-fn unify_batches(
+pub(crate) fn unify_batches(
     a: (usize, usize, usize, usize),
     b: (usize, usize, usize, usize),
 ) -> Option<(usize, usize, usize, usize, usize)> {

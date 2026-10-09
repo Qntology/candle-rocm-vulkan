@@ -1,21 +1,20 @@
 //! Quantized (GGML block format) tensors stored on a Vulkan device.
 //!
-//! The blocks are kept as raw bytes in a mapped host visible buffer, so a
-//! quantized weight uses the same amount of memory as in the GGUF file. The
-//! matmul and dequantization run the CPU k-quant kernels directly on the
-//! mapped memory, without copying the weights.
 use super::k_quants::{
     BlockQ2K, BlockQ3K, BlockQ4K, BlockQ4_0, BlockQ4_1, BlockQ5K, BlockQ5_0, BlockQ5_1, BlockQ6K,
     BlockQ8K, BlockQ8_0, BlockQ8_1, GgmlType,
 };
 use super::{GgmlDType, QStorage, QuantizedType};
 use crate::backend::BackendStorage;
+use crate::vulkan_backend::qgpu::{self, GpuQ8};
 use crate::{CpuStorage, DType, Layout, Result, Shape, VulkanDevice, VulkanStorage};
 use half::{bf16, f16};
 
 pub struct QVulkanStorage {
-    data: VulkanStorage,
+    data: Option<VulkanStorage>,
+    gpu: Option<GpuQ8>,
     dtype: GgmlDType,
+    device: VulkanDevice,
 }
 
 macro_rules! with_blocks {
@@ -120,12 +119,52 @@ impl QVulkanStorage {
         let bytes = elem_count / dtype.block_size() * dtype.type_size();
         let mut data = device.alloc_buffer(bytes, DType::U8)?;
         data.as_bytes_mut().fill(0);
-        Ok(Self { data, dtype })
+        Ok(Self {
+            data: Some(data),
+            gpu: None,
+            dtype,
+            device: device.clone(),
+        })
     }
 
     pub fn from_bytes(device: &VulkanDevice, dtype: GgmlDType, bytes: &[u8]) -> Result<Self> {
+        if dtype == GgmlDType::Q8_0 && qgpu::want_q8_on_gpu(device, bytes.len()) {
+            match GpuQ8::from_ggml(device, bytes) {
+                Ok(g) => {
+                    return Ok(Self {
+                        data: None,
+                        gpu: Some(g),
+                        dtype,
+                        device: device.clone(),
+                    })
+                }
+                Err(_) => {}
+            }
+        }
         let data = device.upload_bytes(bytes, bytes.len(), DType::U8)?;
-        Ok(Self { data, dtype })
+        Ok(Self {
+            data: Some(data),
+            gpu: None,
+            dtype,
+            device: device.clone(),
+        })
+    }
+
+    fn maybe_promote(&mut self) {
+        if self.gpu.is_some() || self.dtype != GgmlDType::Q8_0 {
+            return;
+        }
+        let Some(data) = &self.data else { return };
+        if !qgpu::want_q8_on_gpu(&self.device, data.capacity_bytes) {
+            return;
+        }
+        match GpuQ8::from_ggml(&self.device, data.as_bytes()) {
+            Ok(g) => {
+                self.gpu = Some(g);
+                self.data = None;
+            }
+            Err(_) => {}
+        }
     }
 
     pub fn dtype(&self) -> GgmlDType {
@@ -133,31 +172,65 @@ impl QVulkanStorage {
     }
 
     pub fn device(&self) -> &VulkanDevice {
-        &self.data.device
+        &self.device
+    }
+
+    pub fn is_on_gpu(&self) -> bool {
+        self.gpu.is_some()
     }
 
     pub fn storage_size_in_bytes(&self) -> usize {
-        self.data.capacity_bytes
+        match (&self.data, &self.gpu) {
+            (Some(d), _) => d.capacity_bytes,
+            (None, Some(g)) => g.ggml_bytes(),
+            (None, None) => 0,
+        }
     }
 
     fn elem_count(&self) -> usize {
-        self.data.capacity_bytes / self.dtype.type_size() * self.dtype.block_size()
+        self.storage_size_in_bytes() / self.dtype.type_size() * self.dtype.block_size()
+    }
+
+    fn with_host_bytes<R>(&self, f: impl FnOnce(&[u8]) -> Result<R>) -> Result<R> {
+        match (&self.data, &self.gpu) {
+            (Some(d), _) => f(d.as_bytes()),
+            (None, Some(g)) => {
+                let v = g.to_ggml()?;
+                let tmp = self.device.upload_bytes(&v, v.len(), DType::U8)?;
+                f(tmp.as_bytes())
+            }
+            (None, None) => crate::bail!("vulkan quantized storage holds no data"),
+        }
     }
 
     pub fn dequantize(&self, elem_count: usize) -> Result<VulkanStorage> {
         let elem_count = elem_count.min(self.elem_count());
-        let mut out = self.device().alloc_buffer(elem_count, DType::F32)?;
-        let dst = out.as_mut_slice::<f32>()?;
-        with_blocks!(self.dtype, self.data.as_bytes(), |blocks| dequantize_into(
-            blocks, dst
-        ))?;
+        if let Some(g) = &self.gpu {
+            match g.dequantize(elem_count, DType::F32, &self.device) {
+                Ok(s) => return Ok(s),
+                Err(_) => {}
+            }
+        }
+        let mut out = self.device.alloc_buffer(elem_count, DType::F32)?;
+        let dtype = self.dtype;
+        self.with_host_bytes(|bytes| {
+            let dst = out.as_mut_slice::<f32>()?;
+            with_blocks!(dtype, bytes, |blocks| dequantize_into(blocks, dst))
+        })?;
         Ok(out)
     }
 
     pub fn dequantize_f16(&self, elem_count: usize) -> Result<VulkanStorage> {
+        if let Some(g) = &self.gpu {
+            let n = elem_count.min(self.elem_count());
+            match g.dequantize(n, DType::F16, &self.device) {
+                Ok(s) => return Ok(s),
+                Err(_) => {}
+            }
+        }
         let f32s = self.dequantize(elem_count)?;
         let src = f32s.as_slice::<f32>()?;
-        let mut out = self.device().alloc_buffer(src.len(), DType::F16)?;
+        let mut out = self.device.alloc_buffer(src.len(), DType::F16)?;
         for (d, s) in out.as_mut_slice::<f16>()?.iter_mut().zip(src.iter()) {
             *d = f16::from_f32(*s);
         }
@@ -166,14 +239,20 @@ impl QVulkanStorage {
 
     fn write_quantized(&mut self, q: &dyn QuantizedType) -> Result<()> {
         let bytes = unsafe { std::slice::from_raw_parts(q.as_ptr(), q.storage_size_in_bytes()) };
-        if bytes.len() != self.data.capacity_bytes {
+        let expected = self.storage_size_in_bytes();
+        if bytes.len() != expected {
             crate::bail!(
                 "vulkan quantize: size mismatch {} vs {}",
                 bytes.len(),
-                self.data.capacity_bytes
+                expected
             )
         }
-        self.data.as_bytes_mut().copy_from_slice(bytes);
+        self.gpu = None;
+        match &mut self.data {
+            Some(d) => d.as_bytes_mut().copy_from_slice(bytes),
+            None => self.data = Some(self.device.upload_bytes(bytes, bytes.len(), DType::U8)?),
+        }
+        self.maybe_promote();
         Ok(())
     }
 
@@ -216,7 +295,7 @@ impl QVulkanStorage {
     }
 
     pub fn data(&self) -> Result<Vec<u8>> {
-        Ok(self.data.as_bytes().to_vec())
+        self.with_host_bytes(|b| Ok(b.to_vec()))
     }
 
     pub fn embedding(
@@ -242,22 +321,31 @@ impl QVulkanStorage {
                 "quantized embedding hidden size {hidden} is not divisible by block size {block}"
             )
         }
+        if let Some(g) = &self.gpu {
+            match g.embedding(rows, hidden, &ids, &self.device) {
+                Ok(s) => return Ok(s),
+                Err(_) => {}
+            }
+        }
         let row_bytes = hidden / block * self.dtype.type_size();
-        if self.data.capacity_bytes != rows * row_bytes {
+        if self.storage_size_in_bytes() != rows * row_bytes {
             crate::bail!("vulkan quantized embedding: storage does not hold {rows}x{hidden} values")
         }
-        let mut out = self.device().alloc_buffer(ids.len() * hidden, DType::F32)?;
-        let dst = out.as_mut_slice::<f32>()?;
-        let src = self.data.as_bytes();
-        for (o, &id) in ids.iter().enumerate() {
-            let id = id as usize;
-            if id >= rows {
-                crate::bail!("embedding id {id} is out of range for {rows} rows")
+        let mut out = self.device.alloc_buffer(ids.len() * hidden, DType::F32)?;
+        let dtype = self.dtype;
+        self.with_host_bytes(|src| {
+            let dst = out.as_mut_slice::<f32>()?;
+            for (o, &id) in ids.iter().enumerate() {
+                let id = id as usize;
+                if id >= rows {
+                    crate::bail!("embedding id {id} is out of range for {rows} rows")
+                }
+                let row = &src[id * row_bytes..(id + 1) * row_bytes];
+                let dst = &mut dst[o * hidden..(o + 1) * hidden];
+                with_blocks!(dtype, row, |blocks| dequantize_into(blocks, dst))?;
             }
-            let row = &src[id * row_bytes..(id + 1) * row_bytes];
-            let dst = &mut dst[o * hidden..(o + 1) * hidden];
-            with_blocks!(self.dtype, row, |blocks| dequantize_into(blocks, dst))?;
-        }
+            Ok(())
+        })?;
         Ok(out)
     }
 
@@ -269,11 +357,26 @@ impl QVulkanStorage {
         layout: &Layout,
     ) -> Result<(VulkanStorage, Shape)> {
         let (dst_shape, mkn) = qmatmul_shapes(self_shape, layout)?;
-        let weights = self.data.as_bytes();
-        qmatmul(storage, layout, &dst_shape, mkn, |lhs, dst| {
-            with_blocks!(self.dtype, weights, |blocks| super::k_quants::matmul(
-                mkn, lhs, blocks, dst
-            ))
+        if let Some(g) = &self.gpu {
+            match g.matmul(mkn, storage, layout) {
+                Ok(out) => {
+                    let in_dtype = storage.dtype();
+                    if in_dtype == DType::F32 {
+                        return Ok((out, dst_shape));
+                    }
+                    let out = out.to_dtype(&Layout::contiguous(&dst_shape), in_dtype)?;
+                    return Ok((out, dst_shape));
+                }
+                Err(_) => {}
+            }
+        }
+        let dtype = self.dtype;
+        self.with_host_bytes(|weights| {
+            qmatmul(storage, layout, &dst_shape, mkn, |lhs, dst| {
+                with_blocks!(dtype, weights, |blocks| super::k_quants::matmul(
+                    mkn, lhs, blocks, dst
+                ))
+            })
         })
     }
 

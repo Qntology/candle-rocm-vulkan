@@ -12,13 +12,7 @@ pub type hipDeviceptr_t = *mut c_void;
 pub type hipMemPool_t = *mut c_void;
 
 pub const HIP_SUCCESS: hipError_t = 0;
-
-/// `hipMemPoolAttr` values (uint64 each).
 pub const HIP_MEMPOOL_ATTR_RELEASE_THRESHOLD: c_int = 0x4;
-pub const HIP_MEMPOOL_ATTR_RESERVED_MEM_CURRENT: c_int = 0x5;
-pub const HIP_MEMPOOL_ATTR_RESERVED_MEM_HIGH: c_int = 0x6;
-pub const HIP_MEMPOOL_ATTR_USED_MEM_CURRENT: c_int = 0x7;
-pub const HIP_MEMPOOL_ATTR_USED_MEM_HIGH: c_int = 0x8;
 pub const HIP_ERROR_OUT_OF_MEMORY: hipError_t = 2;
 pub const HIP_ERROR_NO_DEVICE: hipError_t = 100;
 
@@ -69,7 +63,6 @@ extern "C" {
     pub fn hipDeviceGetDefaultMemPool(pool: *mut hipMemPool_t, device: c_int) -> hipError_t;
     pub fn hipMemPoolTrimTo(pool: hipMemPool_t, min_bytes_to_hold: usize) -> hipError_t;
     pub fn hipMemPoolSetAttribute(pool: hipMemPool_t, attr: c_int, value: *mut c_void) -> hipError_t;
-    pub fn hipMemPoolGetAttribute(pool: hipMemPool_t, attr: c_int, value: *mut c_void) -> hipError_t;
     pub fn hipMemcpy(
         dst: *mut c_void,
         src: *const c_void,
