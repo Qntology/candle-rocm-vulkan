@@ -1,0 +1,39 @@
+candle-rocm-vulkan
+Copyright 2026 Qntology
+
+Licensed under the Apache License, Version 2.0 (see LICENSE).
+
+This product combines and modifies the following third-party works. Their
+copyright notices and license terms are retained as required; the full license
+texts are in the licenses/ directory.
+
+1. candle (candle-core 0.11.0, candle-nn 0.11.0)
+   https://github.com/huggingface/candle
+   Copyright Hugging Face, Inc. and the candle contributors.
+   Licensed under "MIT OR Apache-2.0"; used here under the Apache License 2.0.
+   License texts: licenses/LICENSE-APACHE-2.0.txt, licenses/LICENSE-MIT-candle.txt
+   Applies to: candle-core/, candle-nn/
+
+2. Vulkan and OpenCL backends for candle-core / candle-nn
+   https://github.com/rexlunae/candle-core
+   https://github.com/rexlunae/candle-nn
+   Copyright the respective authors.
+   Licensed under the Apache License 2.0.
+   License text: licenses/LICENSE-APACHE-2.0.txt
+   Applies to: candle-core/src/vulkan_backend/, candle-core/src/opencl_backend/,
+               the vulkan / opencl paths in candle-nn/
+
+3. candle-rocm (ROCm/HIP backend, hip-sys, hip-runtime)
+   https://github.com/Nu11ified/candle-rocm
+   Copyright (c) 2026 Manas
+   Licensed under the MIT License.
+   License text: licenses/LICENSE-MIT-candle-rocm.txt
+   Applies to: hip-sys/, hip-runtime/, candle-backend/, kernels/, poc/,
+               candle-core/src/rocm_backend/, candle-core/kernels/
+
+Modifications by Qntology (2026) include: the merge of the three code bases
+into one candle 0.11 workspace, GPU-resident Q8_0 weights and Q8 GEMV/GEMM
+kernels for Vulkan (candle-core/src/vulkan_backend/qgpu.rs), Vulkan device and
+queue selection, ROCm memory-pool and runtime-cache management, and related
+fixes. Modified files are distributed under the Apache License 2.0; the
+third-party notices above continue to apply to the portions they cover.

@@ -3,7 +3,8 @@ name = "hip-sys"
 version = "0.2.0"
 edition = "2021"
 description = "Raw FFI bindings to AMD HIP runtime, rocBLAS, and hipRAND"
-license = "MIT OR Apache-2.0"
+license = "Apache-2.0"
+repository = "https://github.com/Qntology/candle-rocm-vulkan"
 build = "build.rs"
 
 [features]

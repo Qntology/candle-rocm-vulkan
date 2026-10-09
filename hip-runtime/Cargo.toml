@@ -3,7 +3,8 @@ name = "hip-runtime"
 version = "0.2.0"
 edition = "2021"
 description = "Safe Rust wrappers for AMD HIP runtime"
-license = "MIT OR Apache-2.0"
+license = "Apache-2.0"
+repository = "https://github.com/Qntology/candle-rocm-vulkan"
 
 [dependencies]
 hip-sys = { path = "../hip-sys" }

@@ -8,7 +8,7 @@ autobins = false
 autoexamples = false
 autotests = false
 autobenches = false
-description = "Minimalist ML framework (with ROCm/HIP backend)."
+description = "Minimalist ML framework with ROCm/HIP, Vulkan and OpenCL backends."
 readme = "README.md"
 keywords = [
     "blas",
@@ -16,8 +16,8 @@ keywords = [
     "machine-learning",
 ]
 categories = ["science"]
-license = "MIT OR Apache-2.0"
-repository = "https://github.com/huggingface/candle"
+license = "Apache-2.0"
+repository = "https://github.com/Qntology/candle-rocm-vulkan"
 
 [features]
 accelerate = ["dep:accelerate-src"]
