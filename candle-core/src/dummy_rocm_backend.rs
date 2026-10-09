@@ -4,6 +4,24 @@
 use crate::op::{BinaryOpT, CmpOp, ReduceOp, UnaryOpT};
 use crate::{CpuStorage, DType, Error, Layout, Result, Shape};
 
+#[derive(Debug, Clone, Copy, Default)]
+pub struct MemoryReport {
+    pub free: usize,
+    pub total: usize,
+    pub live_bytes: usize,
+    pub live_allocs: usize,
+    pub peak_bytes: usize,
+    pub pool_reserved: u64,
+    pub pool_used: u64,
+    pub pool_reserved_high: u64,
+}
+
+impl MemoryReport {
+    pub fn unattributed_used(&self) -> usize {
+        0
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct RocmDevice;
 
@@ -39,6 +57,14 @@ impl RocmDevice {
     }
 
     pub fn trim_memory_pool(&self) -> Result<()> {
+        Err(Error::NotCompiledWithRocmSupport)
+    }
+
+    pub fn memory_report(&self) -> Result<MemoryReport> {
+        Err(Error::NotCompiledWithRocmSupport)
+    }
+
+    pub fn release_cached_resources(&self) -> Result<()> {
         Err(Error::NotCompiledWithRocmSupport)
     }
 }
