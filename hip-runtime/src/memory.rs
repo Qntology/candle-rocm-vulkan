@@ -4,11 +4,16 @@ use crate::error::{check_hip, Result};
 use hip_sys::hip_runtime::{self, hipMemcpyKind};
 use std::ffi::c_void;
 use std::marker::PhantomData;
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Mutex;
 
 static LIVE_BYTES: AtomicUsize = AtomicUsize::new(0);
 static LIVE_ALLOCS: AtomicUsize = AtomicUsize::new(0);
 static PEAK_BYTES: AtomicUsize = AtomicUsize::new(0);
+/// Live allocation count per exact byte size (diagnostics: tells weights, KV blocks
+/// and activations apart without backtraces).
+static LIVE_SIZES: Mutex<Option<HashMap<usize, usize>>> = Mutex::new(None);
 
 fn account_alloc(bytes: usize) {
     if bytes == 0 {
@@ -17,6 +22,9 @@ fn account_alloc(bytes: usize) {
     let now = LIVE_BYTES.fetch_add(bytes, Ordering::Relaxed) + bytes;
     LIVE_ALLOCS.fetch_add(1, Ordering::Relaxed);
     PEAK_BYTES.fetch_max(now, Ordering::Relaxed);
+    if let Ok(mut g) = LIVE_SIZES.lock() {
+        *g.get_or_insert_with(HashMap::new).entry(bytes).or_insert(0) += 1;
+    }
 }
 
 fn account_free(bytes: usize) {
@@ -25,6 +33,30 @@ fn account_free(bytes: usize) {
     }
     LIVE_BYTES.fetch_sub(bytes, Ordering::Relaxed);
     LIVE_ALLOCS.fetch_sub(1, Ordering::Relaxed);
+    if let Ok(mut g) = LIVE_SIZES.lock() {
+        if let Some(m) = g.as_mut() {
+            if let Some(c) = m.get_mut(&bytes) {
+                *c -= 1;
+                if *c == 0 {
+                    m.remove(&bytes);
+                }
+            }
+        }
+    }
+}
+
+/// The `top` allocation sizes holding the most live bytes, as `(bytes_each, count)`.
+pub fn live_size_histogram(top: usize) -> Vec<(usize, usize)> {
+    let mut v: Vec<(usize, usize)> = match LIVE_SIZES.lock() {
+        Ok(g) => g
+            .as_ref()
+            .map(|m| m.iter().map(|(&b, &c)| (b, c)).collect())
+            .unwrap_or_default(),
+        Err(_) => Vec::new(),
+    };
+    v.sort_by(|a, b| (b.0 * b.1).cmp(&(a.0 * a.1)));
+    v.truncate(top);
+    v
 }
 
 /// Bytes / allocations currently owned by live `DeviceBuffer`s of this process

@@ -169,6 +169,11 @@ impl RocmDevice {
         })
     }
 
+    /// Largest live allocation groups `(bytes_each, count)`, biggest total first.
+    pub fn live_size_histogram(&self, top: usize) -> Vec<(usize, usize)> {
+        hip_runtime::memory::live_size_histogram(top)
+    }
+
     /// Hands back everything that can be handed back without destroying the device context:
     /// synchronizes, trims the stream-ordered pool and re-creates the rocBLAS handle (its
     /// internal workspace only grows and is otherwise kept for the lifetime of the handle).

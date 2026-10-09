@@ -1,0 +1,102 @@
+[MSVC] requested=14.44 active=14.44.35207
+**********************************************************************
+** Visual Studio 2026 Developer Command Prompt v18.10.3
+** Copyright (c) 2026 Microsoft Corporation
+**********************************************************************
+[vcvarsall.bat] Environment initialized for: 'x64'
+===== FIXED LIBRARY, no env set =====
+   Compiling hip-runtime v0.2.0 (C:\Users\lp\Documents\GitHub\candle-rocm-vulkan\hip-runtime)
+   Compiling candle-core v0.11.0 (C:\Users\lp\Documents\GitHub\candle-rocm-vulkan\candle-core)
+warning: use of deprecated constant `std::f64::INFINITY`: replaced by the `INFINITY` associated constant on `f64`
+  --> candle-core\src\cpu\erf.rs:43:14
+   |
+43 |         f64::INFINITY
+   |              ^^^^^^^^
+   |
+   = note: `#[warn(deprecated)]` on by default
+
+warning: use of deprecated constant `std::f64::NEG_INFINITY`: replaced by the `NEG_INFINITY` associated constant on `f64`
+  --> candle-core\src\cpu\erf.rs:45:14
+   |
+45 |         f64::NEG_INFINITY
+   |              ^^^^^^^^^^^^
+
+warning: use of deprecated constant `std::f64::INFINITY`: replaced by the `INFINITY` associated constant on `f64`
+  --> candle-core\src\cpu\erf.rs:67:14
+   |
+67 |         f64::INFINITY
+   |              ^^^^^^^^
+
+warning: use of deprecated constant `std::f64::NEG_INFINITY`: replaced by the `NEG_INFINITY` associated constant on `f64`
+  --> candle-core\src\cpu\erf.rs:69:14
+   |
+69 |         f64::NEG_INFINITY
+   |              ^^^^^^^^^^^^
+
+   Compiling candle-rocm v0.2.0 (C:\Users\lp\Documents\GitHub\candle-rocm-vulkan\candle-backend)
+   Compiling candle-nn v0.11.0 (C:\Users\lp\Documents\GitHub\candle-rocm-vulkan\candle-nn)
+warning: use of deprecated constant `std::f32::NEG_INFINITY`: replaced by the `NEG_INFINITY` associated constant on `f32`
+   --> candle-nn\src\attention\cpu_flash\standard.rs:173:30
+    |
+173 |             let mut m = f32::NEG_INFINITY;
+    |                              ^^^^^^^^^^^^
+    |
+    = note: `#[warn(deprecated)]` on by default
+
+warning: use of deprecated constant `std::f32::NEG_INFINITY`: replaced by the `NEG_INFINITY` associated constant on `f32`
+   --> candle-nn\src\attention\cpu_flash\standard.rs:260:30
+    |
+260 |             let mut m = f32::NEG_INFINITY;
+    |                              ^^^^^^^^^^^^
+
+warning: use of deprecated constant `std::f32::NEG_INFINITY`: replaced by the `NEG_INFINITY` associated constant on `f32`
+   --> candle-nn\src\attention\cpu_flash\standard.rs:270:31
+    |
+270 |                 if mv == f32::NEG_INFINITY {
+    |                               ^^^^^^^^^^^^
+
+warning: use of deprecated constant `std::f32::NEG_INFINITY`: replaced by the `NEG_INFINITY` associated constant on `f32`
+   --> candle-nn\src\attention\cpu_flash\standard.rs:349:34
+    |
+349 |                 let mut m = f32::NEG_INFINITY;
+    |                                  ^^^^^^^^^^^^
+
+warning: use of deprecated constant `std::f32::NEG_INFINITY`: replaced by the `NEG_INFINITY` associated constant on `f32`
+   --> candle-nn\src\attention\cpu_flash\standard.rs:442:34
+    |
+442 |                 let mut m = f32::NEG_INFINITY;
+    |                                  ^^^^^^^^^^^^
+
+warning: use of deprecated constant `std::f32::NEG_INFINITY`: replaced by the `NEG_INFINITY` associated constant on `f32`
+   --> candle-nn\src\attention\cpu_flash\standard.rs:452:35
+    |
+452 |                     if mv == f32::NEG_INFINITY {
+    |                                   ^^^^^^^^^^^^
+
+warning: `candle-nn` (lib) generated 6 warnings
+warning: `candle-core` (lib) generated 4 warnings
+    Finished `release` profile [optimized] target(s) in 30.41s
+     Running `C:\Users\lp\Documents\GitHub\candle-rocm-vulkan\target\release\examples\vram_probe2.exe`
+[PROBE2] env: CANDLE_ROCM_ASYNC_ALLOC=None GPU_RESOURCE_CACHE_SIZE=None GPU_MAX_SUBALLOC_SIZE=None
+[PROBE2] OS usage before HIP init: Some(0.0)
+[PROBE2] init                           | OS    216.4 MB | hip    216.4 | live      0.0 (    0) | pool    32.0/    0.0 | top 
+[PROBE2] r1 weights loaded              | OS   1368.4 MB | hip   1368.4 | live   1104.1 (  108) | pool  1184.0/ 1104.1 | top 24.00MBx36 8.00MBx24 2.00MBx24 0.00MBx24
+[PROBE2] r1 model ok (checksum -65.291) | prefill 1113.5 ms | decode 478.94 ms/token (sync each)
+[PROBE2] r1 after prefill+decode        | OS   1464.4 MB | hip   1464.4 | live   1104.1 (  108) | pool  1280.0/ 1104.1 | top 24.00MBx36 8.00MBx24 2.00MBx24 0.00MBx24
+[PROBE2] r1 weights dropped             | OS   1464.4 MB | hip   1464.4 | live      0.0 (    0) | pool  1280.0/    0.0 | top 
+[PROBE2] r1 synchronize (trim)          | OS    184.4 MB | hip    184.4 | live      0.0 (    0) | pool     0.0/    0.0 | top 
+[PROBE2] r1 release_cached              | OS    184.4 MB | hip    184.4 | live      0.0 (    0) | pool     0.0/    0.0 | top 
+[PROBE2] r1 +3s                         | OS    184.4 MB | hip    184.4 | live      0.0 (    0) | pool     0.0/    0.0 | top 
+[PROBE2] r1 small-alloc storm freed     | OS   1464.4 MB | hip   1464.4 | live      0.0 (    0) | pool  1280.0/    0.0 | top 
+[PROBE2] r1 storm released +2s          | OS    184.4 MB | hip    184.4 | live      0.0 (    0) | pool     0.0/    0.0 | top 
+[PROBE2] r2 weights loaded              | OS   1368.4 MB | hip   1368.4 | live   1104.1 (  108) | pool  1184.0/ 1104.1 | top 24.00MBx36 8.00MBx24 2.00MBx24 0.00MBx24
+[PROBE2] r2 model ok (checksum 1292.763) | prefill 1075.2 ms | decode 479.04 ms/token (sync each)
+[PROBE2] r2 after prefill+decode        | OS   1464.4 MB | hip   1464.4 | live   1104.1 (  108) | pool  1280.0/ 1104.1 | top 24.00MBx36 8.00MBx24 2.00MBx24 0.00MBx24
+[PROBE2] r2 weights dropped             | OS   1464.4 MB | hip   1464.4 | live      0.0 (    0) | pool  1280.0/    0.0 | top 
+[PROBE2] r2 synchronize (trim)          | OS    184.4 MB | hip    184.4 | live      0.0 (    0) | pool     0.0/    0.0 | top 
+[PROBE2] r2 release_cached              | OS    184.4 MB | hip    184.4 | live      0.0 (    0) | pool     0.0/    0.0 | top 
+[PROBE2] r2 +3s                         | OS    184.4 MB | hip    184.4 | live      0.0 (    0) | pool     0.0/    0.0 | top 
+[PROBE2] r2 small-alloc storm freed     | OS   1464.4 MB | hip   1464.4 | live      0.0 (    0) | pool  1280.0/    0.0 | top 
+[PROBE2] r2 storm released +2s          | OS    184.4 MB | hip    184.4 | live      0.0 (    0) | pool     0.0/    0.0 | top 
+[STEP] exit=0
+PROBE2_DONE

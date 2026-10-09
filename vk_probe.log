@@ -1,0 +1,195 @@
+[MSVC] requested= active=14.51.36231
+**********************************************************************
+** Visual Studio 2026 Developer Command Prompt v18.10.3
+** Copyright (c) 2026 Microsoft Corporation
+**********************************************************************
+[vcvarsall.bat] Environment initialized for: 'x64'
+[STEP] env done, cwd=C:\Users\lp\Documents\GitHub\candle-rocm-vulkan
+===== default (as the app runs) =====
+ Downloading crates ...
+  Downloaded cfg_aliases v0.2.2
+  Downloaded anyhow v1.0.102
+  Downloaded clap v4.6.0
+  Downloaded clap_derive v4.6.0
+   Compiling windows-sys v0.61.2
+   Compiling utf8parse v0.2.2
+   Compiling once_cell_polyfill v1.70.2
+   Compiling anstyle v1.0.14
+   Compiling winapi v0.3.9
+   Compiling half v2.7.1
+   Compiling is_terminal_polyfill v1.70.2
+   Compiling colorchoice v1.0.5
+   Compiling cfg_aliases v0.2.2
+   Compiling alloca v0.4.0
+   Compiling ciborium-io v0.2.2
+   Compiling unicode-width v0.2.2
+   Compiling anstyle-parse v1.0.0
+   Compiling naga v27.0.3
+   Compiling clap_lex v1.1.0
+   Compiling unicode-xid v0.2.6
+   Compiling heck v0.5.0
+   Compiling bit-vec v0.8.0
+   Compiling ash v0.38.0+1.3.281
+   Compiling strsim v0.11.1
+   Compiling bit-set v0.8.0
+   Compiling codespan-reporting v0.12.0
+   Compiling clap_derive v4.6.0
+   Compiling pp-rs v0.2.1
+   Compiling spirv v0.3.0+sdk-1.3.268.0
+   Compiling libloading v0.8.9
+   Compiling itertools v0.13.0
+   Compiling gemm-common v0.19.0
+   Compiling ciborium-ll v0.2.2
+   Compiling anyhow v1.0.102
+   Compiling arrayvec v0.7.8
+   Compiling candle-core v0.11.0 (C:\Users\lp\Documents\GitHub\candle-rocm-vulkan\candle-core)
+   Compiling anstyle-query v1.1.5
+   Compiling anstyle-wincon v3.0.11
+   Compiling winapi-util v0.1.11
+   Compiling gemm-f32 v0.19.0
+   Compiling tempfile v3.27.0
+   Compiling anstream v1.0.0
+   Compiling gemm-c64 v0.19.0
+   Compiling same-file v1.0.6
+   Compiling gemm-f64 v0.19.0
+   Compiling gemm-c32 v0.19.0
+   Compiling cast v0.3.0
+   Compiling clap_builder v4.6.0
+   Compiling gemm-f16 v0.19.0
+   Compiling rustc-hash v1.1.0
+   Compiling walkdir v2.5.0
+   Compiling criterion-plot v0.8.2
+   Compiling safetensors v0.8.0
+   Compiling gemm v0.19.0
+   Compiling page_size v0.6.0
+   Compiling ciborium v0.2.2
+   Compiling float8 v0.7.0
+   Compiling tinytemplate v1.2.1
+   Compiling oorandom v11.1.5
+   Compiling anes v0.1.6
+   Compiling clap v4.6.0
+   Compiling criterion v0.8.2
+warning: use of deprecated constant `std::f64::INFINITY`: replaced by the `INFINITY` associated constant on `f64`
+  --> candle-core\src\cpu\erf.rs:43:14
+   |
+43 |         f64::INFINITY
+   |              ^^^^^^^^
+   |
+   = note: `#[warn(deprecated)]` on by default
+
+warning: use of deprecated constant `std::f64::NEG_INFINITY`: replaced by the `NEG_INFINITY` associated constant on `f64`
+  --> candle-core\src\cpu\erf.rs:45:14
+   |
+45 |         f64::NEG_INFINITY
+   |              ^^^^^^^^^^^^
+
+warning: use of deprecated constant `std::f64::INFINITY`: replaced by the `INFINITY` associated constant on `f64`
+  --> candle-core\src\cpu\erf.rs:67:14
+   |
+67 |         f64::INFINITY
+   |              ^^^^^^^^
+
+warning: use of deprecated constant `std::f64::NEG_INFINITY`: replaced by the `NEG_INFINITY` associated constant on `f64`
+  --> candle-core\src\cpu\erf.rs:69:14
+   |
+69 |         f64::NEG_INFINITY
+   |              ^^^^^^^^^^^^
+
+warning: `candle-core` (lib) generated 4 warnings
+    Finished `release` profile [optimized] target(s) in 53.15s
+     Running `C:\Users\lp\Documents\GitHub\candle-rocm-vulkan\target\release\examples\vulkan_probe.exe`
+[VK-PROBE] CANDLE_VULKAN_MEMORY=None CANDLE_VULKAN_NATIVE=None
+device=AMD Radeon RX 6600 type=discrete memory_budget_ext=true default_native=false native_now=false
+  heap[0] size=7920 MB device_local=true budget=7148 MB usage=1 MB
+  heap[1] size=8155 MB device_local=false budget=7491 MB usage=32 MB
+  heap[2] size=256 MB device_local=true budget=231 MB usage=0 MB
+  type[0] heap=0 DL=1 HV=0 HC=0 CACHED=0
+  type[1] heap=1 DL=0 HV=1 HC=1 CACHED=0  (candidate #4)
+  type[2] heap=2 DL=1 HV=1 HC=1 CACHED=0  (candidate #8)
+  type[3] heap=1 DL=0 HV=1 HC=1 CACHED=1  <== tensors allocated here
+  type[4] heap=0 DL=1 HV=0 HC=0 CACHED=0
+  type[5] heap=1 DL=0 HV=1 HC=1 CACHED=0  (candidate #5)
+  type[6] heap=2 DL=1 HV=1 HC=1 CACHED=0  (candidate #9)
+  type[7] heap=1 DL=0 HV=1 HC=1 CACHED=1  (candidate #1)
+  type[8] heap=0 DL=1 HV=0 HC=0 CACHED=0
+  type[9] heap=1 DL=0 HV=1 HC=1 CACHED=0  (candidate #6)
+  type[10] heap=2 DL=1 HV=1 HC=1 CACHED=0  (candidate #10)
+  type[11] heap=1 DL=0 HV=1 HC=1 CACHED=1  (candidate #2)
+  type[12] heap=0 DL=1 HV=0 HC=0 CACHED=0
+  type[13] heap=1 DL=0 HV=1 HC=1 CACHED=0  (candidate #7)
+  type[14] heap=2 DL=1 HV=1 HC=1 CACHED=0  (candidate #11)
+  type[15] heap=1 DL=0 HV=1 HC=1 CACHED=1  (candidate #3)
+[VK-PROBE] init                             | heap(of tensor type) used    696.4 MB /   8155.3 MB | process alloc      0.0 MB (pool    0.0) | gpu dispatches 0
+[VK-PROBE] 1 GiB tensor allocated           | heap(of tensor type) used   1720.4 MB /   8155.3 MB | process alloc   1024.0 MB (pool    0.0) | gpu dispatches 0
+[VK-PROBE] 1 GiB tensor dropped             | heap(of tensor type) used    696.4 MB /   8155.3 MB | process alloc      0.0 MB (pool    0.0) | gpu dispatches 0
+[VK-PROBE] after trim_memory_pool           | heap(of tensor type) used    696.4 MB /   8155.3 MB | process alloc      0.0 MB (pool    0.0) | gpu dispatches 0
+[VK-PROBE] kernels OFF  f32 gemv   1.267 ms | f32 gemm512   10.587 ms | f16 gemv   0.942 ms | q4k gemv   0.726 ms | q8_0 gemv   1.713 ms | q4k gemm512  232.992 ms | gpu dispatches +0
+[VK-PROBE] kernels OFF tensors alive        | heap(of tensor type) used    872.4 MB /   8155.3 MB | process alloc    176.1 MB (pool   16.0) | gpu dispatches 0
+[VK-PROBE] kernels ON   f32 gemv   7.222 ms | f32 gemm512    6.225 ms | f16 gemv   0.872 ms | q4k gemv   0.724 ms | q8_0 gemv   1.555 ms | q4k gemm512  376.335 ms | gpu dispatches +33
+[VK-PROBE] kernels ON tensors alive         | heap(of tensor type) used    875.2 MB /   8155.3 MB | process alloc    176.1 MB (pool   16.0) | gpu dispatches 33
+[VK-PROBE] end (trimmed)                    | heap(of tensor type) used    699.1 MB /   8155.3 MB | process alloc      0.0 MB (pool    0.0) | gpu dispatches 33
+[VK-PROBE] CPU device   f32 gemv   1.242 ms | q4k gemv   0.723 ms
+[STEP] run1 exit=0
+===== CANDLE_VULKAN_MEMORY=device =====
+warning: use of deprecated constant `std::f64::INFINITY`: replaced by the `INFINITY` associated constant on `f64`
+  --> candle-core\src\cpu\erf.rs:43:14
+   |
+43 |         f64::INFINITY
+   |              ^^^^^^^^
+   |
+   = note: `#[warn(deprecated)]` on by default
+
+warning: use of deprecated constant `std::f64::NEG_INFINITY`: replaced by the `NEG_INFINITY` associated constant on `f64`
+  --> candle-core\src\cpu\erf.rs:45:14
+   |
+45 |         f64::NEG_INFINITY
+   |              ^^^^^^^^^^^^
+
+warning: use of deprecated constant `std::f64::INFINITY`: replaced by the `INFINITY` associated constant on `f64`
+  --> candle-core\src\cpu\erf.rs:67:14
+   |
+67 |         f64::INFINITY
+   |              ^^^^^^^^
+
+warning: use of deprecated constant `std::f64::NEG_INFINITY`: replaced by the `NEG_INFINITY` associated constant on `f64`
+  --> candle-core\src\cpu\erf.rs:69:14
+   |
+69 |         f64::NEG_INFINITY
+   |              ^^^^^^^^^^^^
+
+warning: `candle-core` (lib) generated 4 warnings
+    Finished `release` profile [optimized] target(s) in 0.24s
+     Running `C:\Users\lp\Documents\GitHub\candle-rocm-vulkan\target\release\examples\vulkan_probe.exe`
+[VK-PROBE] CANDLE_VULKAN_MEMORY=Some("device") CANDLE_VULKAN_NATIVE=None
+device=AMD Radeon RX 6600 type=discrete memory_budget_ext=true default_native=false native_now=false
+  heap[0] size=7920 MB device_local=true budget=7148 MB usage=1 MB
+  heap[1] size=8155 MB device_local=false budget=7491 MB usage=32 MB
+  heap[2] size=256 MB device_local=true budget=231 MB usage=0 MB
+  type[0] heap=0 DL=1 HV=0 HC=0 CACHED=0
+  type[1] heap=1 DL=0 HV=1 HC=1 CACHED=0  (candidate #4)
+  type[2] heap=2 DL=1 HV=1 HC=1 CACHED=0  (candidate #8)
+  type[3] heap=1 DL=0 HV=1 HC=1 CACHED=1  <== tensors allocated here
+  type[4] heap=0 DL=1 HV=0 HC=0 CACHED=0
+  type[5] heap=1 DL=0 HV=1 HC=1 CACHED=0  (candidate #5)
+  type[6] heap=2 DL=1 HV=1 HC=1 CACHED=0  (candidate #9)
+  type[7] heap=1 DL=0 HV=1 HC=1 CACHED=1  (candidate #1)
+  type[8] heap=0 DL=1 HV=0 HC=0 CACHED=0
+  type[9] heap=1 DL=0 HV=1 HC=1 CACHED=0  (candidate #6)
+  type[10] heap=2 DL=1 HV=1 HC=1 CACHED=0  (candidate #10)
+  type[11] heap=1 DL=0 HV=1 HC=1 CACHED=1  (candidate #2)
+  type[12] heap=0 DL=1 HV=0 HC=0 CACHED=0
+  type[13] heap=1 DL=0 HV=1 HC=1 CACHED=0  (candidate #7)
+  type[14] heap=2 DL=1 HV=1 HC=1 CACHED=0  (candidate #11)
+  type[15] heap=1 DL=0 HV=1 HC=1 CACHED=1  (candidate #3)
+[VK-PROBE] init                             | heap(of tensor type) used    696.4 MB /   8155.3 MB | process alloc      0.0 MB (pool    0.0) | gpu dispatches 0
+[VK-PROBE] 1 GiB tensor allocated           | heap(of tensor type) used   1720.4 MB /   8155.3 MB | process alloc   1024.0 MB (pool    0.0) | gpu dispatches 0
+[VK-PROBE] 1 GiB tensor dropped             | heap(of tensor type) used    696.4 MB /   8155.3 MB | process alloc      0.0 MB (pool    0.0) | gpu dispatches 0
+[VK-PROBE] after trim_memory_pool           | heap(of tensor type) used    696.4 MB /   8155.3 MB | process alloc      0.0 MB (pool    0.0) | gpu dispatches 0
+[VK-PROBE] kernels OFF  f32 gemv   1.367 ms | f32 gemm512   10.662 ms | f16 gemv   0.891 ms | q4k gemv   0.726 ms | q8_0 gemv   2.228 ms | q4k gemm512  262.448 ms | gpu dispatches +0
+[VK-PROBE] kernels OFF tensors alive        | heap(of tensor type) used    872.4 MB /   8155.3 MB | process alloc    176.1 MB (pool   16.0) | gpu dispatches 0
+[VK-PROBE] kernels ON   f32 gemv   7.263 ms | f32 gemm512    6.234 ms | f16 gemv   0.936 ms | q4k gemv   0.725 ms | q8_0 gemv   2.016 ms | q4k gemm512  376.240 ms | gpu dispatches +33
+[VK-PROBE] kernels ON tensors alive         | heap(of tensor type) used    875.2 MB /   8155.3 MB | process alloc    176.1 MB (pool   16.0) | gpu dispatches 33
+[VK-PROBE] end (trimmed)                    | heap(of tensor type) used    699.1 MB /   8155.3 MB | process alloc      0.0 MB (pool    0.0) | gpu dispatches 33
+[VK-PROBE] CPU device   f32 gemv   1.256 ms | q4k gemv   0.725 ms
+[STEP] run2 exit=0
+VK_PROBE_DONE

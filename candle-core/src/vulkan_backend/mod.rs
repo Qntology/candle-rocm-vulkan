@@ -19,6 +19,7 @@
 //! independently created handles of the same GPU.
 #![allow(clippy::missing_safety_doc)]
 
+pub(crate) mod qgpu;
 pub mod shaders;
 
 use crate::backend::{BackendDevice, BackendStorage};
@@ -29,7 +30,7 @@ use float8::F8E4M3;
 use half::{bf16, f16};
 use std::collections::HashMap;
 use std::mem::ManuallyDrop;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, Weak};
 
 /// The `DeviceLocation::Vulkan` variant carries a `gpu_id`.
@@ -84,6 +85,10 @@ pub(crate) struct VulkanContext {
     /// GPU kernels are used by default on integrated GPUs and whenever the
     /// tensor memory is device local.
     default_native: bool,
+    /// Weights in GPU memory (see [`qgpu`]).
+    pub(crate) gpu: qgpu::GpuState,
+    /// The kernels run on a graphics (universal) queue rather than a compute-only one.
+    queue_graphics: bool,
 }
 
 unsafe impl Send for VulkanContext {}
@@ -214,6 +219,7 @@ const SLAB_MAX_SLOTS: usize = 1024;
 impl Drop for VulkanContext {
     fn drop(&mut self) {
         self.trim_pool();
+        self.gpu.release_scratch(&self.device);
         let chunks: Vec<SlabChunk> = match self.slabs.lock() {
             Ok(mut slabs) => slabs.drain().flat_map(|(_, v)| v).collect(),
             Err(_) => Vec::new(),
@@ -298,16 +304,29 @@ fn device_type_rank(t: vk::PhysicalDeviceType) -> u32 {
     }
 }
 
-/// Physical devices that expose a compute queue, real GPUs first (discrete,
-/// integrated, virtual, other, cpu); the ordinal used by
-/// [`VulkanDevice::new`] indexes this list.
+/// Physical devices that expose a compute queue, best first: discrete GPUs (the one
+/// with the most VRAM first), then integrated, virtual and other GPUs. Software
+/// rasterizers (CPU type devices such as llvmpipe / SwiftShader) are left out unless
+/// `CANDLE_VULKAN_ALLOW_CPU=1`, so a machine without a GPU reports no Vulkan device and
+/// callers fall back to the CPU backend. `CANDLE_VULKAN_DEVICE=<name substring>` moves
+/// the matching device to the front. The ordinal used by [`VulkanDevice::new`]
+/// indexes this list.
 fn sorted_physical_devices(instance: &ash::Instance) -> Result<Vec<vk::PhysicalDevice>> {
     let list = unsafe { instance.enumerate_physical_devices() }
         .map_err(|e| Error::Msg(format!("vulkan: enumerate_physical_devices failed: {e:?}")))?;
+    let allow_cpu = std::env::var("CANDLE_VULKAN_ALLOW_CPU")
+        .map(|v| {
+            let v = v.trim().to_ascii_lowercase();
+            !(v.is_empty() || v == "0" || v == "false" || v == "off" || v == "no")
+        })
+        .unwrap_or(false);
     let mut ranked = Vec::with_capacity(list.len());
     for (i, p) in list.into_iter().enumerate() {
         let props = unsafe { instance.get_physical_device_properties(p) };
         if props.api_version < vk::API_VERSION_1_1 {
+            continue;
+        }
+        if props.device_type == vk::PhysicalDeviceType::CPU && !allow_cpu {
             continue;
         }
         let queues = unsafe { instance.get_physical_device_queue_family_properties(p) };
@@ -317,10 +336,35 @@ fn sorted_physical_devices(instance: &ash::Instance) -> Result<Vec<vk::PhysicalD
         {
             continue;
         }
-        ranked.push((device_type_rank(props.device_type), i, p));
+        let mem = unsafe { instance.get_physical_device_memory_properties(p) };
+        let vram = (0..mem.memory_heap_count as usize)
+            .filter(|&h| mem.memory_heaps[h].flags.contains(vk::MemoryHeapFlags::DEVICE_LOCAL))
+            .map(|h| mem.memory_heaps[h].size)
+            .max()
+            .unwrap_or(0);
+        let name = props
+            .device_name_as_c_str()
+            .map(|s| s.to_string_lossy().to_lowercase())
+            .unwrap_or_default();
+        ranked.push((
+            device_type_rank(props.device_type),
+            std::cmp::Reverse(vram),
+            i,
+            p,
+            name,
+        ));
     }
-    ranked.sort_by_key(|(rank, i, _)| (*rank, *i));
-    Ok(ranked.into_iter().map(|(_, _, p)| p).collect())
+    ranked.sort_by(|a, b| (a.0, a.1, a.2).cmp(&(b.0, b.1, b.2)));
+    if let Ok(want) = std::env::var("CANDLE_VULKAN_DEVICE") {
+        let want = want.trim().to_lowercase();
+        if !want.is_empty() {
+            if let Some(pos) = ranked.iter().position(|r| r.4.contains(&want)) {
+                let r = ranked.remove(pos);
+                ranked.insert(0, r);
+            }
+        }
+    }
+    Ok(ranked.into_iter().map(|r| r.3).collect())
 }
 
 /// Number of Vulkan devices usable as candle devices.
@@ -399,7 +443,27 @@ fn init_vulkan(gpu_id: usize) -> Result<VulkanContext> {
     let any_compute = queues
         .iter()
         .position(|q| q.queue_flags.contains(vk::QueueFlags::COMPUTE));
-    let queue_family = match compute_only.or(any_compute) {
+    // Which hardware queue runs the kernels. Both kinds drive the same shader cores; the
+    // OS just accounts them to different engines (Windows Task Manager: "3D" for the
+    // graphics queue, "Compute 0/1" for a compute-only queue). A compute-only queue
+    // lets the desktop compositor keep rendering on the 3D engine while long kernels
+    // run. `CANDLE_VULKAN_QUEUE=graphics` (or `3d`) / `compute` picks one.
+    let graphics = queues.iter().position(|q| {
+        q.queue_flags
+            .contains(vk::QueueFlags::GRAPHICS | vk::QueueFlags::COMPUTE)
+    });
+    let want_graphics = std::env::var("CANDLE_VULKAN_QUEUE")
+        .map(|v| {
+            let v = v.trim().to_ascii_lowercase();
+            v == "graphics" || v == "3d" || v == "universal"
+        })
+        .unwrap_or(false);
+    let picked = if want_graphics {
+        graphics.or(compute_only).or(any_compute)
+    } else {
+        compute_only.or(any_compute)
+    };
+    let queue_family = match picked {
         Some(i) => i as u32,
         None => {
             destroy_instance(&instance);
@@ -440,6 +504,9 @@ fn init_vulkan(gpu_id: usize) -> Result<VulkanContext> {
         }
     };
     let queue = unsafe { device.get_device_queue(queue_family, 0) };
+    let queue_graphics = queues[queue_family as usize]
+        .queue_flags
+        .contains(vk::QueueFlags::GRAPHICS);
 
     let memory_properties = unsafe { instance.get_physical_device_memory_properties(physical) };
     let memory_types = memory_type_order(&memory_properties);
@@ -520,6 +587,8 @@ fn init_vulkan(gpu_id: usize) -> Result<VulkanContext> {
         )),
         native_ok: AtomicBool::new(true),
         default_native,
+        gpu: Default::default(),
+        queue_graphics,
     })
 }
 
@@ -555,6 +624,85 @@ impl VulkanDevice {
         &self.inner.name
     }
 
+    /// Human readable dump of the memory heaps/types the driver exposes, which
+    /// type the tensors are allocated from, per-heap budget/usage (when
+    /// `VK_EXT_memory_budget` is available) and whether GPU kernels are on.
+    pub fn memory_diagnostics(&self) -> String {
+        use std::fmt::Write;
+        let ctx = &self.inner;
+        let mp = &ctx.memory_properties;
+        let mut out = String::new();
+        let (mut budget, mut usage) = ([0u64; vk::MAX_MEMORY_HEAPS], [0u64; vk::MAX_MEMORY_HEAPS]);
+        if ctx.memory_budget_ext {
+            let mut b = vk::PhysicalDeviceMemoryBudgetPropertiesEXT::default();
+            let mut props2 = vk::PhysicalDeviceMemoryProperties2::default().push_next(&mut b);
+            unsafe {
+                ctx.instance
+                    .get_physical_device_memory_properties2(ctx.physical, &mut props2)
+            };
+            budget = b.heap_budget;
+            usage = b.heap_usage;
+        }
+        let _ = writeln!(
+            out,
+            "device={} type={} memory_budget_ext={} default_native={} native_now={}",
+            ctx.name,
+            self.device_type(),
+            ctx.memory_budget_ext,
+            ctx.default_native,
+            self.native_kernels_enabled()
+        );
+        let _ = writeln!(
+            out,
+            "  queue: {}",
+            if ctx.queue_graphics {
+                "graphics (Windows Task Manager engine: 3D)"
+            } else {
+                "compute-only (Windows Task Manager engine: Compute)"
+            }
+        );
+        let (gl, gs) = self.gpu_memory_bytes();
+        let _ = writeln!(
+            out,
+            "  gpu weights: enabled={} local={} MB shared={} MB buffers={}",
+            self.gpu_weights_enabled(),
+            gl >> 20,
+            gs >> 20,
+            ctx.gpu.buffers.load(Ordering::Relaxed)
+        );
+        for h in 0..mp.memory_heap_count as usize {
+            let heap = mp.memory_heaps[h];
+            let _ = writeln!(
+                out,
+                "  heap[{h}] size={} MB device_local={} budget={} MB usage={} MB",
+                heap.size >> 20,
+                heap.flags.contains(vk::MemoryHeapFlags::DEVICE_LOCAL),
+                budget[h] >> 20,
+                usage[h] >> 20
+            );
+        }
+        for t in 0..mp.memory_type_count as usize {
+            let ty = mp.memory_types[t];
+            let f = ty.property_flags;
+            let rank = ctx.memory_types.iter().position(|&x| x as usize == t);
+            let _ = writeln!(
+                out,
+                "  type[{t}] heap={} DL={} HV={} HC={} CACHED={}{}",
+                ty.heap_index,
+                f.contains(vk::MemoryPropertyFlags::DEVICE_LOCAL) as u8,
+                f.contains(vk::MemoryPropertyFlags::HOST_VISIBLE) as u8,
+                f.contains(vk::MemoryPropertyFlags::HOST_COHERENT) as u8,
+                f.contains(vk::MemoryPropertyFlags::HOST_CACHED) as u8,
+                match rank {
+                    Some(0) => "  <== tensors allocated here".to_string(),
+                    Some(r) => format!("  (candidate #{r})"),
+                    None => String::new(),
+                }
+            );
+        }
+        out
+    }
+
     /// `"discrete"`, `"integrated"`, `"virtual"`, `"cpu"` or `"other"`.
     pub fn device_type(&self) -> &'static str {
         match self.inner.device_type {
@@ -571,6 +719,33 @@ impl VulkanDevice {
     /// otherwise the heap size minus what this process allocated.
     pub fn mem_info(&self) -> Result<(usize, usize)> {
         let ctx = &self.inner;
+        // GPU working memory: VRAM on a discrete GPU, carve-out + shared heap on an
+        // integrated one (where weights are placed, see `qgpu`).
+        if qgpu::enabled(self) {
+            let heaps = qgpu::working_heaps(ctx);
+            if !heaps.is_empty() {
+                let budgets = qgpu::heap_budgets(ctx);
+                let (mut free, mut total) = (0usize, 0usize);
+                for h in heaps {
+                    let heap = ctx.memory_properties.memory_heaps[h];
+                    let size = heap.size as usize;
+                    total += size;
+                    free += match &budgets {
+                        Some((b, u)) => b[h].saturating_sub(u[h]) as usize,
+                        None => {
+                            let own = if heap.flags.contains(vk::MemoryHeapFlags::DEVICE_LOCAL) {
+                                ctx.gpu.local_bytes.load(Ordering::Relaxed)
+                            } else {
+                                ctx.gpu.shared_bytes.load(Ordering::Relaxed)
+                                    + ctx.allocated_bytes.load(Ordering::Relaxed)
+                            };
+                            size.saturating_sub(own)
+                        }
+                    };
+                }
+                return Ok((free, total));
+            }
+        }
         let mt = ctx.memory_types[0] as usize;
         let heap = ctx.memory_properties.memory_types[mt].heap_index as usize;
         let total = ctx.memory_properties.memory_heaps[heap].size as usize;
@@ -605,7 +780,22 @@ impl VulkanDevice {
     /// Returns the buffers kept for reuse to the driver.
     pub fn trim_memory_pool(&self) -> Result<()> {
         self.inner.trim_pool();
+        self.inner.gpu.release_scratch(&self.inner.device);
         Ok(())
+    }
+
+    /// `(device local, shared)` bytes held in GPU memory by weights, mirrors and the
+    /// activation scratch (see `qgpu`).
+    pub fn gpu_memory_bytes(&self) -> (usize, usize) {
+        (
+            self.inner.gpu.local_bytes.load(Ordering::Relaxed),
+            self.inner.gpu.shared_bytes.load(Ordering::Relaxed),
+        )
+    }
+
+    /// Whether large weights are placed in GPU memory and run on GPU kernels.
+    pub fn gpu_weights_enabled(&self) -> bool {
+        qgpu::enabled(self)
     }
 
     /// Whether the GPU kernels are in use (see [`shaders::native_enabled`]).
@@ -653,6 +843,8 @@ impl VulkanDevice {
                 dtype,
                 numel,
                 device: self.clone(),
+                mirror: Default::default(),
+                rhs_uses: AtomicU32::new(0),
             });
         }
         let slab_ok = backing <= SLAB_MAX_BUCKET;
@@ -776,6 +968,8 @@ impl VulkanDevice {
             dtype,
             numel,
             device: self.clone(),
+            mirror: Default::default(),
+            rhs_uses: AtomicU32::new(0),
         })
     }
 
@@ -892,6 +1086,8 @@ impl VulkanDevice {
             dtype,
             numel,
             device: self.clone(),
+            mirror: Default::default(),
+            rhs_uses: AtomicU32::new(0),
         })
     }
 
@@ -967,6 +1163,9 @@ pub struct VulkanStorage {
     pub dtype: DType,
     pub numel: usize,
     pub device: VulkanDevice,
+    /// GPU copy used when this storage is the right hand side of matmuls (`qgpu`).
+    pub(crate) mirror: Mutex<Option<Arc<qgpu::GpuBuf>>>,
+    pub(crate) rhs_uses: AtomicU32,
 }
 
 impl std::fmt::Debug for VulkanStorage {
@@ -1039,7 +1238,16 @@ impl VulkanStorage {
         unsafe { std::slice::from_raw_parts(self.mapped, self.capacity_bytes) }
     }
 
+    /// Drops the GPU copy: the host bytes are about to change.
+    pub(crate) fn invalidate_mirror(&mut self) {
+        if let Ok(m) = self.mirror.get_mut() {
+            *m = None;
+        }
+        *self.rhs_uses.get_mut() = 0;
+    }
+
     pub(crate) fn as_bytes_mut(&mut self) -> &mut [u8] {
+        self.invalidate_mirror();
         if self.capacity_bytes == 0 {
             return &mut [];
         }
@@ -1062,6 +1270,7 @@ impl VulkanStorage {
     }
 
     pub(crate) fn as_mut_slice<T: crate::WithDType>(&mut self) -> Result<&mut [T]> {
+        self.invalidate_mirror();
         if T::DTYPE != self.dtype {
             crate::bail!(
                 "vulkan as_mut_slice: expected {:?}, got {:?}",
@@ -1102,6 +1311,7 @@ impl VulkanStorage {
     /// Same as [`Self::host_view`] for the CPU operations that update the
     /// elements in place (copies, scatter, const_set).
     fn host_view_mut(&mut self) -> ManuallyDrop<CpuStorage> {
+        self.invalidate_mirror();
         self.host_view()
     }
 
@@ -1218,6 +1428,7 @@ impl BackendStorage for VulkanStorage {
     }
 
     fn const_set(&mut self, s: crate::scalar::Scalar, layout: &Layout) -> Result<()> {
+        self.invalidate_mirror();
         if shaders::const_set(self, s, layout)? {
             return Ok(());
         }
@@ -1456,6 +1667,12 @@ impl BackendStorage for VulkanStorage {
         if let Some(out) = shaders::matmul(self, rhs, bmnk, lhs_l, rhs_l)? {
             return Ok(out);
         }
+        if let Some(out) = qgpu::dense_matmul(self, rhs, bmnk, lhs_l, rhs_l)? {
+            return Ok(out);
+        }
+        if let Some(out) = qgpu::act_matmul(self, rhs, bmnk, lhs_l, rhs_l)? {
+            return Ok(out);
+        }
         if self.dtype == DType::BF16 && rhs.dtype == DType::BF16 {
             let (b, m, n, _) = bmnk;
             let l32 = self.to_dtype(lhs_l, DType::F32)?;
@@ -1474,6 +1691,7 @@ impl BackendStorage for VulkanStorage {
     }
 
     fn copy_strided_src(&self, dst: &mut Self, dst_offset: usize, src_l: &Layout) -> Result<()> {
+        dst.invalidate_mirror();
         if shaders::copy_strided(self, dst, dst_offset, src_l)? {
             return Ok(());
         }
@@ -1492,6 +1710,7 @@ impl BackendStorage for VulkanStorage {
         src_o: usize,
         dst_o: usize,
     ) -> Result<()> {
+        dst.invalidate_mirror();
         if shaders::copy2d(self, dst, d1, d2, src_s, dst_s, src_o, dst_o)? {
             return Ok(());
         }

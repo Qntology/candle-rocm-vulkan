@@ -10,6 +10,7 @@ pub struct HipDevice {
 
 impl HipDevice {
     pub fn new(ordinal: usize) -> Result<Self> {
+        crate::configure_runtime_env();
         let count = Self::device_count()?;
         if ordinal >= count {
             return Err(HipError::HipRuntimeError {
@@ -35,6 +36,7 @@ impl HipDevice {
     }
 
     pub fn device_count() -> Result<usize> {
+        crate::configure_runtime_env();
         let mut count: i32 = 0;
         check_hip(unsafe { hip_runtime::hipGetDeviceCount(&mut count) })?;
         Ok(count.max(0) as usize)
@@ -72,6 +74,7 @@ impl HipDevice {
 }
 
 pub fn runtime_version() -> Result<i32> {
+    crate::configure_runtime_env();
     let mut v: i32 = 0;
     check_hip(unsafe { hip_runtime::hipRuntimeGetVersion(&mut v) })?;
     Ok(v)

@@ -64,6 +64,10 @@ impl RocmDevice {
         Err(Error::NotCompiledWithRocmSupport)
     }
 
+    pub fn live_size_histogram(&self, _top: usize) -> Vec<(usize, usize)> {
+        Vec::new()
+    }
+
     pub fn release_cached_resources(&self) -> Result<()> {
         Err(Error::NotCompiledWithRocmSupport)
     }
