@@ -139,7 +139,7 @@ pub use rocm_backend as rocm;
 #[cfg(not(feature = "rocm"))]
 pub use dummy_rocm_backend as rocm;
 
-pub use rocm::{RocmDevice, RocmStorage};
+pub use rocm::{MemoryReport as RocmMemoryReport, RocmDevice, RocmStorage};
 
 #[cfg(not(feature = "metal"))]
 pub use dummy_metal_backend::{MetalDevice, MetalError, MetalStorage};

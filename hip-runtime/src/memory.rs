@@ -4,6 +4,60 @@ use crate::error::{check_hip, Result};
 use hip_sys::hip_runtime::{self, hipMemcpyKind};
 use std::ffi::c_void;
 use std::marker::PhantomData;
+use std::sync::atomic::{AtomicUsize, Ordering};
+
+static LIVE_BYTES: AtomicUsize = AtomicUsize::new(0);
+static LIVE_ALLOCS: AtomicUsize = AtomicUsize::new(0);
+static PEAK_BYTES: AtomicUsize = AtomicUsize::new(0);
+
+fn account_alloc(bytes: usize) {
+    if bytes == 0 {
+        return;
+    }
+    let now = LIVE_BYTES.fetch_add(bytes, Ordering::Relaxed) + bytes;
+    LIVE_ALLOCS.fetch_add(1, Ordering::Relaxed);
+    PEAK_BYTES.fetch_max(now, Ordering::Relaxed);
+}
+
+fn account_free(bytes: usize) {
+    if bytes == 0 {
+        return;
+    }
+    LIVE_BYTES.fetch_sub(bytes, Ordering::Relaxed);
+    LIVE_ALLOCS.fetch_sub(1, Ordering::Relaxed);
+}
+
+/// Bytes / allocations currently owned by live `DeviceBuffer`s of this process
+/// (i.e. what the application still references; excludes driver-side caches).
+#[derive(Debug, Clone, Copy, Default)]
+pub struct AllocStats {
+    pub live_bytes: usize,
+    pub live_allocs: usize,
+    pub peak_bytes: usize,
+}
+
+pub fn alloc_stats() -> AllocStats {
+    AllocStats {
+        live_bytes: LIVE_BYTES.load(Ordering::Relaxed),
+        live_allocs: LIVE_ALLOCS.load(Ordering::Relaxed),
+        peak_bytes: PEAK_BYTES.load(Ordering::Relaxed),
+    }
+}
+
+/// Resets the peak counter to the current live size.
+pub fn reset_peak_alloc() {
+    PEAK_BYTES.store(LIVE_BYTES.load(Ordering::Relaxed), Ordering::Relaxed);
+}
+
+/// State of the default stream-ordered memory pool of a device.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct PoolStats {
+    pub reserved_current: u64,
+    pub reserved_high: u64,
+    pub used_current: u64,
+    pub used_high: u64,
+    pub release_threshold: u64,
+}
 
 /// Typed GPU memory buffer with RAII.
 pub struct DeviceBuffer<T> {
@@ -20,6 +74,7 @@ impl<T: Copy> DeviceBuffer<T> {
         let mut ptr = std::ptr::null_mut();
         if bytes > 0 {
             check_hip(unsafe { hip_runtime::hipMalloc(&mut ptr, bytes) })?;
+            account_alloc(bytes);
         }
         Ok(Self {
             ptr,
@@ -36,6 +91,7 @@ impl<T: Copy> DeviceBuffer<T> {
         let mut ptr = std::ptr::null_mut();
         if bytes > 0 {
             check_hip(unsafe { hip_runtime::hipMallocAsync(&mut ptr, bytes, std::ptr::null_mut()) })?;
+            account_alloc(bytes);
         }
         Ok(Self {
             ptr,
@@ -116,6 +172,7 @@ impl<T: Copy> DeviceBuffer<T> {
 impl<T> Drop for DeviceBuffer<T> {
     fn drop(&mut self) {
         if !self.ptr.is_null() {
+            account_free(self.len * std::mem::size_of::<T>());
             unsafe {
                 if self.stream_ordered {
                     hip_runtime::hipFreeAsync(self.ptr, std::ptr::null_mut());
@@ -144,6 +201,40 @@ pub fn trim_default_pool(device: i32) -> Result<()> {
     let mut pool: hip_runtime::hipMemPool_t = std::ptr::null_mut();
     check_hip(unsafe { hip_runtime::hipDeviceGetDefaultMemPool(&mut pool, device) })?;
     check_hip(unsafe { hip_runtime::hipMemPoolTrimTo(pool, 0) })
+}
+
+/// Reads the usage counters of the default memory pool of `device`.
+pub fn pool_stats(device: i32) -> Result<PoolStats> {
+    let mut pool: hip_runtime::hipMemPool_t = std::ptr::null_mut();
+    check_hip(unsafe { hip_runtime::hipDeviceGetDefaultMemPool(&mut pool, device) })?;
+    let get = |attr: i32| -> Result<u64> {
+        let mut v: u64 = 0;
+        check_hip(unsafe {
+            hip_runtime::hipMemPoolGetAttribute(pool, attr, &mut v as *mut u64 as *mut c_void)
+        })?;
+        Ok(v)
+    };
+    Ok(PoolStats {
+        reserved_current: get(hip_runtime::HIP_MEMPOOL_ATTR_RESERVED_MEM_CURRENT)?,
+        reserved_high: get(hip_runtime::HIP_MEMPOOL_ATTR_RESERVED_MEM_HIGH)?,
+        used_current: get(hip_runtime::HIP_MEMPOOL_ATTR_USED_MEM_CURRENT)?,
+        used_high: get(hip_runtime::HIP_MEMPOOL_ATTR_USED_MEM_HIGH)?,
+        release_threshold: get(hip_runtime::HIP_MEMPOOL_ATTR_RELEASE_THRESHOLD).unwrap_or(0),
+    })
+}
+
+/// Sets how many bytes the default pool may keep cached after a synchronization (0 = give everything back).
+pub fn set_pool_release_threshold(device: i32, bytes: u64) -> Result<()> {
+    let mut pool: hip_runtime::hipMemPool_t = std::ptr::null_mut();
+    check_hip(unsafe { hip_runtime::hipDeviceGetDefaultMemPool(&mut pool, device) })?;
+    let mut v = bytes;
+    check_hip(unsafe {
+        hip_runtime::hipMemPoolSetAttribute(
+            pool,
+            hip_runtime::HIP_MEMPOOL_ATTR_RELEASE_THRESHOLD,
+            &mut v as *mut u64 as *mut c_void,
+        )
+    })
 }
 
 // Device pointers are plain addresses; the HIP runtime is thread safe.

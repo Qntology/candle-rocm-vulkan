@@ -7,7 +7,7 @@ pub mod kernels;
 mod storage;
 pub mod utils;
 
-pub use device::RocmDevice;
+pub use device::{MemoryReport, RocmDevice};
 pub use hip_runtime;
 pub use hip_sys;
 pub use storage::{RocmStorage, RopeKind};
