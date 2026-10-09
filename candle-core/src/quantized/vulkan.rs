@@ -1,10 +1,5 @@
 //! Quantized (GGML block format) tensors stored on a Vulkan device.
 //!
-//! `Q8_0` weights are repacked into GPU memory (VRAM on a discrete GPU, the carve-out
-//! or shared memory on an integrated one, see `vulkan_backend::qgpu`) and run on GPU
-//! kernels. Other block types, and `Q8_0` when no GPU memory is available, are kept as
-//! raw bytes in a mapped host visible buffer and run on the CPU k-quant kernels directly
-//! on the mapped memory.
 use super::k_quants::{
     BlockQ2K, BlockQ3K, BlockQ4K, BlockQ4_0, BlockQ4_1, BlockQ5K, BlockQ5_0, BlockQ5_1, BlockQ6K,
     BlockQ8K, BlockQ8_0, BlockQ8_1, GgmlType,
@@ -16,9 +11,7 @@ use crate::{CpuStorage, DType, Layout, Result, Shape, VulkanDevice, VulkanStorag
 use half::{bf16, f16};
 
 pub struct QVulkanStorage {
-    /// GGML blocks in host visible memory, read by the CPU k-quant kernels.
     data: Option<VulkanStorage>,
-    /// `Q8_0` blocks repacked into GPU memory, read by the GPU kernels.
     gpu: Option<GpuQ8>,
     dtype: GgmlDType,
     device: VulkanDevice,
@@ -135,8 +128,6 @@ impl QVulkanStorage {
     }
 
     pub fn from_bytes(device: &VulkanDevice, dtype: GgmlDType, bytes: &[u8]) -> Result<Self> {
-        let mut _p = crate::vulkan_backend::prof::scope("qtensor", if dtype == GgmlDType::Q8_0 { "load_q8" } else { "load_other(host)" });
-        _p.work(bytes.len());
         if dtype == GgmlDType::Q8_0 && qgpu::want_q8_on_gpu(device, bytes.len()) {
             match GpuQ8::from_ggml(device, bytes) {
                 Ok(g) => {
@@ -147,7 +138,7 @@ impl QVulkanStorage {
                         device: device.clone(),
                     })
                 }
-                Err(e) => qgpu::note_fallback("q8 weights to GPU memory", &e),
+                Err(_) => {}
             }
         }
         let data = device.upload_bytes(bytes, bytes.len(), DType::U8)?;
@@ -159,7 +150,6 @@ impl QVulkanStorage {
         })
     }
 
-    /// Moves host `Q8_0` blocks into GPU memory when that is wanted and possible.
     fn maybe_promote(&mut self) {
         if self.gpu.is_some() || self.dtype != GgmlDType::Q8_0 {
             return;
@@ -173,7 +163,7 @@ impl QVulkanStorage {
                 self.gpu = Some(g);
                 self.data = None;
             }
-            Err(e) => qgpu::note_fallback("q8 weights to GPU memory", &e),
+            Err(_) => {}
         }
     }
 
@@ -185,7 +175,6 @@ impl QVulkanStorage {
         &self.device
     }
 
-    /// Whether the blocks live in GPU memory and run on the GPU kernels.
     pub fn is_on_gpu(&self) -> bool {
         self.gpu.is_some()
     }
@@ -202,13 +191,11 @@ impl QVulkanStorage {
         self.storage_size_in_bytes() / self.dtype.type_size() * self.dtype.block_size()
     }
 
-    /// Runs `f` on the GGML bytes, downloading them from GPU memory when needed.
     fn with_host_bytes<R>(&self, f: impl FnOnce(&[u8]) -> Result<R>) -> Result<R> {
         match (&self.data, &self.gpu) {
             (Some(d), _) => f(d.as_bytes()),
             (None, Some(g)) => {
                 let v = g.to_ggml()?;
-                // mapped memory: block aligned, unlike a plain Vec<u8>
                 let tmp = self.device.upload_bytes(&v, v.len(), DType::U8)?;
                 f(tmp.as_bytes())
             }
@@ -217,12 +204,11 @@ impl QVulkanStorage {
     }
 
     pub fn dequantize(&self, elem_count: usize) -> Result<VulkanStorage> {
-        let _p = crate::vulkan_backend::prof::scope("qtensor", "dequantize");
         let elem_count = elem_count.min(self.elem_count());
         if let Some(g) = &self.gpu {
             match g.dequantize(elem_count, DType::F32, &self.device) {
                 Ok(s) => return Ok(s),
-                Err(e) => qgpu::note_fallback("q8 dequantize", &e),
+                Err(_) => {}
             }
         }
         let mut out = self.device.alloc_buffer(elem_count, DType::F32)?;
@@ -239,7 +225,7 @@ impl QVulkanStorage {
             let n = elem_count.min(self.elem_count());
             match g.dequantize(n, DType::F16, &self.device) {
                 Ok(s) => return Ok(s),
-                Err(e) => qgpu::note_fallback("q8 dequantize to f16", &e),
+                Err(_) => {}
             }
         }
         let f32s = self.dequantize(elem_count)?;
@@ -261,7 +247,6 @@ impl QVulkanStorage {
                 expected
             )
         }
-        // new content: the GPU copy (if any) is rebuilt from the host blocks
         self.gpu = None;
         match &mut self.data {
             Some(d) => d.as_bytes_mut().copy_from_slice(bytes),
@@ -339,7 +324,7 @@ impl QVulkanStorage {
         if let Some(g) = &self.gpu {
             match g.embedding(rows, hidden, &ids, &self.device) {
                 Ok(s) => return Ok(s),
-                Err(e) => qgpu::note_fallback("q8 embedding", &e),
+                Err(_) => {}
             }
         }
         let row_bytes = hidden / block * self.dtype.type_size();
@@ -372,8 +357,6 @@ impl QVulkanStorage {
         layout: &Layout,
     ) -> Result<(VulkanStorage, Shape)> {
         let (dst_shape, mkn) = qmatmul_shapes(self_shape, layout)?;
-        let mut _p = crate::vulkan_backend::prof::scope("qtensor", "matmul_gpu");
-        _p.work(2 * mkn.0 * mkn.1 * mkn.2);
         if let Some(g) = &self.gpu {
             match g.matmul(mkn, storage, layout) {
                 Ok(out) => {
@@ -384,10 +367,9 @@ impl QVulkanStorage {
                     let out = out.to_dtype(&Layout::contiguous(&dst_shape), in_dtype)?;
                     return Ok((out, dst_shape));
                 }
-                Err(e) => qgpu::note_fallback("q8 matmul", &e),
+                Err(_) => {}
             }
         }
-        _p.rename("qtensor", "matmul_cpu");
         let dtype = self.dtype;
         self.with_host_bytes(|weights| {
             qmatmul(storage, layout, &dst_shape, mkn, |lhs, dst| {
@@ -409,7 +391,6 @@ impl QVulkanStorage {
         crate::bail!("indexed_moe_forward is not implemented on the Vulkan backend")
     }
 }
-
 
 pub(crate) fn qmatmul_shapes(
     self_shape: &Shape,

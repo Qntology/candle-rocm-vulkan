@@ -29,7 +29,6 @@ use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock};
 
 const MAX_BINDINGS: u32 = 8;
-/// Descriptor sets (dispatches) one recorded command buffer may use.
 pub(crate) const MAX_SETS: u32 = 32;
 const MAX_RANK: usize = 6;
 const WG: u32 = 256;
@@ -484,8 +483,6 @@ fn run(
         let submit = [vk::SubmitInfo::default().command_buffers(&cmds)];
         d.queue_submit(ctx.queue, &submit, exec.fence)
             .map_err(|e| vk_err(dev, "queue_submit", e))?;
-        // Short jobs finish long before the OS wakes a thread blocked in
-        // vkWaitForFences: poll the fence first (see `spin_us`).
         let mut done = false;
         let spin = spin_us();
         if spin > 0 {
@@ -514,7 +511,6 @@ fn run(
     Ok(())
 }
 
-/// A storage buffer binding: `range` bytes of `buffer` from `offset`.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct Bind {
     pub(crate) buffer: vk::Buffer,
@@ -522,7 +518,6 @@ pub(crate) struct Bind {
     pub(crate) range: u64,
 }
 
-/// One step of a command sequence recorded by [`run_ops`].
 pub(crate) enum Op<'a> {
     Copy {
         src: vk::Buffer,
@@ -537,14 +532,9 @@ pub(crate) enum Op<'a> {
         push: Vec<u8>,
         groups: [u32; 3],
     },
-    /// Makes every earlier transfer / shader write visible to later transfers and shaders.
     Barrier,
 }
 
-/// Records `ops` into one command buffer, submits it and waits for completion. A host
-/// barrier is appended so results are readable through mapped memory on return.
-/// How long `run_ops` polls the fence before blocking, in microseconds
-/// (`CANDLE_VULKAN_SPIN_US`, default 1000, 0 disables polling).
 fn spin_us() -> u64 {
     static V: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
     *V.get_or_init(|| {
@@ -556,8 +546,6 @@ fn spin_us() -> u64 {
 }
 
 pub(crate) fn run_ops(dev: &VulkanDevice, ops: &[Op<'_>]) -> Result<()> {
-    let mut _p = super::prof::scope("gpu", "submit_wait");
-    _p.work(ops.len());
     let limits = dev.limits();
     let mut dispatches = 0u32;
     for op in ops {
@@ -733,8 +721,6 @@ pub(crate) fn run_ops(dev: &VulkanDevice, ops: &[Op<'_>]) -> Result<()> {
         let submit = [vk::SubmitInfo::default().command_buffers(&cmds)];
         d.queue_submit(ctx.queue, &submit, exec.fence)
             .map_err(|e| vk_err(dev, "queue_submit", e))?;
-        // Short jobs finish long before the OS wakes a thread blocked in
-        // vkWaitForFences: poll the fence first (see `spin_us`).
         let mut done = false;
         let spin = spin_us();
         if spin > 0 {

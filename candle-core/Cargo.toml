@@ -90,16 +90,6 @@ path = "examples/metal_basics.rs"
 required-features = ["metal"]
 
 [[example]]
-name = "vulkan_gpu_test"
-path = "examples/vulkan_gpu_test.rs"
-required-features = ["vulkan"]
-
-[[example]]
-name = "vulkan_probe"
-path = "examples/vulkan_probe.rs"
-required-features = ["vulkan"]
-
-[[example]]
 name = "vulkan_benchmark"
 path = "examples/vulkan_benchmark.rs"
 required-features = ["vulkan"]
@@ -325,7 +315,3 @@ optional = true
 version = "0.22.0"
 features = ["onig"]
 default-features = false
-
-[target.'cfg(windows)'.dev-dependencies.windows]
-version = "0.61.3"
-features = ["Win32_Graphics_Dxgi", "Win32_Foundation"]

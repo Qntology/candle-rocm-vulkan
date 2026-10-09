@@ -1,3 +1,0 @@
-@echo off
-call "%~dp0run_vk_probe.bat"
-call "%~dp0run_probe.bat"

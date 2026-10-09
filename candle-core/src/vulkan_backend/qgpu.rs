@@ -1,31 +1,3 @@
-//! GPU memory for the large read-only matmul operands and the kernels that read it.
-//!
-//! The rest of this backend keeps every tensor in host visible memory so that the CPU
-//! fallbacks can work on it in place. That is the right layout on unified memory (iGPU),
-//! but on a discrete GPU it means every weight would be read over PCIe, so the GPU
-//! kernels stay off there and the work runs on the CPU. This module moves the operands
-//! that dominate an LLM forward pass into memory the GPU reads at full speed:
-//!
-//! * quantized weights (`Q8_0`) are repacked into a GPU friendly layout and run through
-//!   dedicated GEMV/GEMM, embedding and dequantization kernels;
-//! * dense weights (`F32`/`F16`/`BF16`) used as the right hand side of a matmul get a GPU
-//!   copy (a "mirror") the second time they are used that way.
-//!
-//! Placement follows the device kind:
-//! * discrete GPU: device local VRAM, uploaded through a staging buffer; activations are
-//!   copied into a VRAM scratch buffer per call and results are written straight into
-//!   the host visible output tensor;
-//! * integrated GPU: the device local carve-out first and then the shared system memory
-//!   heap (the "shared GPU memory" of the OS), both read directly by the GPU, no copies.
-//!
-//! A heap only takes an allocation while its `VK_EXT_memory_budget` budget keeps a
-//! reserve free, otherwise the next memory kind is tried and finally the CPU path.
-//!
-//! Environment: `CANDLE_VULKAN_GPU_WEIGHTS=0` disables all of it,
-//! `CANDLE_VULKAN_DENSE_MIRROR=0` only the dense mirrors, `CANDLE_VULKAN_SCRATCH_MB`
-//! (default 128) bounds the activation scratch, `CANDLE_VULKAN_VRAM_RESERVE_MB`
-//! (default 512) is the free VRAM kept for the desktop and other processes.
-
 use super::shaders::{self, Bind, Op};
 use super::{VulkanContext, VulkanDevice, VulkanStorage};
 use crate::backend::{BackendDevice, BackendStorage};
@@ -34,10 +6,6 @@ use ash::vk;
 use half::f16;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
-
-// ---------------------------------------------------------------------------
-// Settings
-// ---------------------------------------------------------------------------
 
 fn env_on(name: &str, default: bool) -> bool {
     match std::env::var(name) {
@@ -71,7 +39,6 @@ fn act_enabled_env() -> bool {
     *V.get_or_init(|| env_on("CANDLE_VULKAN_ACT_MATMUL", true))
 }
 
-/// Activation matmuls below this many FLOPs stay on the CPU (copies cost more).
 fn act_min_flops() -> usize {
     static V: OnceLock<usize> = OnceLock::new();
     *V.get_or_init(|| env_mb("CANDLE_VULKAN_ACT_MIN_MFLOP", 256) * 1_000_000)
@@ -87,54 +54,29 @@ fn vram_reserve() -> u64 {
     *V.get_or_init(|| (env_mb("CANDLE_VULKAN_VRAM_RESERVE_MB", 512) as u64) << 20)
 }
 
-fn debug() -> bool {
-    static V: OnceLock<bool> = OnceLock::new();
-    *V.get_or_init(|| env_on("CANDLE_VULKAN_DEBUG", false))
-}
-
-pub(crate) fn note_fallback(what: &str, e: &Error) {
-    if debug() {
-        eprintln!("vulkan: {what} fell back to the CPU path: {e}");
-    }
-}
-
-/// Whether weights may be placed in GPU memory on `dev`.
 pub(crate) fn enabled(dev: &VulkanDevice) -> bool {
     weights_enabled_env()
         && dev.ctx().device_type != vk::PhysicalDeviceType::CPU
         && dev.ctx().native_ok.load(Ordering::Relaxed)
 }
 
-/// Testing aid: treat a discrete GPU like an integrated one (weights go to the small
-/// device local + host visible heap first, then spill to shared system memory, and
-/// activations are bound in place), to exercise the integrated GPU code paths.
 fn pretend_integrated() -> bool {
     static V: OnceLock<bool> = OnceLock::new();
     *V.get_or_init(|| env_on("CANDLE_VULKAN_PRETEND_INTEGRATED", false))
 }
 
-/// Unified memory: the GPU reads the host visible tensor memory at full speed, so
-/// activations and dense weights are bound directly instead of being copied.
 fn unified(ctx: &VulkanContext) -> bool {
     ctx.default_native || pretend_integrated()
 }
 
-// ---------------------------------------------------------------------------
-// Per-device state
-// ---------------------------------------------------------------------------
-
-/// Bookkeeping of this module, stored in the device context.
 #[derive(Default)]
 pub(crate) struct GpuState {
-    /// Bytes of device local memory held by GPU buffers of this module.
     pub(crate) local_bytes: AtomicUsize,
-    /// Bytes of host (shared) memory held by GPU buffers of this module.
     pub(crate) shared_bytes: AtomicUsize,
     pub(crate) buffers: AtomicUsize,
     scratch: Mutex<Option<RawBuf>>,
 }
 
-/// A buffer owned by the context itself (no back reference to the device).
 pub(crate) struct RawBuf {
     buffer: vk::Buffer,
     memory: vk::DeviceMemory,
@@ -143,7 +85,6 @@ pub(crate) struct RawBuf {
 }
 
 impl GpuState {
-    /// Frees the activation scratch buffer (it is re-created on demand).
     pub(crate) fn release_scratch(&self, device: &ash::Device) {
         if let Ok(mut s) = self.scratch.lock() {
             if let Some(r) = s.take() {
@@ -179,17 +120,12 @@ impl GpuState {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Memory placement
-// ---------------------------------------------------------------------------
-
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) enum Use {
     Weights,
     Scratch,
 }
 
-/// `(budget, usage)` per heap from `VK_EXT_memory_budget`.
 pub(crate) fn heap_budgets(
     ctx: &VulkanContext,
 ) -> Option<([u64; vk::MAX_MEMORY_HEAPS], [u64; vk::MAX_MEMORY_HEAPS])> {
@@ -214,7 +150,6 @@ fn is_discrete(ctx: &VulkanContext) -> bool {
     ctx.device_type == vk::PhysicalDeviceType::DISCRETE_GPU && !pretend_integrated()
 }
 
-/// Memory types for `use_`, best first.
 fn candidates(ctx: &VulkanContext, use_: Use, type_bits: u32) -> Vec<u32> {
     let mp = &ctx.memory_properties;
     let discrete = is_discrete(ctx);
@@ -240,12 +175,9 @@ fn candidates(ctx: &VulkanContext, use_: Use, type_bits: u32) -> Vec<u32> {
             (Use::Scratch, _, true, false) => 0,
             (Use::Scratch, _, true, true) => 1,
             (Use::Scratch, _, false, _) => continue,
-            // discrete: VRAM, then a resizable BAR window; never system RAM (the CPU
-            // path reads that faster than the GPU does over PCIe)
             (Use::Weights, true, true, false) => 0,
             (Use::Weights, true, true, true) if hsize >= (1 << 30) => 1,
             (Use::Weights, true, _, _) => continue,
-            // integrated: the carve-out, then the shared system memory heap
             (Use::Weights, false, true, true) => 0,
             (Use::Weights, false, false, true) => 1,
             (Use::Weights, false, true, false) => 2,
@@ -257,7 +189,6 @@ fn candidates(ctx: &VulkanContext, use_: Use, type_bits: u32) -> Vec<u32> {
     v.into_iter().map(|(_, _, t)| t).collect()
 }
 
-/// Whether `size` more bytes fit in `heap` while keeping its reserve free.
 fn heap_fits(
     ctx: &VulkanContext,
     heap: usize,
@@ -284,8 +215,6 @@ fn heap_fits(
     }
 }
 
-/// Heaps that hold GPU working memory, for `mem_info`: the VRAM heap on a discrete GPU,
-/// the carve-out plus the shared heap on an integrated one.
 pub(crate) fn working_heaps(ctx: &VulkanContext) -> Vec<usize> {
     let mut heaps: Vec<usize> = Vec::new();
     for t in candidates(ctx, Use::Weights, u32::MAX) {
@@ -314,8 +243,6 @@ fn create_buffer(ctx: &VulkanContext, size: usize) -> Result<vk::Buffer> {
     .map_err(|e| Error::Msg(format!("vulkan create_buffer ({size} bytes) failed: {e:?}")))
 }
 
-/// Allocates and binds memory for a new buffer of `size` bytes. Returns
-/// `(buffer, memory, mapped, device_local, alloc_size)`.
 fn alloc_raw(
     ctx: &VulkanContext,
     size: usize,
@@ -377,7 +304,6 @@ fn alloc_raw(
     )))
 }
 
-/// A buffer in GPU memory owned by a tensor.
 pub(crate) struct GpuBuf {
     pub(crate) buffer: vk::Buffer,
     memory: vk::DeviceMemory,
@@ -426,10 +352,7 @@ impl std::fmt::Debug for GpuBuf {
 
 const STAGING_CHUNK: usize = 32 << 20;
 
-/// Copies `data` into `dst` at `offset` (directly when mapped, else through staging).
 pub(crate) fn write(dev: &VulkanDevice, dst: &GpuBuf, offset: usize, data: &[u8]) -> Result<()> {
-    let mut _p = super::prof::scope("gpu", "write(staging)");
-    _p.work(data.len());
     if data.is_empty() {
         return Ok(());
     }
@@ -461,10 +384,7 @@ pub(crate) fn write(dev: &VulkanDevice, dst: &GpuBuf, offset: usize, data: &[u8]
     Ok(())
 }
 
-/// Copies `out.len()` bytes of `src` starting at `offset` into `out`.
 pub(crate) fn read(dev: &VulkanDevice, src: &GpuBuf, offset: usize, out: &mut [u8]) -> Result<()> {
-    let mut _p = super::prof::scope("gpu", "read(staging)");
-    _p.work(out.len());
     if out.is_empty() {
         return Ok(());
     }
@@ -496,7 +416,6 @@ pub(crate) fn read(dev: &VulkanDevice, src: &GpuBuf, offset: usize, out: &mut [u
     Ok(())
 }
 
-/// The activation scratch buffer (VRAM), grown on demand, held while the guard lives.
 struct Scratch<'a> {
     guard: MutexGuard<'a, Option<RawBuf>>,
 }
@@ -530,10 +449,6 @@ fn scratch(ctx: &VulkanContext, bytes: usize) -> Result<Scratch<'_>> {
     Ok(Scratch { guard })
 }
 
-// ---------------------------------------------------------------------------
-// Kernels
-// ---------------------------------------------------------------------------
-
 fn push(vals: &[usize]) -> Vec<u8> {
     let mut v = Vec::with_capacity(vals.len() * 4);
     for &x in vals {
@@ -542,8 +457,6 @@ fn push(vals: &[usize]) -> Vec<u8> {
     v
 }
 
-/// The whole storage, rounded to 16 bytes so vec4 views cover the tail (storages are
-/// bucketed: the buffer behind them is always at least that large).
 fn storage_bind(s: &VulkanStorage) -> Bind {
     Bind {
         buffer: s.buffer,
@@ -556,8 +469,6 @@ fn fits_u32(v: usize) -> bool {
     v <= u32::MAX as usize
 }
 
-/// Splits `ops` dispatch-wise into submissions of at most `shaders::MAX_SETS`
-/// dispatches; `prefix` (copies) runs first in the first submission.
 fn submit(dev: &VulkanDevice, prefix: Vec<Op<'_>>, dispatches: Vec<Op<'_>>) -> Result<()> {
     let mut pending: Vec<Op<'_>> = prefix;
     let mut count = 0u32;
@@ -576,11 +487,6 @@ fn submit(dev: &VulkanDevice, prefix: Vec<Op<'_>>, dispatches: Vec<Op<'_>>) -> R
     Ok(())
 }
 
-// Q8_0, repacked: the 32 int8 quants of block `i` at bytes `[32 i, 32 i + 32)` of `wq`,
-// its scale as an f32 at `wd[i]`. Block `i` of row `r` of an `(n, k)` matrix is
-// `r * k / 32 + c`.
-
-/// Small m: 8 output columns per workgroup, 32 lanes per column striding over blocks.
 const GLSL_Q8_GEMV: &str = r#"#version 450
 layout(local_size_x = 256) in;
 layout(set = 0, binding = 0) readonly buffer X { float x[]; };
@@ -630,8 +536,6 @@ void main() {
 }
 "#;
 
-/// Small m with 16 byte loads: the 32 quants of a block as two uvec4, x as vec4
-/// (needs x rows aligned to 4 floats).
 const GLSL_Q8_GEMV_V: &str = r#"#version 450
 layout(local_size_x = 256) in;
 layout(set = 0, binding = 0) readonly buffer X { vec4 x[]; };
@@ -696,7 +600,6 @@ void main() {
 }
 "#;
 
-/// Larger m: 64x64 output tiles, 4x4 per thread, one Q8_0 block (32 k) per step.
 const GLSL_Q8_GEMM: &str = r#"#version 450
 layout(local_size_x = 16, local_size_y = 16) in;
 layout(set = 0, binding = 0) readonly buffer X { float x[]; };
@@ -784,7 +687,6 @@ void main() {
 }
 "#;
 
-/// Embedding rows: `y[i, c] = wd[blk] * q(blk, c)` with `blk = ids[i] * nb + c / 32`.
 const GLSL_Q8_GATHER: &str = r#"#version 450
 layout(local_size_x = 256) in;
 layout(set = 0, binding = 0) readonly buffer IDS { uint ids[]; };
@@ -811,7 +713,6 @@ void main() {
 }
 "#;
 
-/// Whole tensor to f32 (`HALF == 0`) or to packed f16 pairs (`HALF == 1`).
 const GLSL_Q8_DEQUANT: &str = r#"#version 450
 layout(local_size_x = 256) in;
 layout(set = 0, binding = 0) readonly buffer WQ { uint wq[]; };
@@ -840,11 +741,8 @@ void main() {
 "#;
 
 const GEMV_MAX_M: usize = 8;
-/// Upper bound of the work of one dispatch (2 * rows * cols * k), keeps every
-/// dispatch far below the OS GPU watchdog (2 s on Windows).
 const MAX_DISPATCH_FLOPS: usize = 1 << 34;
 
-/// Repacked `Q8_0` weights in GPU memory.
 pub(crate) struct GpuQ8 {
     pub(crate) buf: GpuBuf,
     pub(crate) nblocks: usize,
@@ -863,11 +761,7 @@ impl std::fmt::Debug for GpuQ8 {
 pub(crate) const Q8_BLOCK_BYTES: usize = 34;
 
 impl GpuQ8 {
-    /// Moves GGML `Q8_0` blocks into GPU memory, or fails when no GPU memory kind has
-    /// room (the caller keeps the CPU layout then).
     pub(crate) fn from_ggml(dev: &VulkanDevice, bytes: &[u8]) -> Result<Self> {
-        let mut _p = super::prof::scope("q8", "upload(repack+copy)");
-        _p.work(bytes.len());
         if !bytes.len().is_multiple_of(Q8_BLOCK_BYTES) {
             crate::bail!("vulkan q8: {} bytes are not whole Q8_0 blocks", bytes.len())
         }
@@ -895,9 +789,7 @@ impl GpuQ8 {
         })
     }
 
-    /// The GGML `Q8_0` bytes of this tensor (downloads them from the GPU).
     pub(crate) fn to_ggml(&self) -> Result<Vec<u8>> {
-        let _p = super::prof::scope("q8", "download");
         let nb = self.nblocks;
         let mut packed = vec![0u8; self.d_off + nb * 4];
         read(&self.buf.dev, &self.buf, 0, &mut packed)?;
@@ -936,7 +828,6 @@ impl GpuQ8 {
         }
     }
 
-    /// `x @ W^T` for `W` of shape `(n, k)`, `x` of `m` rows. Output is f32.
     pub(crate) fn matmul(
         &self,
         (m, k, n): (usize, usize, usize),
@@ -944,8 +835,6 @@ impl GpuQ8 {
         layout: &Layout,
     ) -> Result<VulkanStorage> {
         let dev = x.device.clone();
-        let mut _p = super::prof::scope("q8", if m <= GEMV_MAX_M { "gemv" } else { "gemm" });
-        _p.work(2 * m * n * k);
         if !k.is_multiple_of(32) || self.nblocks * 32 != n * k {
             crate::bail!("vulkan q8 matmul: weights do not hold {n}x{k} values")
         }
@@ -968,7 +857,6 @@ impl GpuQ8 {
         }
         let nb = k / 32;
         let gemv = m <= GEMV_MAX_M;
-        // the vector kernel reads x as vec4: rows must start 16 byte aligned
         let x_aligned = !unified(dev.ctx()) || x_off % 4 == 0;
         let kern = match (gemv, x_aligned) {
             (true, true) => shaders::kernel(&dev, "q8_gemv_v", 4, 36, || GLSL_Q8_GEMV_V.to_string())?,
@@ -978,7 +866,6 @@ impl GpuQ8 {
         let max_groups = dev.limits().max_workgroup_count;
         let ctx = dev.ctx();
         let row_bytes = k * 4;
-        // rows processed per pass (all of them unless the scratch would get too big)
         let band = if unified(ctx) || m * row_bytes <= scratch_cap() {
             m
         } else {
@@ -1032,8 +919,6 @@ impl GpuQ8 {
                 } else {
                     [cols.div_ceil(64) as u32, rows.div_ceil(64) as u32, 1]
                 };
-                // c0 is folded into the column index; n stays the full width so the
-                // stores land in the right place.
                 let p = push(&[rows, (c0 + cols), k, nb, xo, k, r0 * n, n, c0]);
                 dispatches.push(Op::Dispatch {
                     kernel: kern.as_ref(),
@@ -1050,9 +935,7 @@ impl GpuQ8 {
         Ok(out)
     }
 
-    /// Rows `ids` of the `(rows, hidden)` table, as f32.
     pub(crate) fn embedding(&self, rows: usize, hidden: usize, ids: &[u32], dev: &VulkanDevice) -> Result<VulkanStorage> {
-        let _p = super::prof::scope("q8", "gather");
         if !hidden.is_multiple_of(32) || self.nblocks * 32 != rows * hidden {
             crate::bail!("vulkan q8 embedding: table does not hold {rows}x{hidden} values")
         }
@@ -1081,9 +964,7 @@ impl GpuQ8 {
         Ok(out)
     }
 
-    /// The first `elem_count` values as f32 or f16.
     pub(crate) fn dequantize(&self, elem_count: usize, dtype: DType, dev: &VulkanDevice) -> Result<VulkanStorage> {
-        let _p = super::prof::scope("q8", "dequant");
         let elem_count = elem_count.min(self.nblocks * 32);
         let half = match dtype {
             DType::F32 => false,
@@ -1117,14 +998,9 @@ impl GpuQ8 {
     }
 }
 
-/// Whether a `Q8_0` tensor of `bytes` should live in GPU memory.
 pub(crate) fn want_q8_on_gpu(dev: &VulkanDevice, bytes: usize) -> bool {
     enabled(dev) && bytes >= 64 * Q8_BLOCK_BYTES
 }
-
-// ---------------------------------------------------------------------------
-// Dense matmul with GPU resident right hand side
-// ---------------------------------------------------------------------------
 
 fn rhs_variant(dtype: DType) -> Option<(&'static str, &'static str, &'static str)> {
     match dtype {
@@ -1189,11 +1065,7 @@ void main() {{
     )
 }
 
-/// GEMV for a right hand side that is contiguous along k (a weight matrix used as
-/// `w.t()`), reading 16 bytes per lane per load with four loads in flight:
-/// `(binding declaration, elements per vector, dot function)`.
 fn dense_vec_variant(dtype: DType) -> Option<(&'static str, usize, &'static str)> {
-    // x is read as vec4 at element offset `xo` (a multiple of 4)
     match dtype {
         DType::F32 => Some((
             "vec4 w[];",
@@ -1344,7 +1216,6 @@ void main() {{
     )
 }
 
-/// Matmuls whose right hand side has fewer bytes stay on the regular path.
 const MIRROR_MIN_BYTES: usize = 4 << 20;
 
 fn mirror_after() -> u32 {
@@ -1352,7 +1223,6 @@ fn mirror_after() -> u32 {
     *V.get_or_init(|| env_mb("CANDLE_VULKAN_MIRROR_AFTER", 2).max(1) as u32)
 }
 
-/// The GPU copy of `rhs` (made on its `mirror_after`-th use as a matmul rhs).
 fn mirror_of(rhs: &VulkanStorage) -> Option<Arc<GpuBuf>> {
     let mut slot = rhs.mirror.lock().ok()?;
     if let Some(m) = slot.as_ref() {
@@ -1363,20 +1233,15 @@ fn mirror_of(rhs: &VulkanStorage) -> Option<Arc<GpuBuf>> {
         return None;
     }
     let bytes = rhs.as_bytes();
-    let mut _p = super::prof::scope("gpu", "mirror_create");
-    _p.work(bytes.len());
     let size = bytes.len().max(4).div_ceil(4) * 4;
     let buf = match GpuBuf::new(&rhs.device, size, Use::Weights) {
         Ok(b) => b,
-        Err(e) => {
-            note_fallback("dense mirror allocation", &e);
-            // do not retry on every call
+        Err(_) => {
             rhs.rhs_uses.store(0, Ordering::Relaxed);
             return None;
         }
     };
-    if let Err(e) = write(&rhs.device, &buf, 0, bytes) {
-        note_fallback("dense mirror upload", &e);
+    if write(&rhs.device, &buf, 0, bytes).is_err() {
         return None;
     }
     let buf = Arc::new(buf);
@@ -1384,8 +1249,6 @@ fn mirror_of(rhs: &VulkanStorage) -> Option<Arc<GpuBuf>> {
     Some(buf)
 }
 
-/// `lhs @ rhs` on the GPU when `rhs` looks like a weight matrix (one matrix shared by
-/// all batches, large enough) and lives, or can be mirrored, in GPU memory.
 pub(crate) fn dense_matmul(
     lhs: &VulkanStorage,
     rhs: &VulkanStorage,
@@ -1400,7 +1263,6 @@ pub(crate) fn dense_matmul(
     let Some((tag, decl, load)) = rhs_variant(rhs.dtype) else {
         return Ok(None);
     };
-    // worth a GPU copy: a big weight, or a smaller one that multiplies many rows
     let worthwhile = rhs.capacity_bytes >= MIRROR_MIN_BYTES
         || (rhs.capacity_bytes >= (256 << 10) && b * m >= 32);
     if lhs.dtype != rhs.dtype
@@ -1411,7 +1273,6 @@ pub(crate) fn dense_matmul(
     {
         return Ok(None);
     }
-    // the rhs must be one matrix shared by every batch
     let rd = rhs_l.dims();
     let rs = rhs_l.stride();
     let rr = rd.len();
@@ -1426,7 +1287,6 @@ pub(crate) fn dense_matmul(
         return Ok(None);
     }
     let ctx = dev.ctx();
-    // the mirror stays alive (Arc) for the duration of the call
     let mirror = if unified(ctx) {
         None
     } else {
@@ -1435,8 +1295,6 @@ pub(crate) fn dense_matmul(
             None => return Ok(None),
         }
     };
-    // ranges rounded to 16 bytes so vec4/uvec4 views cover the tail (the buffers are
-    // at least that large: storages are bucketed, mirrors rounded to 256 bytes)
     let w_range = (rhs.capacity_bytes.max(16).div_ceil(16) * 16) as u64;
     let w_bind = match &mirror {
         None => Bind {
@@ -1451,7 +1309,6 @@ pub(crate) fn dense_matmul(
         },
     };
     let res = (|| -> Result<VulkanStorage> {
-        // contiguous f32 lhs of (b*m, k)
         let view = lhs.host_view();
         let converted;
         let (xs, x_off) = match (lhs.dtype, lhs_l.contiguous_offsets()) {
@@ -1557,27 +1414,15 @@ pub(crate) fn dense_matmul(
     })();
     match res {
         Ok(out) => Ok(Some(out)),
-        Err(e) => {
-            note_fallback("dense matmul", &e);
-            Ok(None)
-        }
+        Err(_) => Ok(None)
     }
 }
 
 #[allow(dead_code)]
-/// Whether `s` has a GPU mirror (diagnostics).
 pub(crate) fn has_mirror(s: &VulkanStorage) -> bool {
     s.mirror.lock().map(|m| m.is_some()).unwrap_or(false)
 }
 
-// ---------------------------------------------------------------------------
-// Activation x activation matmul on a discrete GPU
-// ---------------------------------------------------------------------------
-
-/// `lhs @ rhs` for two activations (attention scores, attention x values, ...) on a
-/// discrete GPU: the spans of both operands are copied into the VRAM scratch, the tiled
-/// matmul kernel runs there and writes the result straight into the host visible
-/// output. Only for f32 and large enough problems; everything else stays on the CPU.
 pub(crate) fn act_matmul(
     lhs: &VulkanStorage,
     rhs: &VulkanStorage,
@@ -1707,9 +1552,6 @@ pub(crate) fn act_matmul(
     })();
     match res {
         Ok(out) => Ok(Some(out)),
-        Err(e) => {
-            note_fallback("activation matmul", &e);
-            Ok(None)
-        }
+        Err(_) => Ok(None)
     }
 }

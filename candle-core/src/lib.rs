@@ -99,7 +99,6 @@ mod tensor;
 mod tensor_cat;
 pub mod test_utils;
 pub mod utils;
-/// Host side helpers for the gated delta rule (CPU / Vulkan).
 pub mod delta_rule;
 mod variable;
 
@@ -141,7 +140,7 @@ pub use rocm_backend as rocm;
 #[cfg(not(feature = "rocm"))]
 pub use dummy_rocm_backend as rocm;
 
-pub use rocm::{MemoryReport as RocmMemoryReport, RocmDevice, RocmStorage};
+pub use rocm::{RocmDevice, RocmStorage};
 
 #[cfg(not(feature = "metal"))]
 pub use dummy_metal_backend::{MetalDevice, MetalError, MetalStorage};

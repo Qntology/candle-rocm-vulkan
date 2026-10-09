@@ -19,7 +19,6 @@
 //! independently created handles of the same GPU.
 #![allow(clippy::missing_safety_doc)]
 
-pub mod prof;
 pub(crate) mod qgpu;
 pub mod shaders;
 
@@ -86,10 +85,7 @@ pub(crate) struct VulkanContext {
     /// GPU kernels are used by default on integrated GPUs and whenever the
     /// tensor memory is device local.
     default_native: bool,
-    /// Weights in GPU memory (see [`qgpu`]).
     pub(crate) gpu: qgpu::GpuState,
-    /// The kernels run on a graphics (universal) queue rather than a compute-only one.
-    queue_graphics: bool,
 }
 
 unsafe impl Send for VulkanContext {}
@@ -305,13 +301,6 @@ fn device_type_rank(t: vk::PhysicalDeviceType) -> u32 {
     }
 }
 
-/// Physical devices that expose a compute queue, best first: discrete GPUs (the one
-/// with the most VRAM first), then integrated, virtual and other GPUs. Software
-/// rasterizers (CPU type devices such as llvmpipe / SwiftShader) are left out unless
-/// `CANDLE_VULKAN_ALLOW_CPU=1`, so a machine without a GPU reports no Vulkan device and
-/// callers fall back to the CPU backend. `CANDLE_VULKAN_DEVICE=<name substring>` moves
-/// the matching device to the front. The ordinal used by [`VulkanDevice::new`]
-/// indexes this list.
 fn sorted_physical_devices(instance: &ash::Instance) -> Result<Vec<vk::PhysicalDevice>> {
     let list = unsafe { instance.enumerate_physical_devices() }
         .map_err(|e| Error::Msg(format!("vulkan: enumerate_physical_devices failed: {e:?}")))?;
@@ -444,11 +433,6 @@ fn init_vulkan(gpu_id: usize) -> Result<VulkanContext> {
     let any_compute = queues
         .iter()
         .position(|q| q.queue_flags.contains(vk::QueueFlags::COMPUTE));
-    // Which hardware queue runs the kernels. Both kinds drive the same shader cores; the
-    // OS just accounts them to different engines (Windows Task Manager: "3D" for the
-    // graphics queue, "Compute 0/1" for a compute-only queue). A compute-only queue
-    // lets the desktop compositor keep rendering on the 3D engine while long kernels
-    // run. `CANDLE_VULKAN_QUEUE=graphics` (or `3d`) / `compute` picks one.
     let graphics = queues.iter().position(|q| {
         q.queue_flags
             .contains(vk::QueueFlags::GRAPHICS | vk::QueueFlags::COMPUTE)
@@ -505,9 +489,6 @@ fn init_vulkan(gpu_id: usize) -> Result<VulkanContext> {
         }
     };
     let queue = unsafe { device.get_device_queue(queue_family, 0) };
-    let queue_graphics = queues[queue_family as usize]
-        .queue_flags
-        .contains(vk::QueueFlags::GRAPHICS);
 
     let memory_properties = unsafe { instance.get_physical_device_memory_properties(physical) };
     let memory_types = memory_type_order(&memory_properties);
@@ -589,7 +570,6 @@ fn init_vulkan(gpu_id: usize) -> Result<VulkanContext> {
         native_ok: AtomicBool::new(true),
         default_native,
         gpu: Default::default(),
-        queue_graphics,
     })
 }
 
@@ -625,85 +605,6 @@ impl VulkanDevice {
         &self.inner.name
     }
 
-    /// Human readable dump of the memory heaps/types the driver exposes, which
-    /// type the tensors are allocated from, per-heap budget/usage (when
-    /// `VK_EXT_memory_budget` is available) and whether GPU kernels are on.
-    pub fn memory_diagnostics(&self) -> String {
-        use std::fmt::Write;
-        let ctx = &self.inner;
-        let mp = &ctx.memory_properties;
-        let mut out = String::new();
-        let (mut budget, mut usage) = ([0u64; vk::MAX_MEMORY_HEAPS], [0u64; vk::MAX_MEMORY_HEAPS]);
-        if ctx.memory_budget_ext {
-            let mut b = vk::PhysicalDeviceMemoryBudgetPropertiesEXT::default();
-            let mut props2 = vk::PhysicalDeviceMemoryProperties2::default().push_next(&mut b);
-            unsafe {
-                ctx.instance
-                    .get_physical_device_memory_properties2(ctx.physical, &mut props2)
-            };
-            budget = b.heap_budget;
-            usage = b.heap_usage;
-        }
-        let _ = writeln!(
-            out,
-            "device={} type={} memory_budget_ext={} default_native={} native_now={}",
-            ctx.name,
-            self.device_type(),
-            ctx.memory_budget_ext,
-            ctx.default_native,
-            self.native_kernels_enabled()
-        );
-        let _ = writeln!(
-            out,
-            "  queue: {}",
-            if ctx.queue_graphics {
-                "graphics (Windows Task Manager engine: 3D)"
-            } else {
-                "compute-only (Windows Task Manager engine: Compute)"
-            }
-        );
-        let (gl, gs) = self.gpu_memory_bytes();
-        let _ = writeln!(
-            out,
-            "  gpu weights: enabled={} local={} MB shared={} MB buffers={}",
-            self.gpu_weights_enabled(),
-            gl >> 20,
-            gs >> 20,
-            ctx.gpu.buffers.load(Ordering::Relaxed)
-        );
-        for h in 0..mp.memory_heap_count as usize {
-            let heap = mp.memory_heaps[h];
-            let _ = writeln!(
-                out,
-                "  heap[{h}] size={} MB device_local={} budget={} MB usage={} MB",
-                heap.size >> 20,
-                heap.flags.contains(vk::MemoryHeapFlags::DEVICE_LOCAL),
-                budget[h] >> 20,
-                usage[h] >> 20
-            );
-        }
-        for t in 0..mp.memory_type_count as usize {
-            let ty = mp.memory_types[t];
-            let f = ty.property_flags;
-            let rank = ctx.memory_types.iter().position(|&x| x as usize == t);
-            let _ = writeln!(
-                out,
-                "  type[{t}] heap={} DL={} HV={} HC={} CACHED={}{}",
-                ty.heap_index,
-                f.contains(vk::MemoryPropertyFlags::DEVICE_LOCAL) as u8,
-                f.contains(vk::MemoryPropertyFlags::HOST_VISIBLE) as u8,
-                f.contains(vk::MemoryPropertyFlags::HOST_COHERENT) as u8,
-                f.contains(vk::MemoryPropertyFlags::HOST_CACHED) as u8,
-                match rank {
-                    Some(0) => "  <== tensors allocated here".to_string(),
-                    Some(r) => format!("  (candidate #{r})"),
-                    None => String::new(),
-                }
-            );
-        }
-        out
-    }
-
     /// `"discrete"`, `"integrated"`, `"virtual"`, `"cpu"` or `"other"`.
     pub fn device_type(&self) -> &'static str {
         match self.inner.device_type {
@@ -720,8 +621,6 @@ impl VulkanDevice {
     /// otherwise the heap size minus what this process allocated.
     pub fn mem_info(&self) -> Result<(usize, usize)> {
         let ctx = &self.inner;
-        // GPU working memory: VRAM on a discrete GPU, carve-out + shared heap on an
-        // integrated one (where weights are placed, see `qgpu`).
         if qgpu::enabled(self) {
             let heaps = qgpu::working_heaps(ctx);
             if !heaps.is_empty() {
@@ -778,35 +677,11 @@ impl VulkanDevice {
         self.inner.pool.lock().map(|p| p.bytes).unwrap_or(0)
     }
 
-    /// Op profiler table (`CANDLE_VULKAN_PROFILE=1`, see [`prof`]); `None` when off.
-    pub fn profile_report(&self, top: usize, reset: bool) -> Option<String> {
-        prof::report(top, reset)
-    }
-
-    /// Clears the op profiler counters.
-    pub fn profile_reset(&self) {
-        prof::reset()
-    }
-
     /// Returns the buffers kept for reuse to the driver.
     pub fn trim_memory_pool(&self) -> Result<()> {
         self.inner.trim_pool();
         self.inner.gpu.release_scratch(&self.inner.device);
         Ok(())
-    }
-
-    /// `(device local, shared)` bytes held in GPU memory by weights, mirrors and the
-    /// activation scratch (see `qgpu`).
-    pub fn gpu_memory_bytes(&self) -> (usize, usize) {
-        (
-            self.inner.gpu.local_bytes.load(Ordering::Relaxed),
-            self.inner.gpu.shared_bytes.load(Ordering::Relaxed),
-        )
-    }
-
-    /// Whether large weights are placed in GPU memory and run on GPU kernels.
-    pub fn gpu_weights_enabled(&self) -> bool {
-        qgpu::enabled(self)
     }
 
     /// Whether the GPU kernels are in use (see [`shaders::native_enabled`]).
@@ -833,8 +708,6 @@ impl VulkanDevice {
             .ok_or_else(|| Error::Msg("vulkan: overflow in storage size".into()))?;
         let ctx = &self.inner;
         let backing = bucket_size(bytes);
-        let mut _p = prof::scope("alloc", "pool_hit");
-        _p.work(bytes);
         let reused = if backing <= POOL_MAX_BUFFER {
             ctx.pool.lock().ok().and_then(|mut pool| {
                 let b = pool.free.get_mut(&backing).and_then(|v| v.pop())?;
@@ -861,13 +734,11 @@ impl VulkanDevice {
             });
         }
         let slab_ok = backing <= SLAB_MAX_BUCKET;
-        _p.rename("alloc", "new_slab_slot");
         if slab_ok && ctx.use_slabs() {
             if let Ok(s) = self.alloc_slab(backing, bytes, numel, dtype) {
                 return Ok(s);
             }
         }
-        _p.rename("alloc", "new_dedicated");
         match self.alloc_dedicated(backing, bytes, numel, dtype) {
             Ok(s) => Ok(s),
             Err(first) => {
@@ -1178,7 +1049,6 @@ pub struct VulkanStorage {
     pub dtype: DType,
     pub numel: usize,
     pub device: VulkanDevice,
-    /// GPU copy used when this storage is the right hand side of matmuls (`qgpu`).
     pub(crate) mirror: Mutex<Option<Arc<qgpu::GpuBuf>>>,
     pub(crate) rhs_uses: AtomicU32,
 }
@@ -1253,7 +1123,6 @@ impl VulkanStorage {
         unsafe { std::slice::from_raw_parts(self.mapped, self.capacity_bytes) }
     }
 
-    /// Drops the GPU copy: the host bytes are about to change.
     pub(crate) fn invalidate_mirror(&mut self) {
         if let Ok(m) = self.mirror.get_mut() {
             *m = None;
@@ -1430,8 +1299,6 @@ impl BackendStorage for VulkanStorage {
     type Device = VulkanDevice;
 
     fn try_clone(&self, _layout: &Layout) -> Result<Self> {
-        let mut _p = prof::scope("op", "try_clone");
-        _p.work(self.capacity_bytes);
         self.device
             .upload_bytes(self.as_bytes(), self.numel, self.dtype)
     }
@@ -1445,7 +1312,6 @@ impl BackendStorage for VulkanStorage {
     }
 
     fn const_set(&mut self, s: crate::scalar::Scalar, layout: &Layout) -> Result<()> {
-        let _p = prof::scope("op", "const_set");
         self.invalidate_mirror();
         if shaders::const_set(self, s, layout)? {
             return Ok(());
@@ -1455,14 +1321,11 @@ impl BackendStorage for VulkanStorage {
     }
 
     fn to_cpu_storage(&self) -> Result<CpuStorage> {
-        let mut _p = prof::scope("xfer", "to_cpu");
-        _p.work(self.capacity_bytes);
         let view = self.host_view();
         Ok((*view).clone())
     }
 
     fn affine(&self, layout: &Layout, mul: f64, add: f64) -> Result<Self> {
-        let _p = prof::scope("op", "affine");
         if let Some(out) = shaders::affine(self, layout, mul, add)? {
             return Ok(out);
         }
@@ -1471,7 +1334,6 @@ impl BackendStorage for VulkanStorage {
     }
 
     fn powf(&self, layout: &Layout, e: f64) -> Result<Self> {
-        let _p = prof::scope("op", "powf");
         if let Some(out) = shaders::powf(self, layout, e)? {
             return Ok(out);
         }
@@ -1480,7 +1342,6 @@ impl BackendStorage for VulkanStorage {
     }
 
     fn elu(&self, layout: &Layout, alpha: f64) -> Result<Self> {
-        let _p = prof::scope("op", "elu");
         if let Some(out) = shaders::elu(self, layout, alpha)? {
             return Ok(out);
         }
@@ -1489,7 +1350,6 @@ impl BackendStorage for VulkanStorage {
     }
 
     fn reduce_op(&self, op: ReduceOp, layout: &Layout, dims: &[usize]) -> Result<Self> {
-        let _p = prof::scope("reduce", match &op { ReduceOp::Sum => "sum", ReduceOp::Min => "min", ReduceOp::Max => "max", ReduceOp::ArgMin => "argmin", ReduceOp::ArgMax => "argmax" });
         if let Some(out) = shaders::reduce(self, op, layout, dims)? {
             return Ok(out);
         }
@@ -1498,7 +1358,6 @@ impl BackendStorage for VulkanStorage {
     }
 
     fn cmp(&self, op: CmpOp, rhs: &Self, lhs_l: &Layout, rhs_l: &Layout) -> Result<Self> {
-        let _p = prof::scope("op", "cmp");
         if let Some(out) = shaders::cmp(self, op, rhs, lhs_l, rhs_l)? {
             return Ok(out);
         }
@@ -1508,7 +1367,6 @@ impl BackendStorage for VulkanStorage {
     }
 
     fn to_dtype(&self, layout: &Layout, dtype: DType) -> Result<Self> {
-        let _p = prof::scope("to_dtype", match (self.dtype, dtype) { (DType::F32, DType::F16) => "f32>f16", (DType::F16, DType::F32) => "f16>f32", (DType::F32, DType::BF16) => "f32>bf16", (DType::BF16, DType::F32) => "bf16>f32", (DType::F16, DType::BF16) => "f16>bf16", (DType::BF16, DType::F16) => "bf16>f16", (a, b) if a == b => "same", _ => "other" });
         if let Some(out) = shaders::to_dtype(self, layout, dtype)? {
             return Ok(out);
         }
@@ -1517,7 +1375,6 @@ impl BackendStorage for VulkanStorage {
     }
 
     fn unary_impl<B: UnaryOpT>(&self, layout: &Layout) -> Result<Self> {
-        let _p = prof::scope("unary", B::NAME);
         if let Some(out) = shaders::unary(self, B::NAME, layout)? {
             return Ok(out);
         }
@@ -1531,7 +1388,6 @@ impl BackendStorage for VulkanStorage {
         lhs_l: &Layout,
         rhs_l: &Layout,
     ) -> Result<Self> {
-        let _p = prof::scope("binary", B::NAME);
         if let Some(out) = shaders::binary(self, B::NAME, rhs, lhs_l, rhs_l)? {
             return Ok(out);
         }
@@ -1548,7 +1404,6 @@ impl BackendStorage for VulkanStorage {
         f: &Self,
         f_l: &Layout,
     ) -> Result<Self> {
-        let _p = prof::scope("op", "where_cond");
         if let Some(out) = shaders::where_cond(self, layout, t, t_l, f, f_l)? {
             return Ok(out);
         }
@@ -1565,7 +1420,6 @@ impl BackendStorage for VulkanStorage {
         kernel_l: &Layout,
         params: &crate::conv::ParamsConv1D,
     ) -> Result<Self> {
-        let _p = prof::scope("op", "conv1d");
         if self.dtype == DType::BF16 && kernel.dtype == DType::BF16 {
             return self.bf16_via_f32(l, kernel, kernel_l, |a, al, b, bl| {
                 a.conv1d(al, b, bl, params)
@@ -1583,7 +1437,6 @@ impl BackendStorage for VulkanStorage {
         kernel_l: &Layout,
         params: &crate::conv::ParamsConvTranspose1D,
     ) -> Result<Self> {
-        let _p = prof::scope("op", "conv_transpose1d");
         if self.dtype == DType::BF16 && kernel.dtype == DType::BF16 {
             return self.bf16_via_f32(l, kernel, kernel_l, |a, al, b, bl| {
                 a.conv_transpose1d(al, b, bl, params)
@@ -1601,7 +1454,6 @@ impl BackendStorage for VulkanStorage {
         kernel_l: &Layout,
         params: &crate::conv::ParamsConv2D,
     ) -> Result<Self> {
-        let _p = prof::scope("op", "conv2d");
         if self.dtype == DType::BF16 && kernel.dtype == DType::BF16 {
             return self.bf16_via_f32(l, kernel, kernel_l, |a, al, b, bl| {
                 a.conv2d(al, b, bl, params)
@@ -1619,7 +1471,6 @@ impl BackendStorage for VulkanStorage {
         kernel_l: &Layout,
         params: &crate::conv::ParamsConvTranspose2D,
     ) -> Result<Self> {
-        let _p = prof::scope("op", "conv_transpose2d");
         if self.dtype == DType::BF16 && kernel.dtype == DType::BF16 {
             return self.bf16_via_f32(l, kernel, kernel_l, |a, al, b, bl| {
                 a.conv_transpose2d(al, b, bl, params)
@@ -1631,7 +1482,6 @@ impl BackendStorage for VulkanStorage {
     }
 
     fn index_select(&self, ids: &Self, l: &Layout, ids_l: &Layout, dim: usize) -> Result<Self> {
-        let _p = prof::scope("op", "index_select");
         if let Some(out) = shaders::index_select(self, ids, l, ids_l, dim)? {
             return Ok(out);
         }
@@ -1641,7 +1491,6 @@ impl BackendStorage for VulkanStorage {
     }
 
     fn gather(&self, l: &Layout, ids: &Self, ids_l: &Layout, dim: usize) -> Result<Self> {
-        let _p = prof::scope("op", "gather");
         let src = self.host_view();
         let ids = ids.host_view();
         self.upload(src.gather(l, &ids, ids_l, dim)?)
@@ -1656,7 +1505,6 @@ impl BackendStorage for VulkanStorage {
         src_l: &Layout,
         dim: usize,
     ) -> Result<()> {
-        let _p = prof::scope("op", "scatter_set");
         let ids = ids.host_view();
         let src = src.host_view();
         let mut dst = self.host_view_mut();
@@ -1672,7 +1520,6 @@ impl BackendStorage for VulkanStorage {
         src_l: &Layout,
         dim: usize,
     ) -> Result<()> {
-        let _p = prof::scope("op", "scatter_add_set");
         let ids = ids.host_view();
         let src = src.host_view();
         let mut dst = self.host_view_mut();
@@ -1688,7 +1535,6 @@ impl BackendStorage for VulkanStorage {
         src_l: &Layout,
         dim: usize,
     ) -> Result<Self> {
-        let _p = prof::scope("op", "index_add");
         let tgt = self.host_view();
         let ids = ids.host_view();
         let src = src.host_view();
@@ -1702,29 +1548,15 @@ impl BackendStorage for VulkanStorage {
         lhs_l: &Layout,
         rhs_l: &Layout,
     ) -> Result<Self> {
-        let mut _p = prof::scope("matmul", "native");
-        _p.work(2 * bmnk.0 * bmnk.1 * bmnk.2 * bmnk.3);
         if let Some(out) = shaders::matmul(self, rhs, bmnk, lhs_l, rhs_l)? {
             return Ok(out);
         }
-        _p.rename("matmul", "gpu_dense_weight");
         if let Some(out) = qgpu::dense_matmul(self, rhs, bmnk, lhs_l, rhs_l)? {
             return Ok(out);
         }
-        _p.rename("matmul", "gpu_activation");
         if let Some(out) = qgpu::act_matmul(self, rhs, bmnk, lhs_l, rhs_l)? {
             return Ok(out);
         }
-        _p.rename(
-            "matmul",
-            match (self.dtype, bmnk.1 == 1) {
-                (DType::F32, true) => "cpu_f32_m1",
-                (DType::F32, false) => "cpu_f32",
-                (DType::F16, _) => "cpu_f16",
-                (DType::BF16, _) => "cpu_bf16(via f32)",
-                _ => "cpu_other",
-            },
-        );
         if self.dtype == DType::BF16 && rhs.dtype == DType::BF16 {
             let (b, m, n, _) = bmnk;
             let l32 = self.to_dtype(lhs_l, DType::F32)?;
@@ -1743,8 +1575,6 @@ impl BackendStorage for VulkanStorage {
     }
 
     fn copy_strided_src(&self, dst: &mut Self, dst_offset: usize, src_l: &Layout) -> Result<()> {
-        let mut _p = prof::scope("copy", if src_l.is_contiguous() { "strided(contig)" } else { "strided" });
-        _p.work(src_l.shape().elem_count() * elem_size(self.dtype));
         dst.invalidate_mirror();
         if shaders::copy_strided(self, dst, dst_offset, src_l)? {
             return Ok(());
@@ -1764,8 +1594,6 @@ impl BackendStorage for VulkanStorage {
         src_o: usize,
         dst_o: usize,
     ) -> Result<()> {
-        let mut _p = prof::scope("copy", "2d");
-        _p.work(d1 * d2 * elem_size(self.dtype));
         dst.invalidate_mirror();
         if shaders::copy2d(self, dst, d1, d2, src_s, dst_s, src_o, dst_o)? {
             return Ok(());
@@ -1776,25 +1604,21 @@ impl BackendStorage for VulkanStorage {
     }
 
     fn avg_pool2d(&self, layout: &Layout, k: (usize, usize), s: (usize, usize)) -> Result<Self> {
-        let _p = prof::scope("op", "avg_pool2d");
         let view = self.host_view();
         self.upload(view.avg_pool2d(layout, k, s)?)
     }
 
     fn max_pool2d(&self, layout: &Layout, k: (usize, usize), s: (usize, usize)) -> Result<Self> {
-        let _p = prof::scope("op", "max_pool2d");
         let view = self.host_view();
         self.upload(view.max_pool2d(layout, k, s)?)
     }
 
     fn upsample_nearest1d(&self, layout: &Layout, sz: usize) -> Result<Self> {
-        let _p = prof::scope("op", "upsample_nearest1d");
         let view = self.host_view();
         self.upload(view.upsample_nearest1d(layout, sz)?)
     }
 
     fn upsample_nearest2d(&self, layout: &Layout, h: usize, w: usize) -> Result<Self> {
-        let _p = prof::scope("op", "upsample_nearest2d");
         let view = self.host_view();
         self.upload(view.upsample_nearest2d(layout, h, w)?)
     }
@@ -1808,7 +1632,6 @@ impl BackendStorage for VulkanStorage {
         scale_h: Option<f64>,
         scale_w: Option<f64>,
     ) -> Result<Self> {
-        let _p = prof::scope("op", "upsample_bilinear2d");
         let view = self.host_view();
         self.upload(view.upsample_bilinear2d(layout, h, w, align_corners, scale_h, scale_w)?)
     }
@@ -1852,7 +1675,6 @@ impl BackendDevice for VulkanDevice {
     }
 
     fn zeros_impl(&self, shape: &Shape, dtype: DType) -> Result<Self::Storage> {
-        let _p = prof::scope("dev", "zeros");
         if dtype.size_in_bytes() == 0 || dtype == DType::F8E8M0 {
             return Err(Error::UnsupportedDTypeForOp(dtype, "zeros").bt());
         }
@@ -1869,8 +1691,6 @@ impl BackendDevice for VulkanDevice {
     }
 
     fn storage_from_slice<T: crate::WithDType>(&self, s: &[T]) -> Result<Self::Storage> {
-        let mut _p = prof::scope("xfer", "from_slice");
-        _p.work(std::mem::size_of_val(s));
         let bytes = unsafe {
             std::slice::from_raw_parts(s.as_ptr() as *const u8, std::mem::size_of_val(s))
         };
@@ -1878,7 +1698,6 @@ impl BackendDevice for VulkanDevice {
     }
 
     fn storage_from_cpu_storage(&self, cpu: &CpuStorage) -> Result<Self::Storage> {
-        let _p = prof::scope("xfer", "from_cpu");
         let (bytes, numel) = cpu_bytes(cpu);
         self.upload_bytes(bytes, numel, cpu.dtype())
     }
@@ -1982,7 +1801,6 @@ impl BackendDevice for VulkanDevice {
     }
 
     fn synchronize(&self) -> Result<()> {
-        let _p = prof::scope("gpu", "wait_idle");
         shaders::wait_idle(self)
     }
 }
