@@ -60,6 +60,10 @@ pub fn device_name(_: usize) -> Result<String> {
     Err(Error::NotCompiledWithRocmSupport)
 }
 
+pub fn device_arch(_: usize) -> Result<String> {
+    Err(Error::NotCompiledWithRocmSupport)
+}
+
 impl crate::backend::BackendStorage for RocmStorage {
     type Device = RocmDevice;
 

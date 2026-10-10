@@ -4,14 +4,57 @@ use hip_sys::hip_runtime::*;
 use std::ffi::CString;
 use std::ptr;
 
+/// `HIP_ARCH`, else the gfx target of device 0, else `gfx1010`.
+fn gpu_arch() -> String {
+    if let Ok(a) = std::env::var("HIP_ARCH") {
+        if !a.trim().is_empty() {
+            return a.trim().to_string();
+        }
+    }
+    let mut props = hipDevicePropR0600Storage::zeroed();
+    if unsafe { hipGetDevicePropertiesR0600(&mut props, 0) } == HIP_SUCCESS {
+        let name = String::from_utf8_lossy(props.gcn_arch_name()).to_string();
+        let base = name.split(':').next().unwrap_or("").trim().to_string();
+        if base.starts_with("gfx") {
+            return base;
+        }
+    }
+    "gfx1010".to_string()
+}
+
+/// `HIPCC`, else `bin/hipcc` of `ROCM_PATH` / `HIP_PATH` (legacy HIP SDK or ROCm Core SDK), else
+/// `/opt/rocm/bin/hipcc`, else `hipcc` from `PATH`.
+fn hipcc() -> std::path::PathBuf {
+    if let Ok(p) = std::env::var("HIPCC") {
+        if !p.trim().is_empty() {
+            return std::path::PathBuf::from(p.trim());
+        }
+    }
+    let exe = if cfg!(windows) { "hipcc.exe" } else { "hipcc" };
+    for var in ["ROCM_PATH", "HIP_PATH"] {
+        if let Ok(root) = std::env::var(var) {
+            let p = std::path::Path::new(root.trim().trim_matches('"')).join("bin").join(exe);
+            if p.is_file() {
+                return p;
+            }
+        }
+    }
+    let p = std::path::PathBuf::from("/opt/rocm/bin/hipcc");
+    if p.is_file() {
+        p
+    } else {
+        std::path::PathBuf::from(exe)
+    }
+}
+
 fn compile_rng_kernel() -> std::path::PathBuf {
     let kernel_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../kernels");
     let src = kernel_dir.join("rng.hip");
-    let out = kernel_dir.join("rng.hsaco");
+    let arch = gpu_arch();
+    let out = kernel_dir.join(format!("rng-{arch}.hsaco"));
 
     if !out.exists() {
-        let arch = std::env::var("HIP_ARCH").unwrap_or_else(|_| "gfx1010".to_string());
-        let status = std::process::Command::new("/opt/rocm/bin/hipcc")
+        let status = std::process::Command::new(hipcc())
             .args(["--genco", &format!("--offload-arch={arch}"), "-o"])
             .arg(&out)
             .arg(&src)

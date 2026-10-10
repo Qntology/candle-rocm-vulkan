@@ -1,11 +1,27 @@
 //! Safe device management.
 
 use crate::error::{check_hip, HipError, Result};
+use crate::track::HipVersion;
 use hip_sys::hip_runtime;
 
 #[derive(Debug, Clone)]
 pub struct HipDevice {
     ordinal: usize,
+}
+
+/// GPU target of a device as reported by the HIP runtime (`hipDeviceProp_t::gcnArchName`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GpuArch {
+    /// Full target id, e.g. `gfx1100` or `gfx90a:sramecc+:xnack-`.
+    pub full: String,
+    /// Processor name without target features, e.g. `gfx90a`.
+    pub name: String,
+}
+
+impl std::fmt::Display for GpuArch {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.full)
+    }
 }
 
 impl HipDevice {
@@ -71,6 +87,37 @@ impl HipDevice {
         check_hip(unsafe { hip_runtime::hipMemGetInfo(&mut free, &mut total) })?;
         Ok((free, total))
     }
+
+    /// GPU target (`gfx...`) of this device.
+    pub fn arch(&self) -> Result<GpuArch> {
+        let mut props = hip_runtime::hipDevicePropR0600Storage::zeroed();
+        check_hip(unsafe { hip_runtime::hipGetDevicePropertiesR0600(&mut props, self.ordinal as i32) })?;
+        let full = String::from_utf8_lossy(props.gcn_arch_name()).trim().to_string();
+        let name = full.split(':').next().unwrap_or("").trim().to_string();
+        if !name.starts_with("gfx") {
+            return Err(HipError::HipRuntimeError {
+                code: hip_runtime::HIP_ERROR_NOT_FOUND,
+                msg: format!("unexpected gcnArchName {full:?} for device {}", self.ordinal),
+            });
+        }
+        Ok(GpuArch { full, name })
+    }
+
+    fn attribute(&self, attr: i32) -> Result<i32> {
+        let mut v: i32 = 0;
+        check_hip(unsafe { hip_runtime::hipDeviceGetAttribute(&mut v, attr, self.ordinal as i32) })?;
+        Ok(v)
+    }
+
+    /// Wavefront size: 32 on RDNA, 64 on GCN / CDNA.
+    pub fn warp_size(&self) -> Result<u32> {
+        Ok(self.attribute(hip_runtime::hipDeviceAttributeWarpSize)?.max(0) as u32)
+    }
+
+    /// Number of compute units.
+    pub fn compute_units(&self) -> Result<u32> {
+        Ok(self.attribute(hip_runtime::hipDeviceAttributeMultiprocessorCount)?.max(0) as u32)
+    }
 }
 
 pub fn runtime_version() -> Result<i32> {
@@ -78,4 +125,9 @@ pub fn runtime_version() -> Result<i32> {
     let mut v: i32 = 0;
     check_hip(unsafe { hip_runtime::hipRuntimeGetVersion(&mut v) })?;
     Ok(v)
+}
+
+/// Version of the loaded HIP runtime, e.g. `7.2.x` (legacy ROCm 7.2) or `7.16.0` (ROCm 10.1).
+pub fn runtime_hip_version() -> Result<HipVersion> {
+    runtime_version().map(HipVersion::from_raw)
 }

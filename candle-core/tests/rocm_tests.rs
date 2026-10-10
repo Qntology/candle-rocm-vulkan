@@ -658,3 +658,91 @@ fn half_matmul_without_gemm_ex() -> Result<()> {
     std::env::remove_var("CANDLE_MOCK_NO_HALF_GEMM");
     res
 }
+
+/// Matmuls with the given GEMM backend; restores the previous backend afterwards.
+fn with_gemm_backend<R>(dev: &Device, backend: candle_core::rocm::GemmBackend, f: impl FnOnce() -> Result<R>) -> Result<R> {
+    let r = dev.as_rocm_device()?;
+    let prev = r.gemm_backend();
+    r.set_gemm_backend(backend);
+    let res = f();
+    r.set_gemm_backend(prev);
+    res
+}
+
+#[test]
+fn hip_gemm_kernel_matches_cpu() -> Result<()> {
+    use candle_core::rocm::GemmBackend;
+    let dev = rocm();
+    with_gemm_backend(&dev, GemmBackend::Hip, || {
+        // Edge tiles (not multiples of the 64 x 64 x 16 tiling), vectors and batches.
+        let shapes: [(usize, usize, usize, usize); 6] =
+            [(1, 1, 1, 1), (3, 70, 65, 33), (2, 64, 64, 16), (1, 130, 3, 200), (2, 5, 129, 17), (1, 1, 70, 40)];
+        for dtype in [DType::F32, DType::F64, DType::F16, DType::BF16] {
+            for &(b, m, n, k) in shapes.iter() {
+                let a = randn(&[b, m, k], dtype)?;
+                let w = randn(&[b, k, n], dtype)?;
+                let (ag, wg) = (a.to_device(&dev)?, w.to_device(&dev)?);
+                let what = format!("hip gemm {dtype:?} b={b} m={m} n={n} k={k}");
+                assert_close(&ag.matmul(&wg)?, &mm_ref(&a, &w)?, &what)?;
+                let wt = randn(&[b, n, k], dtype)?;
+                let wtg = wt.to_device(&dev)?;
+                assert_close(&ag.matmul(&wtg.transpose(1, 2)?)?, &mm_ref(&a, &wt.transpose(1, 2)?)?, &what)?;
+                let at = randn(&[b, k, m], dtype)?;
+                let atg = at.to_device(&dev)?;
+                assert_close(&atg.transpose(1, 2)?.matmul(&wg)?, &mm_ref(&at.transpose(1, 2)?, &w)?, &what)?;
+            }
+            let x = randn(&[4, 6, 5], dtype)?;
+            let lin = randn(&[9, 5], dtype)?;
+            assert_close(
+                &x.to_device(&dev)?.broadcast_matmul(&lin.to_device(&dev)?.t()?)?,
+                &bmm_ref(&x, &lin.t()?)?,
+                "hip gemm linear broadcast",
+            )?;
+        }
+        // Quantized matmul with more rows than the matrix-vector kernel handles (dequantize + GEMM).
+        let w = randn(&[40, 256], DType::F32)?;
+        let q = QTensor::quantize_onto(&w, GgmlDType::Q8_0, &dev)?;
+        let qmm = QMatMul::from_qtensor(q)?;
+        let x = randn(&[3, 12, 256], DType::F32)?;
+        let deq = QTensor::quantize(&w, GgmlDType::Q8_0)?.dequantize(&Device::Cpu)?;
+        let want = x.broadcast_matmul(&deq.t()?)?;
+        let got = qmm.forward(&x.to_device(&dev)?)?;
+        let (got, want) = (got.to_device(&Device::Cpu)?.flatten_all()?, want.flatten_all()?);
+        let diff = (got - want)?.abs()?.max(0)?.to_scalar::<f32>()?;
+        assert!(diff < 1e-2, "hip gemm quantized matmul diff {diff}");
+        Ok(())
+    })
+}
+
+#[test]
+fn gemm_backends_agree() -> Result<()> {
+    use candle_core::rocm::GemmBackend;
+    let dev = rocm();
+    for dtype in [DType::F32, DType::F16] {
+        let a = randn(&[2, 33, 47], dtype)?.to_device(&dev)?;
+        let b = randn(&[2, 47, 21], dtype)?.to_device(&dev)?;
+        let r1 = with_gemm_backend(&dev, GemmBackend::RocBlas, || a.matmul(&b))?;
+        let r2 = with_gemm_backend(&dev, GemmBackend::Hip, || a.matmul(&b))?;
+        assert_close(&r1, &r2, "rocblas vs hip gemm")?;
+    }
+    Ok(())
+}
+
+#[test]
+fn runtime_info_reports_target() -> Result<()> {
+    let dev = rocm();
+    let r = dev.as_rocm_device()?;
+    let info = r.runtime_info();
+    println!("{info}");
+    let arch = info.arch.clone().expect("gcnArchName");
+    assert!(arch.starts_with("gfx"), "{arch}");
+    assert_eq!(r.arch().map(|a| a.name.clone()), Some(arch.clone()));
+    assert_eq!(candle_core::rocm::device_arch(0)?, arch);
+    assert_eq!(info.kernels_match, Some(true), "kernels built for [{}]", info.compiled_archs);
+    let v = info.hip_version.expect("hip version");
+    assert!(v.major >= 6, "{v}");
+    assert_eq!(info.runtime_track, Some(v.track()));
+    assert!(matches!(info.build_track, "legacy" | "core"));
+    assert!(format!("{info}").contains(&arch));
+    Ok(())
+}

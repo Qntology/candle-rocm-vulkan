@@ -5,7 +5,7 @@
 
 use crate::error::{check_hip, Result};
 use crate::memory::DeviceBuffer;
-use crate::module::{compile_kernel, HipModule};
+use crate::module::{compile_kernel, default_arch, HipModule};
 use hip_sys::hip_runtime;
 use std::path::{Path, PathBuf};
 
@@ -17,12 +17,25 @@ pub struct HipRng {
 
 impl HipRng {
     /// Create RNG with a seed. `kernel_dir` is the path to the kernels/ directory.
+    ///
+    /// `rng.hip` is compiled with hipcc for [`default_arch`] (`HIP_ARCH` or the current GPU) and
+    /// cached per target as `rng-<arch>.hsaco`, rebuilt when `rng.hip` is newer.
     pub fn new(seed: u64, kernel_dir: &Path) -> Result<Self> {
         let src = kernel_dir.join("rng.hip");
-        let hsaco = kernel_dir.join("rng.hsaco");
-        let arch = std::env::var("HIP_ARCH").unwrap_or_else(|_| "gfx1010".to_string());
+        let arch = default_arch();
+        let tag: String = arch
+            .chars()
+            .map(|c| if c.is_ascii_alphanumeric() || c == '-' { c } else { '_' })
+            .collect();
+        let hsaco = kernel_dir.join(format!("rng-{tag}.hsaco"));
 
-        if !hsaco.exists() {
+        let modified = |p: &Path| std::fs::metadata(p).and_then(|m| m.modified()).ok();
+        let stale = match (modified(&hsaco), modified(&src)) {
+            (Some(out), Some(src)) => out < src,
+            (None, _) => true,
+            (Some(_), None) => false,
+        };
+        if stale {
             compile_kernel(&src, &hsaco, &arch)?;
         }
 

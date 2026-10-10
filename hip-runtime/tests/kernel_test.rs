@@ -9,7 +9,7 @@ fn kernel_dir() -> std::path::PathBuf {
 }
 
 fn arch() -> String {
-    std::env::var("HIP_ARCH").unwrap_or_else(|_| "gfx1010".to_string())
+    hip_runtime::module::default_arch()
 }
 
 fn compile_and_load(name: &str) -> HipModule {

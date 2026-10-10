@@ -14,7 +14,16 @@ pub type hipMemPool_t = *mut c_void;
 pub const HIP_SUCCESS: hipError_t = 0;
 pub const HIP_MEMPOOL_ATTR_RELEASE_THRESHOLD: c_int = 0x4;
 pub const HIP_ERROR_OUT_OF_MEMORY: hipError_t = 2;
+pub const HIP_ERROR_INVALID_DEVICE_FUNCTION: hipError_t = 98;
 pub const HIP_ERROR_NO_DEVICE: hipError_t = 100;
+pub const HIP_ERROR_INVALID_IMAGE: hipError_t = 200;
+pub const HIP_ERROR_NO_BINARY_FOR_GPU: hipError_t = 209;
+pub const HIP_ERROR_SHARED_OBJECT_INIT_FAILED: hipError_t = 303;
+pub const HIP_ERROR_NOT_FOUND: hipError_t = 500;
+
+/// `hipDeviceAttribute_t` values used by this crate (same in the ROCm 7.2 and 10.1 headers).
+pub const hipDeviceAttributeMultiprocessorCount: c_int = 63;
+pub const hipDeviceAttributeWarpSize: c_int = 87;
 
 #[repr(C)]
 #[derive(Debug, Copy, Clone)]
@@ -27,7 +36,8 @@ pub enum hipMemcpyKind {
 }
 
 /// Legacy (pre ROCm 6.0) layout prefix of `hipDeviceProp_t`, kept for the tests of this crate.
-/// Prefer `hipDeviceGetName`, `hipDeviceTotalMem` and `hipMemGetInfo` which have a stable ABI.
+/// Prefer `hipDeviceGetName`, `hipDeviceTotalMem`, `hipMemGetInfo`, `hipDeviceGetAttribute`, or
+/// [`hipGetDevicePropertiesR0600`] with [`hipDevicePropR0600Storage`], which have a stable ABI.
 #[repr(C)]
 #[derive(Debug)]
 pub struct hipDeviceProp_t {
@@ -45,6 +55,34 @@ pub struct hipDeviceProp_t {
     pub _padding: [u8; 4096],
 }
 
+/// Size of `hipDeviceProp_tR0600`, the `hipDeviceProp_t` of HIP 6.0 and later. The layout is frozen
+/// by the `R0600` symbol version; it is identical in the ROCm 7.2 and ROCm 10.1 (HIP 7.16) headers,
+/// for Linux and Windows (MSVC) targets.
+pub const HIP_DEVICE_PROP_R0600_SIZE: usize = 1472;
+/// Offset of `char gcnArchName[256]` (e.g. `gfx1100` or `gfx90a:sramecc+:xnack-`).
+pub const HIP_DEVICE_PROP_R0600_GCN_ARCH_NAME_OFFSET: usize = 1160;
+pub const HIP_DEVICE_PROP_R0600_GCN_ARCH_NAME_LEN: usize = 256;
+
+/// Over-allocated, 8-byte aligned storage for a `hipDeviceProp_tR0600` (fields are read by offset).
+#[repr(C, align(8))]
+pub struct hipDevicePropR0600Storage {
+    pub bytes: [u8; 4096],
+}
+
+impl hipDevicePropR0600Storage {
+    pub fn zeroed() -> Self {
+        Self { bytes: [0; 4096] }
+    }
+
+    /// `gcnArchName` as written by the runtime (up to the first NUL).
+    pub fn gcn_arch_name(&self) -> &[u8] {
+        let start = HIP_DEVICE_PROP_R0600_GCN_ARCH_NAME_OFFSET;
+        let raw = &self.bytes[start..start + HIP_DEVICE_PROP_R0600_GCN_ARCH_NAME_LEN];
+        let end = raw.iter().position(|&b| b == 0).unwrap_or(raw.len());
+        &raw[..end]
+    }
+}
+
 extern "C" {
     pub fn hipGetDeviceCount(count: *mut c_int) -> hipError_t;
     pub fn hipSetDevice(device_id: c_int) -> hipError_t;
@@ -53,6 +91,11 @@ extern "C" {
     pub fn hipDeviceGetName(name: *mut c_char, len: c_int, device: hipDevice_t) -> hipError_t;
     pub fn hipDeviceTotalMem(bytes: *mut usize, device: hipDevice_t) -> hipError_t;
     pub fn hipGetDeviceProperties(prop: *mut hipDeviceProp_t, device_id: c_int) -> hipError_t;
+    pub fn hipGetDevicePropertiesR0600(
+        prop: *mut hipDevicePropR0600Storage,
+        device_id: c_int,
+    ) -> hipError_t;
+    pub fn hipDeviceGetAttribute(value: *mut c_int, attr: c_int, device_id: c_int) -> hipError_t;
     pub fn hipMemGetInfo(free: *mut usize, total: *mut usize) -> hipError_t;
     pub fn hipRuntimeGetVersion(version: *mut c_int) -> hipError_t;
     pub fn hipDriverGetVersion(version: *mut c_int) -> hipError_t;

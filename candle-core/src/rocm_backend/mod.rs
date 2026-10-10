@@ -7,7 +7,8 @@ pub mod kernels;
 mod storage;
 pub mod utils;
 
-pub use device::RocmDevice;
+pub(crate) use device::{GemmCall, GemmOutcome};
+pub use device::{GemmBackend, RocmDevice, RocmRuntimeInfo};
 pub use hip_runtime;
 pub use hip_sys;
 pub use storage::{RocmStorage, RopeKind};
@@ -73,4 +74,21 @@ pub fn mem_info(ordinal: usize) -> crate::Result<(usize, usize)> {
 pub fn device_name(ordinal: usize) -> crate::Result<String> {
     let dev = hip_runtime::device::HipDevice::new(ordinal).w()?;
     dev.name().w()
+}
+
+/// GPU target (e.g. `gfx1100`) of the device `ordinal`, without creating a candle device.
+pub fn device_arch(ordinal: usize) -> crate::Result<String> {
+    let dev = hip_runtime::device::HipDevice::new(ordinal).w()?;
+    Ok(dev.arch().w()?.name)
+}
+
+/// Version of the loaded HIP runtime (`7.2.x` for ROCm 7.2, `7.16.0` for ROCm 10.1).
+pub fn hip_version() -> crate::Result<hip_runtime::track::HipVersion> {
+    hip_runtime::device::runtime_hip_version().w()
+}
+
+/// HIP runtime, GPU target, kernel targets and GEMM implementation of the device `ordinal`.
+pub fn runtime_info(ordinal: usize) -> crate::Result<RocmRuntimeInfo> {
+    use crate::backend::BackendDevice;
+    Ok(RocmDevice::new(ordinal)?.runtime_info())
 }

@@ -99,6 +99,23 @@ impl Drop for HipModule {
     }
 }
 
+/// GPU target(s) for kernels compiled at run time: `HIP_ARCH`, else the target of the current
+/// device (e.g. `gfx1032`), else `gfx1010` (the historical default).
+pub fn default_arch() -> String {
+    if let Ok(a) = std::env::var("HIP_ARCH") {
+        if !a.trim().is_empty() {
+            return a.trim().to_string();
+        }
+    }
+    let mut dev: i32 = 0;
+    if unsafe { hip_runtime::hipGetDevice(&mut dev) } == hip_runtime::HIP_SUCCESS {
+        if let Ok(arch) = crate::device::HipDevice::new(dev.max(0) as usize).and_then(|d| d.arch()) {
+            return arch.name;
+        }
+    }
+    "gfx1010".to_string()
+}
+
 /// Compile a .hip source file to a code object using hipcc.
 pub fn compile_kernel(src: &Path, out: &Path, arch: &str) -> Result<()> {
     let hipcc = crate::toolchain::hipcc_path().ok_or_else(|| HipError::KernelCompileFailed {
