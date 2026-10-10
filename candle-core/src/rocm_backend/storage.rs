@@ -2,6 +2,7 @@ use super::kernels::Module;
 use super::utils::{
     cast_suffix, dtype_suffix, elem_bytes, grid_1d, index_suffix, is_float, size_suffix, LaunchArgs, StridedInfo,
 };
+use super::{GemmCall, GemmOutcome};
 use super::{RocmDevice, RocmError, WrapErr};
 use crate::backend::BackendStorage;
 use crate::op::{BinaryOpT, CmpOp, ReduceOp, UnaryOpT};
@@ -1198,77 +1199,41 @@ impl BackendStorage for RocmStorage {
         let bp = self.ptr_at(lhs_l.start_offset()) as *const c_void;
         let c = out.as_void_ptr();
         let stride_c = (m * n) as i64;
-        let status = self.device.with_blas(|blas| {
-            Ok(unsafe {
-                match ty {
-                    GemmType::F32 => blas.sgemm_strided_batched_raw(
-                        cfg.transa,
-                        cfg.transb,
-                        n,
-                        m,
-                        k,
-                        1.0,
-                        a,
-                        cfg.lda,
-                        cfg.stride_a,
-                        bp,
-                        cfg.ldb,
-                        cfg.stride_b,
-                        0.0,
-                        c,
-                        n,
-                        stride_c,
-                        b,
-                    ),
-                    GemmType::F64 => blas.dgemm_strided_batched_raw(
-                        cfg.transa,
-                        cfg.transb,
-                        n,
-                        m,
-                        k,
-                        1.0,
-                        a,
-                        cfg.lda,
-                        cfg.stride_a,
-                        bp,
-                        cfg.ldb,
-                        cfg.stride_b,
-                        0.0,
-                        c,
-                        n,
-                        stride_c,
-                        b,
-                    ),
-                    GemmType::F16 | GemmType::BF16 => blas.gemm_strided_batched_ex_raw(
-                        ty,
-                        cfg.transa,
-                        cfg.transb,
-                        n,
-                        m,
-                        k,
-                        a,
-                        cfg.lda,
-                        cfg.stride_a,
-                        bp,
-                        cfg.ldb,
-                        cfg.stride_b,
-                        c,
-                        n,
-                        stride_c,
-                        b,
-                    ),
-                }
-            })
+        // Row-major C = lhs * rhs is computed as the column-major C^T = rhs^T * lhs^T.
+        let status = self.device.gemm(&GemmCall {
+            ty,
+            transa: cfg.transa,
+            transb: cfg.transb,
+            m: n,
+            n: m,
+            k,
+            a,
+            lda: cfg.lda,
+            stride_a: cfg.stride_a,
+            b: bp,
+            ldb: cfg.ldb,
+            stride_b: cfg.stride_b,
+            c,
+            ldc: n,
+            stride_c,
+            batch: b,
+            batched: true,
         })?;
         match status {
-            Ok(()) => {}
-            Err(hip_runtime::error::HipError::RocblasError { code: 2 | 14 | 15 })
+            GemmOutcome::Done => {}
+            GemmOutcome::Rocblas(hip_runtime::error::HipError::RocblasError { code: 2 | 14 | 15 })
                 if matches!(ty, GemmType::F16 | GemmType::BF16) =>
             {
                 drop(out);
                 return self.half_matmul_via_f32(rhs, (b, m, n, k), lhs_l, rhs_l);
             }
-            Err(e) => return Err::<Self, _>(e).w(),
+            GemmOutcome::Rocblas(e) => return Err::<Self, _>(e).w(),
+            GemmOutcome::NoKernel(_) => {
+                // No GEMM kernel for this GPU (and no rocBLAS kernels either): run on the CPU,
+                // like the other ops whose kernels cannot be loaded.
+                drop(out);
+                return self.fallback2_wide(lhs_l, rhs, rhs_l, |a, la, c, lc| a.matmul(c, (b, m, n, k), la, lc));
+            }
         }
         Ok(Self::new(out, self.dtype, self.device.clone()))
     }

@@ -6,6 +6,8 @@ description = "Raw FFI bindings to AMD HIP runtime, rocBLAS, and hipRAND"
 license = "Apache-2.0"
 repository = "https://github.com/Qntology/candle-rocm-vulkan"
 build = "build.rs"
+# Exposes the selected ROCm installation to dependents as DEP_AMDHIP64_* (see build.rs).
+links = "amdhip64"
 
 [features]
 default = []

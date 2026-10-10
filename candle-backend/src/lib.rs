@@ -39,3 +39,19 @@ pub fn mem_info(ordinal: usize) -> Result<(usize, usize)> {
 pub fn is_available() -> bool {
     candle_core::rocm::device_count() > 0
 }
+
+/// GPU target of the device, e.g. `gfx1100`.
+pub fn device_arch(ordinal: usize) -> Result<String> {
+    candle_core::rocm::device_arch(ordinal)
+}
+
+/// Version of the loaded HIP runtime: `7.2.x` with ROCm 7.2, `7.16.0` with ROCm 10.1.
+pub fn hip_version() -> Result<candle_core::rocm::hip_runtime::track::HipVersion> {
+    candle_core::rocm::hip_version()
+}
+
+/// HIP runtime and track, GPU target, kernel targets and GEMM implementation of a device.
+/// `Display` prints a one-line summary.
+pub fn runtime_info(ordinal: usize) -> Result<candle_core::rocm::RocmRuntimeInfo> {
+    candle_core::rocm::runtime_info(ordinal)
+}

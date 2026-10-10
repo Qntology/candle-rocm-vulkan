@@ -339,3 +339,96 @@ impl Drop for RocBlas {
         }
     }
 }
+
+/// Path of the rocBLAS library loaded in this process.
+#[cfg(windows)]
+pub fn loaded_rocblas_path() -> Option<std::path::PathBuf> {
+    use std::os::windows::ffi::{OsStrExt, OsStringExt};
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn GetModuleHandleW(name: *const u16) -> *mut c_void;
+        fn GetModuleFileNameW(module: *mut c_void, filename: *mut u16, size: u32) -> u32;
+    }
+    for name in ["rocblas.dll", "librocblas.dll"] {
+        let wide: Vec<u16> = std::ffi::OsStr::new(name).encode_wide().chain(Some(0)).collect();
+        let module = unsafe { GetModuleHandleW(wide.as_ptr()) };
+        if module.is_null() {
+            continue;
+        }
+        let mut buf = vec![0u16; 32768];
+        let n = unsafe { GetModuleFileNameW(module, buf.as_mut_ptr(), buf.len() as u32) } as usize;
+        if n > 0 && n < buf.len() {
+            return Some(std::path::PathBuf::from(std::ffi::OsString::from_wide(&buf[..n])));
+        }
+    }
+    None
+}
+
+/// Path of the rocBLAS library loaded in this process.
+#[cfg(target_os = "linux")]
+pub fn loaded_rocblas_path() -> Option<std::path::PathBuf> {
+    let maps = std::fs::read_to_string("/proc/self/maps").ok()?;
+    maps.lines()
+        .filter_map(|line| line.split_whitespace().nth(5))
+        .find(|p| {
+            std::path::Path::new(p)
+                .file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| n.starts_with("librocblas.so"))
+        })
+        .map(std::path::PathBuf::from)
+}
+
+/// Path of the rocBLAS library loaded in this process.
+#[cfg(not(any(windows, target_os = "linux")))]
+pub fn loaded_rocblas_path() -> Option<std::path::PathBuf> {
+    None
+}
+
+/// Directory where rocBLAS looks for its Tensile kernel database, following the lookup of
+/// rocBLAS' `tensile_host.cpp`: `ROCBLAS_TENSILE_LIBPATH`, then paths relative to the library.
+pub fn tensile_library_dir() -> Option<std::path::PathBuf> {
+    if let Some(p) = std::env::var_os("ROCBLAS_TENSILE_LIBPATH") {
+        if !p.is_empty() {
+            return Some(std::path::PathBuf::from(p));
+        }
+    }
+    let lib = loaded_rocblas_path()?;
+    let base = lib.parent()?.to_path_buf();
+    for rel in ["../../Tensile/library", "library", "../rocblas/library", "../Tensile/library"] {
+        let p = base.join(rel);
+        if p.is_dir() {
+            return Some(p);
+        }
+    }
+    Some(base.join("rocblas").join("library"))
+}
+
+/// Whether the rocBLAS kernel database has the GEMM kernels of `arch` (processor name, e.g.
+/// `gfx1100`). rocBLAS aborts the whole process on its first GEMM when they are missing, which is
+/// the case for GPUs that the installed ROCm release does not support.
+///
+/// Returns `None` when this cannot be determined (rocBLAS not found in this process).
+pub fn has_kernels_for(arch: &str) -> Option<bool> {
+    let arch = arch.split(':').next().unwrap_or(arch);
+    let dir = tensile_library_dir()?;
+    let dirs = [
+        dir.join(format!("{arch}-xnack-")),
+        dir.join(format!("{arch}-xnack+")),
+        dir.join(arch),
+        dir.clone(),
+    ];
+    let files = [
+        format!("TensileLibrary_lazy_{arch}.dat"),
+        format!("TensileLibrary_{arch}.dat"),
+        "TensileLibrary.dat".to_string(),
+        format!("TensileLibrary_lazy_{arch}.yaml"),
+        format!("TensileLibrary_{arch}.yaml"),
+        "TensileLibrary.yaml".to_string(),
+    ];
+    let found = dirs
+        .iter()
+        .filter(|d| d.is_dir())
+        .any(|d| files.iter().any(|f| d.join(f).is_file()));
+    Some(found)
+}

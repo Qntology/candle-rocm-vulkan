@@ -5,6 +5,7 @@ pub mod memory;
 pub mod module;
 pub mod rng;
 pub mod toolchain;
+pub mod track;
 
 pub fn configure_runtime_env() {
     static ONCE: std::sync::Once = std::sync::Once::new();

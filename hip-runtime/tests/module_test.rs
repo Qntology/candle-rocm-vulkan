@@ -11,7 +11,7 @@ fn test_compile_and_load_kernel() {
     let src = kernel_dir.join("test_add.hip");
     let out = kernel_dir.join("test_add.hsaco");
 
-    let arch = std::env::var("HIP_ARCH").unwrap_or_else(|_| "gfx1010".to_string());
+    let arch = hip_runtime::module::default_arch();
 
     // Write a trivial kernel if it doesn't exist
     if !src.exists() {
@@ -38,7 +38,7 @@ fn test_launch_add_scalar() {
     let kernel_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../kernels");
     let src = kernel_dir.join("test_add.hip");
     let out = kernel_dir.join("test_add.hsaco");
-    let arch = std::env::var("HIP_ARCH").unwrap_or_else(|_| "gfx1010".to_string());
+    let arch = hip_runtime::module::default_arch();
 
     if !src.exists() {
         std::fs::write(&src, r#"

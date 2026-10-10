@@ -45,17 +45,46 @@ let c = a.matmul(&b)?;
 
 ### Requirements
 
-- An AMD GPU supported by ROCm or the HIP SDK, such as RDNA2 `gfx1030`, RDNA3 `gfx1100`-`gfx1102`, or CDNA.
-- On Linux, ROCm 6.x or 7.x (`/opt/rocm`). On Windows, the AMD HIP SDK (`HIP_PATH`).
+- An AMD GPU supported by ROCm or the HIP SDK, such as RDNA2 `gfx1030`, RDNA3 `gfx1100`-`gfx1103`, RDNA3.5
+  `gfx1150`-`gfx1153`, RDNA4 `gfx1200`/`gfx1201`, or CDNA.
+- A ROCm installation from either release stream ("track", see below):
+  - `legacy`: ROCm 6.x - 7.2 on Linux (`/opt/rocm`), the AMD HIP SDK 6.x / 7.x on Windows (`HIP_PATH`).
+  - `core`: the ROCm Core SDK 7.14 / 10.x built by TheRock (ROCm 10.1 ships HIP 7.16): native packages
+    (`/opt/rocm/core-10.x`), tarballs, or the `rocm-sdk` Python wheels. On Windows it is currently distributed as
+    tarballs and wheels: extract the tarball to `C:\Program Files\AMD\ROCm\10.1` (or anywhere and set
+    `ROCM_PATH`).
 - `hipcc` (or the SDK `clang++`) to compile the kernels at build time, plus `amdhip64` and `rocblas` to link.
 - At run time, `rocblas` and its `rocblas/library` Tensile files must be next to the executable or on `PATH`.
+
+### Two ROCm tracks
+
+Both tracks ship HIP 7.x with the same `amdhip64_7` / `rocblas` ABI, so the FFI and the backend are shared and
+one source tree builds against either. What differs is handled per track:
+
+| | `legacy` (ROCm / HIP SDK 6.x - 7.2) | `core` (ROCm Core SDK 10.x) |
+| --- | --- | --- |
+| install layout | `bin/clang++`, `llvm/bin` | `lib/llvm/bin`, `core-10.x` folders, `rocm-sdk path --root` |
+| compiler | classic offload driver | LLVM 24, new offload driver by default (output still a HIP fat binary, checked at build time) |
+| default targets (no GPU detected) | `gfx1030,gfx1100,gfx1101,gfx1102` | every Radeon / Ryzen target of ROCm 10.1 |
+| GPUs | everything the installed release supports | `gfx908`, `gfx90a`, `gfx942`, `gfx950`, `gfx1030`, `gfx110[0-3]`, `gfx115[0-3]`, `gfx120[01]` |
+
+`hip-sys` picks the installation once and `candle-core` compiles its kernels with the same one: `ROCM_PATH` /
+`HIP_PATH` win, otherwise `CANDLE_ROCM_TRACK=auto` (default) takes the newest `core` installation when every
+detected GPU is supported by it and the newest `legacy` one otherwise; `CANDLE_ROCM_TRACK=legacy|core` forces a
+track.
+
+At run time the device reads its `gfx` target. When the rocBLAS of the loaded ROCm has no kernels for it (rocBLAS
+would abort the process on the first GEMM), matmuls switch to the HIP GEMM kernel of `kernels/gemm.hip`; so do
+F32/F64 GEMMs for which rocBLAS returns `not implemented` / `arch mismatch`. A GPU that the embedded kernels were
+not compiled for is reported with the `HIP_ARCH` to rebuild with.
 
 ### Build configuration
 
 | variable | meaning |
 | --- | --- |
 | `ROCM_PATH` / `HIP_PATH` | ROCm or HIP SDK root (auto-detected otherwise) |
-| `HIP_ARCH` or `CANDLE_ROCM_ARCHS` | GPU targets, e.g. `gfx1100` or `gfx1030,gfx1100`. Auto-detected with `amdgpu-arch`/`hipInfo`; defaults to `gfx1030,gfx1100,gfx1101,gfx1102` |
+| `CANDLE_ROCM_TRACK` | `auto` (default), `legacy` or `core`: which installation to use when `ROCM_PATH` is not set |
+| `HIP_ARCH` or `CANDLE_ROCM_ARCHS` | GPU targets, e.g. `gfx1100` or `gfx1030,gfx1100`, or `all` (every ROCm 10.1 target, for redistributable builds). Auto-detected with `amdgpu-arch`/`hipInfo`; the defaults depend on the track (see above). Targets of the built-in lists that the compiler does not know are skipped |
 | `HIPCC` | explicit compiler path |
 | `CANDLE_ROCM_HIPCC_FLAGS` | extra compiler flags |
 | `CANDLE_ROCM_LIB_DIR` | extra library search path for `amdhip64` / `rocblas` |
@@ -69,6 +98,7 @@ let c = a.matmul(&b)?;
 | `CANDLE_ROCM_POOL_RELEASE_ZERO` | `1` | set the pool release threshold to 0 so freed memory goes back to the driver at sync points |
 | `CANDLE_ROCM_TRIM_ON_SYNC` | `1` | trim the memory pool on `Device::synchronize` |
 | `CANDLE_ROCM_RESOURCE_CACHE_MB` | `0` | value for the HIP runtime's `GPU_RESOURCE_CACHE_SIZE`, unless that variable is already set. The runtime default caches freed buffers as dedicated VRAM |
+| `CANDLE_ROCM_GEMM` | `auto` | `rocblas`, `hip` (the tiled HIP kernel), or `auto`: rocBLAS unless it has no kernels for this GPU |
 
 ### Device utilities
 
@@ -76,17 +106,22 @@ let c = a.matmul(&b)?;
 candle_core::rocm::device_count()        // number of GPUs (0 when no driver)
 candle_core::rocm::device_name(0)?       // e.g. "AMD Radeon RX 7900 XTX"
 candle_core::rocm::mem_info(0)?          // (free, total) VRAM in bytes
+candle_core::rocm::device_arch(0)?       // e.g. "gfx1100"
+candle_core::rocm::hip_version()?        // e.g. 7.2.x (ROCm 7.2) or 7.16.0 (ROCm 10.1)
+candle_core::rocm::runtime_info(0)?      // HIP version and track, GPU target, kernel targets, GEMM backend
 let r = dev.as_rocm_device()?;
 r.trim_memory_pool()?;                   // return the allocator pool to the driver
 r.release_cached_resources()?;           // sync, trim, recreate the rocBLAS handle (its workspace)
-candle_rocm::is_available() / device_count() / mem_info(0) / total_vram(0)
+r.gemm_backend() / r.set_gemm_backend(candle_core::rocm::GemmBackend::Hip)
+candle_rocm::is_available() / device_count() / mem_info(0) / total_vram(0) / device_arch(0) / runtime_info(0)
 ```
 
 ### What runs on the GPU
 
 - Unary, binary, comparison, affine, powf, elu, where, and casts, for all dtypes including `F8E4M3`.
 - Reductions (sum, min, max, argmin, argmax), copies, cat, index_select, gather, scatter, and index_add.
-- Matmul through rocBLAS: f32, f64, and f16/bf16 with f32 accumulation.
+- Matmul through rocBLAS, or the HIP GEMM kernel when rocBLAS cannot run on the GPU: f32, f64, and f16/bf16 with
+  f32 accumulation.
 - Quantized GGUF tensors (Q4_0 to Q8K): dequantize, matmul (`QMatMul`), and embedding.
 - In candle-nn: `softmax_last_dim`, `rms_norm`, `layer_norm`, `sigmoid`, `rope`, `rope_i`, and `rope_thd`.
 

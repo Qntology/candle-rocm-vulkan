@@ -3,8 +3,9 @@ use super::{GgmlDType, QStorage};
 use crate::backend::BackendStorage;
 use crate::rocm_backend::kernels::Module;
 use crate::rocm_backend::utils::LaunchArgs;
-use crate::rocm_backend::{RocmDevice, RocmStorage, WrapErr};
+use crate::rocm_backend::{GemmCall, GemmOutcome, RocmDevice, RocmStorage, WrapErr};
 use crate::{CpuStorage, DType, Layout, Result, Shape};
+use hip_runtime::blas::GemmType;
 use hip_runtime::memory::DeviceBuffer;
 use std::ffi::c_void;
 
@@ -234,26 +235,30 @@ impl QRocmStorage {
                     let src = unsafe { self.data.as_ptr().add(n0 * row_bytes) };
                     self.dequantize_ptr(src, tile.as_mut_ptr(), tn * k, false)?;
                     let c = unsafe { out.as_mut_ptr().add(n0 * 4) } as *mut c_void;
-                    self.device.with_blas(|blas| {
-                        unsafe {
-                            blas.sgemm_raw(
-                                true,
-                                false,
-                                tn,
-                                rows,
-                                k,
-                                1.0,
-                                tile.as_void_ptr(),
-                                k,
-                                x_ptr as *const c_void,
-                                k,
-                                0.0,
-                                c,
-                                n,
-                            )
-                        }
-                        .w()
-                    })?;
+                    let call = GemmCall {
+                        ty: GemmType::F32,
+                        transa: true,
+                        transb: false,
+                        m: tn,
+                        n: rows,
+                        k,
+                        a: tile.as_void_ptr(),
+                        lda: k,
+                        stride_a: 0,
+                        b: x_ptr as *const c_void,
+                        ldb: k,
+                        stride_b: 0,
+                        c,
+                        ldc: n,
+                        stride_c: 0,
+                        batch: 1,
+                        batched: false,
+                    };
+                    match self.device.gemm(&call)? {
+                        GemmOutcome::Done => {}
+                        GemmOutcome::Rocblas(e) => return Err(e).w(),
+                        GemmOutcome::NoKernel(msg) => crate::bail!("rocm quantized matmul: {msg}"),
+                    }
                     n0 += tn;
                 }
             }
