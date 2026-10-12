@@ -951,14 +951,15 @@ impl TurboKvCache {
     pub fn attention(&self, q: &Tensor, cfg: &FlashAttnConfig) -> Result<Tensor> {
         if let Some((kq, vq)) = &self.quant {
             let fused = cfg.fused.unwrap_or(self.fused);
-            if fused
-                && !q.device().is_cpu()
-                && accel::config().turbo_quant_kernels_allowed(q.device())
-            {
-                match self.fused_attention(q, cfg, kq, vq) {
-                    Ok(Some(o)) => return Ok(o),
-                    Ok(None) => {}
-                    Err(e) => warn_cpu_fallback("attention", &e),
+            if fused {
+                if let (Some(kd), Some(vd)) =
+                    (self.k.all_data().as_ref(), self.v.all_data().as_ref())
+                {
+                    match fused_attention_rows(q, kd, vd, self.seq_len(), kq, vq, cfg) {
+                        Ok(Some(o)) => return Ok(o),
+                        Ok(None) => {}
+                        Err(e) => warn_cpu_fallback("attention", &e),
+                    }
                 }
             }
         }
@@ -967,85 +968,176 @@ impl TurboKvCache {
         };
         flash_attn_bhsd(q, &k.to_dtype(q.dtype())?, &v.to_dtype(q.dtype())?, cfg)
     }
+}
 
-    fn fused_attention(
-        &self,
-        q: &Tensor,
-        cfg: &FlashAttnConfig,
-        kq: &TurboQuantizer,
-        vq: &TurboQuantizer,
-    ) -> Result<Option<Tensor>> {
-        let (Some(kd), Some(vd)) = (self.k.all_data().as_ref(), self.v.all_data().as_ref()) else {
-            return Ok(None);
-        };
-        let (b, hq, lq, d) = q.dims4()?;
-        let (bk, hkv, cap, kw) = kd.dims4()?;
-        let vw = vd.dim(3)?;
-        if bk != b || d != self.dim || hkv == 0 || hq % hkv != 0 || d > att::FA_MAX_HEAD_DIM {
-            return Ok(None);
-        }
-        let lk = self.seq_len();
-        // rotated queries, plus S·q for prod keys
-        let qr = kq.rotate(q)?;
-        let qx = match &kq.qjl {
-            Some((_, st)) => Tensor::cat(&[&qr, &qr.broadcast_matmul(st)?], 3)?,
-            None => qr,
-        }
-        .contiguous()?;
-        let w = qx.dim(3)?;
-        let conf = accel::config();
-        let cus = accel::profile(q.device()).compute_units;
-        let (wl, wr) = (
-            cfg.window_size_left
-                .map(|v| v.min(i32::MAX as usize) as i32)
-                .unwrap_or(-1),
-            cfg.window_size_right
-                .map(|v| v.min(i32::MAX as usize) as i32)
-                .unwrap_or(-1),
-        );
-        let alibi = match &cfg.alibi_slopes {
-            Some(t) => Some(
-                t.to_device(q.device())?
-                    .to_dtype(DType::F32)?
-                    .contiguous()?,
-            ),
-            None => None,
-        };
-        let alibi_bstride = match &alibi {
-            Some(t) => att::alibi_batch_stride(t.shape(), b, hq)?,
-            None => 0,
-        };
-        let args = TqAttnArgs {
-            b,
-            lq,
-            lk,
-            hq,
-            hkv,
-            d,
-            q_strides: [hq * lq * w, lq * w, w],
-            q_offset: 0,
-            k_strides: [hkv * cap * kw, cap * kw, kw],
-            k_offset: 0,
-            v_strides: [hkv * cap * vw, cap * vw, vw],
-            v_offset: 0,
-            k: TqSide::new(kq.format(), d)?,
-            v: TqSide::new(vq.format(), d)?,
-            scale: cfg.softmax_scale,
-            softcap: cfg.softcap.unwrap_or(0.0),
-            window_left: wl,
-            window_right: wr,
-            splits: att::split_count_for(
-                b * hq * lq,
-                lk,
-                cfg.split_kv.unwrap_or(conf.flash_attn.split_kv),
-                cus,
-            ),
-            alibi_bstride,
-        };
-        let tab = Tensor::cat(&[&kq.tab, &vq.tab], 0)?;
-        let o = qx.apply_op3_no_bwd(kd, vd, &TqAttn { args, tab, alibi })?;
-        Ok(Some(vq.unrotate(&o)?.to_dtype(q.dtype())?))
+/// Attention of `q: (batch, q_heads, seq_q, head_dim)` over keys and values that are already
+/// packed by `kq` / `vq`: `k_rows: (batch, kv_heads, seq, k_words)` and
+/// `v_rows: (batch, kv_heads, seq, v_words)` u32, of which the first `kv_len` rows of the third
+/// axis are attended (the rest is spare capacity). Masks, soft-capping and ALiBi come from `cfg`
+/// (bottom-right aligned: the queries are the last `seq_q` of the `kv_len` positions).
+///
+/// This is the attention of [`TurboKvCache`] for caches that live outside it, e.g. paged KV
+/// blocks that are offloaded to host memory and concatenated / uploaded per step: the rows stay
+/// compressed through the transfer and the fused kernel reads them directly. Without the fused
+/// kernel (CPU, kernels switched off, unsupported shape or failure) the rows are dequantized and
+/// [`crate::flash_attn::flash_attn_bhsd`] runs, so the result is the same up to rounding.
+/// The output is in `q`'s dtype and layout.
+pub fn attention_packed(
+    q: &Tensor,
+    k_rows: &Tensor,
+    v_rows: &Tensor,
+    kv_len: usize,
+    kq: &TurboQuantizer,
+    vq: &TurboQuantizer,
+    cfg: &FlashAttnConfig,
+) -> Result<Tensor> {
+    let (b, _, _, d) = q.dims4()?;
+    let (bk, hkv, cap, kw) = k_rows.dims4()?;
+    let (bv, hv, capv, vw) = v_rows.dims4()?;
+    if k_rows.dtype() != DType::U32 || v_rows.dtype() != DType::U32 {
+        bail!("turbo-quant attention: packed rows must be u32")
     }
+    // rows offloaded to host memory are uploaded compressed (a no-op when already on q's device)
+    let k_rows = &k_rows.to_device(q.device())?;
+    let v_rows = &v_rows.to_device(q.device())?;
+    if bk != b || bv != b || hv != hkv || capv < kv_len || cap < kv_len || kv_len == 0 {
+        bail!(
+            "turbo-quant attention: q {:?} / k {:?} / v {:?} / kv_len {kv_len} do not match",
+            q.dims(),
+            k_rows.dims(),
+            v_rows.dims()
+        )
+    }
+    if kw != kq.row_words() || vw != vq.row_words() || d != kq.dim() || d != vq.dim() {
+        bail!(
+            "turbo-quant attention: rows of {kw} / {vw} words and head dim {d} do not match the quantizers ({} / {} words, dim {})",
+            kq.row_words(),
+            vq.row_words(),
+            kq.dim()
+        )
+    }
+    if cfg
+        .fused
+        .unwrap_or(accel::config().turbo_quant.fused_attention)
+    {
+        // the kernel reads K and V with the same capacity (row stride of a head)
+        let (kd, vd) = if cap == capv {
+            (k_rows.contiguous()?, v_rows.contiguous()?)
+        } else {
+            (
+                k_rows.narrow(2, 0, kv_len)?.contiguous()?,
+                v_rows.narrow(2, 0, kv_len)?.contiguous()?,
+            )
+        };
+        match fused_attention_rows(q, &kd, &vd, kv_len, kq, vq, cfg) {
+            Ok(Some(o)) => return Ok(o),
+            Ok(None) => {}
+            Err(e) => warn_cpu_fallback("attention", &e),
+        }
+    }
+    let deq = |qz: &TurboQuantizer, rows: &Tensor| -> Result<Tensor> {
+        let w = rows.dim(3)?;
+        let flat = rows
+            .narrow(2, 0, kv_len)?
+            .contiguous()?
+            .reshape((b * hkv * kv_len, w))?;
+        qz.dequantize_rows(&flat)?
+            .reshape((b, hkv, kv_len, d))?
+            .to_dtype(q.dtype())
+    };
+    let k = deq(kq, k_rows)?;
+    let v = deq(vq, v_rows)?;
+    flash_attn_bhsd(q, &k, &v, cfg)
+}
+
+/// The fused kernel over `kd` / `vd` (`(b, hkv, capacity, words)`, contiguous, same capacity),
+/// `Ok(None)` when it does not apply (CPU, kernels off, shape out of range).
+fn fused_attention_rows(
+    q: &Tensor,
+    kd: &Tensor,
+    vd: &Tensor,
+    lk: usize,
+    kq: &TurboQuantizer,
+    vq: &TurboQuantizer,
+    cfg: &FlashAttnConfig,
+) -> Result<Option<Tensor>> {
+    if q.device().is_cpu() || !accel::config().turbo_quant_kernels_allowed(q.device()) {
+        return Ok(None);
+    }
+    let (b, hq, lq, d) = q.dims4()?;
+    let (bk, hkv, cap, kw) = kd.dims4()?;
+    let vw = vd.dim(3)?;
+    if bk != b
+        || d != kq.dim()
+        || hkv == 0
+        || hq % hkv != 0
+        || d > att::FA_MAX_HEAD_DIM
+        || vd.dim(2)? != cap
+        || lk > cap
+        || lk == 0
+    {
+        return Ok(None);
+    }
+    // rotated queries, plus S·q for prod keys
+    let qr = kq.rotate(q)?;
+    let qx = match &kq.qjl {
+        Some((_, st)) => Tensor::cat(&[&qr, &qr.broadcast_matmul(st)?], 3)?,
+        None => qr,
+    }
+    .contiguous()?;
+    let w = qx.dim(3)?;
+    let conf = accel::config();
+    let cus = accel::profile(q.device()).compute_units;
+    let (wl, wr) = (
+        cfg.window_size_left
+            .map(|v| v.min(i32::MAX as usize) as i32)
+            .unwrap_or(-1),
+        cfg.window_size_right
+            .map(|v| v.min(i32::MAX as usize) as i32)
+            .unwrap_or(-1),
+    );
+    let alibi = match &cfg.alibi_slopes {
+        Some(t) => Some(
+            t.to_device(q.device())?
+                .to_dtype(DType::F32)?
+                .contiguous()?,
+        ),
+        None => None,
+    };
+    let alibi_bstride = match &alibi {
+        Some(t) => att::alibi_batch_stride(t.shape(), b, hq)?,
+        None => 0,
+    };
+    let args = TqAttnArgs {
+        b,
+        lq,
+        lk,
+        hq,
+        hkv,
+        d,
+        q_strides: [hq * lq * w, lq * w, w],
+        q_offset: 0,
+        k_strides: [hkv * cap * kw, cap * kw, kw],
+        k_offset: 0,
+        v_strides: [hkv * cap * vw, cap * vw, vw],
+        v_offset: 0,
+        k: TqSide::new(kq.format(), d)?,
+        v: TqSide::new(vq.format(), d)?,
+        scale: cfg.softmax_scale,
+        softcap: cfg.softcap.unwrap_or(0.0),
+        window_left: wl,
+        window_right: wr,
+        splits: att::split_count_for(
+            b * hq * lq,
+            lk,
+            cfg.split_kv.unwrap_or(conf.flash_attn.split_kv),
+            cus,
+        ),
+        alibi_bstride,
+    };
+    let tab = Tensor::cat(&[&kq.tab, &vq.tab], 0)?;
+    let o = qx.apply_op3_no_bwd(kd, vd, &TqAttn { args, tab, alibi })?;
+    Ok(Some(vq.unrotate(&o)?.to_dtype(q.dtype())?))
 }
 
 #[cfg(test)]
@@ -1180,6 +1272,77 @@ mod tests {
         );
         // 4-bit rows: about 4.5 bits per value instead of 32
         assert!(cache.storage_bytes() < 2 * 32 * hkv * d * 4 / 6);
+    }
+
+    /// `attention_packed` over rows packed outside a cache (concatenated blocks, spare capacity)
+    /// computes the same attention as the cache holding the same rows.
+    #[test]
+    fn attention_packed_matches_cache() {
+        let (b, hq, hkv, d) = (1, 4, 2, 64);
+        for (kf, vf, rot) in [
+            (QuantFormat::Fp8, QuantFormat::Fp8, RotationKind::None),
+            (
+                QuantFormat::TurboMse { bits: 4 },
+                QuantFormat::TurboMse { bits: 4 },
+                RotationKind::Hadamard,
+            ),
+        ] {
+            let seed = 11;
+            let mut cache =
+                TurboKvCache::with_formats(kf, vf, d, rot, seed, 8, &Device::Cpu).unwrap();
+            let kq = TurboQuantizer::new(kf, d, rot, seed, &Device::Cpu).unwrap();
+            let vq = TurboQuantizer::new(vf, d, rot, seed.wrapping_add(2), &Device::Cpu).unwrap();
+            let pack = |q: &TurboQuantizer, x: &Tensor| {
+                let (b, h, t, d) = x.dims4().unwrap();
+                q.quantize_rows(&x.reshape((b * h * t, d)).unwrap())
+                    .unwrap()
+                    .reshape((b, h, t, q.row_words()))
+                    .unwrap()
+            };
+            // two "blocks" of 13 and 7 tokens
+            let (k1, v1) = (rand(&[b, hkv, 13, d], 21), rand(&[b, hkv, 13, d], 22));
+            let (k2, v2) = (rand(&[b, hkv, 7, d], 23), rand(&[b, hkv, 7, d], 24));
+            cache.append(&k1, &v1).unwrap();
+            cache.append(&k2, &v2).unwrap();
+            let k_rows = Tensor::cat(&[&pack(&kq, &k1), &pack(&kq, &k2)], 2).unwrap();
+            let v_rows = Tensor::cat(&[&pack(&vq, &v1), &pack(&vq, &v2)], 2).unwrap();
+            for lq in [1usize, 5] {
+                let q = rand(&[b, hq, lq, d], 30 + lq as u64);
+                let cfg = FlashAttnConfig::new(0.125).causal();
+                let want = cache.attention(&q, &cfg).unwrap();
+                let got = attention_packed(&q, &k_rows, &v_rows, 20, &kq, &vq, &cfg).unwrap();
+                assert!(
+                    rel_err(&got, &want) < 1e-5,
+                    "{kf} lq {lq}: {}",
+                    rel_err(&got, &want)
+                );
+                // spare capacity after the valid rows is ignored
+                let junk_k = pack(&kq, &rand(&[b, hkv, 3, d], 99));
+                let junk_v = pack(&vq, &rand(&[b, hkv, 3, d], 98));
+                let k_cap = Tensor::cat(&[&k_rows, &junk_k], 2).unwrap();
+                let v_cap = Tensor::cat(&[&v_rows, &junk_v], 2).unwrap();
+                let got = attention_packed(&q, &k_cap, &v_cap, 20, &kq, &vq, &cfg).unwrap();
+                assert!(
+                    rel_err(&got, &want) < 1e-5,
+                    "{kf} lq {lq} capacity: {}",
+                    rel_err(&got, &want)
+                );
+            }
+            // shape / format mismatches are errors, not silent garbage
+            let q = rand(&[b, hq, 1, d], 40);
+            let cfg = FlashAttnConfig::new(0.125);
+            assert!(attention_packed(&q, &k_rows, &v_rows, 21, &kq, &vq, &cfg).is_err());
+            assert!(attention_packed(
+                &q,
+                &v_rows,
+                &k_rows.narrow(3, 0, 1).unwrap(),
+                20,
+                &kq,
+                &vq,
+                &cfg
+            )
+            .is_err());
+        }
     }
 }
 

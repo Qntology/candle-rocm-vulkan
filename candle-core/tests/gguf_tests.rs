@@ -134,3 +134,48 @@ fn rejects_string_length_above_remaining_file_bytes() {
     pad(&mut buf, 64);
     assert_rejects(buf, "string length");
 }
+
+/// `tensor_from_slice` (memory-mapped image) reads exactly what `tensor` (reader) reads.
+#[test]
+fn tensor_from_slice_matches_reader() {
+    use candle_core::quantized::{gguf_file, GgmlDType, QTensor};
+    use candle_core::Tensor;
+    let dev = Device::Cpu;
+    let a = Tensor::arange(0f32, 64.0 * 32.0, &dev)
+        .unwrap()
+        .reshape((64, 32))
+        .unwrap();
+    let b = (Tensor::arange(0f32, 256.0, &dev).unwrap() * 0.01).unwrap();
+    let qa = QTensor::quantize(&a, GgmlDType::Q8_0).unwrap();
+    let qb = QTensor::quantize(&b, GgmlDType::F32).unwrap();
+    let mut buf = Cursor::new(Vec::new());
+    gguf_file::write(&mut buf, &[], &[("a", &qa), ("b", &qb)]).unwrap();
+    let bytes = buf.into_inner();
+    let ct = Content::read(&mut Cursor::new(&bytes)).unwrap();
+    for name in ["a", "b"] {
+        let via_reader = ct.tensor(&mut Cursor::new(&bytes), name, &dev).unwrap();
+        let via_slice = ct.tensor_from_slice(&bytes, name, &dev).unwrap();
+        assert_eq!(via_reader.dtype(), via_slice.dtype());
+        assert_eq!(via_reader.shape(), via_slice.shape());
+        let x = via_reader
+            .dequantize(&dev)
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap();
+        let y = via_slice
+            .dequantize(&dev)
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap();
+        assert_eq!(x, y, "{name}");
+    }
+    // truncated image: an error instead of reading past the end
+    assert!(ct
+        .tensor_from_slice(&bytes[..bytes.len() - 8], "b", &dev)
+        .is_err());
+    assert!(ct.tensor_from_slice(&bytes, "missing", &dev).is_err());
+}
