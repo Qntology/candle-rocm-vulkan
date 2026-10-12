@@ -41,11 +41,7 @@ impl QCudaStorage {
         Err(Error::NotCompiledWithCudaSupport)
     }
 
-    pub fn exact_mv_supported(&self) -> bool {
-        false
-    }
-
-    pub fn fwd_exact_mv(
+    pub fn fwd_exact(
         &self,
         _self_shape: &crate::Shape,
         _x: &CudaStorage,

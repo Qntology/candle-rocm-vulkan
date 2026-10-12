@@ -769,34 +769,76 @@ impl QCudaStorage {
         }
     }
 
-    /// Whether [`Self::fwd_exact_mv`] has a kernel for this weight type.
-    pub fn exact_mv_supported(&self) -> bool {
-        super::w8a16::mv_supported(self.dtype)
-    }
-
-    /// Exact weight-only quantized mat-vec: `x · dequant(W)ᵀ` for at most
-    /// `w8a16::MV_MAX_ROWS` input rows without quantizing the activations. `x` must be
-    /// contiguous F32 / F16 / BF16 with a 16 byte aligned start; the output has the dtype of `x`.
-    pub fn fwd_exact_mv(
+    /// Exact weight-only quantized matmul `x · dequant(W)ᵀ` (no activation quantization), the
+    /// CUDA part of [`super::QTensor::forward_exact`]. `x` must be contiguous F32 / F16 / BF16
+    /// of shape `(.., k)`; the output has shape `(.., n)` and the dtype of `x`.
+    ///
+    /// * At most [`super::w8a16::MV_MAX_ROWS`] rows, a weight type with a mat-vec kernel and a
+    ///   16 byte aligned `x`: one exact mat-vec launch (f32 weights and accumulation).
+    /// * Otherwise the weight is dequantized on the device to the compute dtype (the dtype of
+    ///   `x`, or f32 for at most `MV_MAX_ROWS` rows) in row tiles and multiplied with the same
+    ///   cuBLAS GEMM as `Tensor::matmul`, writing each tile straight into the output.
+    pub fn fwd_exact(
         &self,
         self_shape: &crate::Shape,
         x: &CudaStorage,
         x_l: &crate::Layout,
     ) -> Result<(CudaStorage, crate::Shape)> {
+        use crate::backend::{BackendDevice, BackendStorage};
+        use crate::DType;
+        use super::w8a16;
         let (n, k) = self_shape.dims2()?;
         let dims = x_l.shape().dims();
         if dims.is_empty() || dims[dims.len() - 1] != k {
-            crate::bail!("fwd_exact_mv: input {:?} incompatible with {self_shape:?}", x_l.shape())
+            crate::bail!("fwd_exact: input {:?} incompatible with {self_shape:?}", x_l.shape())
+        }
+        let in_dtype = x.dtype();
+        if !matches!(in_dtype, DType::F32 | DType::F16 | DType::BF16) {
+            crate::bail!("fwd_exact: unsupported input dtype {in_dtype:?}")
         }
         let Some((o1, _)) = x_l.contiguous_offsets() else {
-            crate::bail!("fwd_exact_mv: input must be contiguous")
+            crate::bail!("fwd_exact: input must be contiguous")
         };
-        let rows = x_l.shape().elem_count() / k;
-        let out = super::w8a16::matvec(&self.device, &self.data.inner, self.dtype, n, k, x, o1, rows)?;
-        let mut out_shape = dims.to_vec();
-        out_shape.pop();
-        out_shape.push(n);
-        Ok((out, out_shape.into()))
+        let mut out_dims = dims.to_vec();
+        out_dims.pop();
+        out_dims.push(n);
+        let out_shape = crate::Shape::from(out_dims);
+        let rows = x_l.shape().elem_count() / k.max(1);
+        if rows == 0 || n == 0 || k == 0 {
+            return Ok((self.device.zeros_impl(&out_shape, in_dtype)?, out_shape));
+        }
+        let aligned = (o1 * in_dtype.size_in_bytes()).is_multiple_of(16);
+        if rows <= w8a16::MV_MAX_ROWS && aligned && w8a16::mv_supported(self.dtype) {
+            let out = w8a16::matvec(&self.device, &self.data.inner, self.dtype, n, k, x, o1, rows)?;
+            return Ok((out, out_shape));
+        }
+        let compute = if rows <= w8a16::MV_MAX_ROWS {
+            DType::F32
+        } else {
+            in_dtype
+        };
+        let cast;
+        let (xc, xoff) = if compute == in_dtype {
+            (x, o1)
+        } else {
+            cast = x.to_dtype(x_l, compute)?;
+            (&cast, 0)
+        };
+        // Weight types without a direct kernel can only be dequantized as a whole.
+        let tile_rows = if w8a16::dq_supported(self.dtype) {
+            w8a16::dequant_tile_rows(k, compute).min(n)
+        } else {
+            n
+        };
+        let out = w8a16::gemm_tiles(&self.device, xc, xoff, rows, n, k, tile_rows, |r0, nr| {
+            self.dequantize_range_to(r0 * k, nr * k, compute)
+        })?;
+        let out = if compute == in_dtype {
+            out
+        } else {
+            out.to_dtype(&crate::Layout::contiguous((rows, n)), in_dtype)?
+        };
+        Ok((out, out_shape))
     }
 
     pub fn quantize(&mut self, src: &CudaStorage) -> Result<()> {

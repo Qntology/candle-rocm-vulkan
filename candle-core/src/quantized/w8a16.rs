@@ -10,6 +10,8 @@
 //!   the output is written in the activation dtype (one rounding). No activation quantization.
 //! * `dequantize`: Q8_0 / Q4_0 / Q4K / Q5K / Q6K blocks or F32 / F16 / BF16 elements straight to
 //!   an f32 / f16 / bf16 buffer, one rounding and no f32 intermediate.
+//! * `gemm_tiles`: the prefill path, `x · Wᵀ` with `W` dequantized in row tiles into a transient
+//!   buffer and multiplied by cuBLAS with the same configuration as `Tensor::matmul`.
 
 use super::GgmlDType;
 use crate::cuda_backend::{CudaDevice, CudaStorage, CudaStorageSlice, WrapErr};
@@ -339,6 +341,181 @@ pub fn dequantize(
         }};
     }
     alloc_out!(cvt)
+}
+
+/// Rows of an `(n, k)` weight dequantized at once by the GEMM path of `forward_exact`:
+/// `CANDLE_W8A16_DEQUANT_TILE_MB` (default 32) MiB of `dtype` values, at least one row.
+pub fn dequant_tile_rows(k: usize, dtype: DType) -> usize {
+    static TILE_BYTES: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    let bytes = *TILE_BYTES.get_or_init(|| {
+        std::env::var("CANDLE_W8A16_DEQUANT_TILE_MB")
+            .ok()
+            .and_then(|s| s.trim().parse::<usize>().ok())
+            .filter(|&mb| mb > 0)
+            .unwrap_or(32)
+            << 20
+    });
+    (bytes / (k.max(1) * dtype.size_in_bytes())).max(1)
+}
+
+/// `y = x · Wᵀ` for the `rows × k` contiguous input `x` starting at element `x_off` and an
+/// `n × k` weight produced by `tile(row0, nrows)` as dense row tiles of at most `tile_rows`
+/// rows in the dtype of `x` (f32 / f16 / bf16). Every tile is multiplied with the cuBLAS call
+/// `Tensor::matmul` issues for `x.matmul(&w.t())` (same data types, compute type and
+/// algorithm; for a single tile the call is identical), its `rows × nrows` result written
+/// straight into the columns `row0..row0 + nrows` of the `rows × n` output. A tile is freed
+/// (stream ordered) as soon as its GEMM is queued, so at most one tile is alive.
+#[allow(clippy::too_many_arguments)]
+pub fn gemm_tiles(
+    dev: &CudaDevice,
+    x: &CudaStorage,
+    x_off: usize,
+    rows: usize,
+    n: usize,
+    k: usize,
+    tile_rows: usize,
+    mut tile: impl FnMut(usize, usize) -> Result<CudaStorage>,
+) -> Result<CudaStorage> {
+    use crate::backend::BackendStorage;
+    use cudarc::driver::{DevicePtr, DevicePtrMut};
+    let dtype = x.dtype();
+    if rows == 0 || n == 0 || k == 0 || tile_rows == 0 {
+        bail!("w8a16 gemm: empty problem rows={rows} n={n} k={k} tile={tile_rows}")
+    }
+    let max = i32::MAX as usize;
+    if rows > max || n > max || k > max {
+        bail!("w8a16 gemm: shape rows={rows} n={n} k={k} too large")
+    }
+    let stream = dev.cuda_stream();
+    macro_rules! run {
+        ($s:expr, $t:ty, $variant:ident) => {{
+            let xv = $s.slice(x_off..x_off + rows * k);
+            // SAFETY: every output column is written by exactly one tile GEMM below.
+            let mut out = unsafe { dev.alloc::<$t>(rows * n)? };
+            let mut n0 = 0;
+            while n0 < n {
+                let tn = tile_rows.min(n - n0);
+                let w = tile(n0, tn)?;
+                let CudaStorageSlice::$variant(wv) = &w.slice else {
+                    bail!("w8a16 gemm: weight tile is {:?}, expected {dtype:?}", w.dtype())
+                };
+                if wv.len() < tn * k {
+                    bail!("w8a16 gemm: weight tile has {} values, expected {}", wv.len(), tn * k)
+                }
+                {
+                    let (a, _ga) = wv.device_ptr(&stream);
+                    let (b, _gb) = xv.device_ptr(&stream);
+                    let (c, _gc) = out.device_ptr_mut(&stream);
+                    let c = c + (n0 * std::mem::size_of::<$t>()) as u64;
+                    // SAFETY: a = tn × k weight tile, b = rows × k input, c = column n0 of the
+                    // rows × n output (ldc = n); all three live until the call is queued.
+                    unsafe { gemm_ex(dev, dtype, tn, rows, k, a, b, c, n) }?;
+                }
+                drop(w);
+                n0 += tn;
+            }
+            Ok(CudaStorage::wrap_cuda_slice(out, dev.clone()))
+        }};
+    }
+    match &x.slice {
+        CudaStorageSlice::F32(s) => run!(s, f32, F32),
+        CudaStorageSlice::F16(s) => run!(s, half::f16, F16),
+        CudaStorageSlice::BF16(s) => run!(s, half::bf16, BF16),
+        _ => bail!("w8a16 gemm: unsupported input dtype {dtype:?}"),
+    }
+}
+
+/// Column-major `C[tn × rows] = A[k × tn]ᵀ · B[k × rows]` (i.e. row-major
+/// `y[rows × tn] = x[rows × k] · w[tn × k]ᵀ`) with leading dimension `ldc`, issued exactly like
+/// `cuda_backend::gemm_strided_batched_{f32,f16,bf16}` (batch 1, `CUBLAS_GEMM_DEFAULT_TENSOR_OP`,
+/// f32 compute unless the matching `gemm_reduced_precision_*` flag is set).
+///
+/// # Safety
+/// `a`, `b` and `c` must be device pointers of `dtype` values covering the described matrices.
+#[allow(clippy::too_many_arguments)]
+unsafe fn gemm_ex(
+    dev: &CudaDevice,
+    dtype: DType,
+    tn: usize,
+    rows: usize,
+    k: usize,
+    a: u64,
+    b: u64,
+    c: u64,
+    ldc: usize,
+) -> Result<()> {
+    use crate::cuda_backend::{
+        gemm_reduced_precision_bf16, gemm_reduced_precision_f16, gemm_reduced_precision_f32,
+    };
+    use cudarc::cublas::sys;
+    use std::ffi::c_void;
+    let (one_f32, zero_f32) = (1f32, 0f32);
+    let (one_f16, zero_f16) = (half::f16::ONE, half::f16::ZERO);
+    let f32s = (
+        &one_f32 as *const f32 as *const c_void,
+        &zero_f32 as *const f32 as *const c_void,
+    );
+    let (data_type, compute, (alpha, beta)) = match dtype {
+        DType::F32 => (
+            sys::cudaDataType_t::CUDA_R_32F,
+            if gemm_reduced_precision_f32() {
+                sys::cublasComputeType_t::CUBLAS_COMPUTE_32F_FAST_TF32
+            } else {
+                sys::cublasComputeType_t::CUBLAS_COMPUTE_32F
+            },
+            f32s,
+        ),
+        DType::F16 if gemm_reduced_precision_f16() => (
+            sys::cudaDataType_t::CUDA_R_16F,
+            sys::cublasComputeType_t::CUBLAS_COMPUTE_16F,
+            (
+                &one_f16 as *const half::f16 as *const c_void,
+                &zero_f16 as *const half::f16 as *const c_void,
+            ),
+        ),
+        DType::F16 => (
+            sys::cudaDataType_t::CUDA_R_16F,
+            sys::cublasComputeType_t::CUBLAS_COMPUTE_32F,
+            f32s,
+        ),
+        DType::BF16 => (
+            sys::cudaDataType_t::CUDA_R_16BF,
+            if gemm_reduced_precision_bf16() {
+                sys::cublasComputeType_t::CUBLAS_COMPUTE_32F_FAST_16BF
+            } else {
+                sys::cublasComputeType_t::CUBLAS_COMPUTE_32F
+            },
+            f32s,
+        ),
+        d => bail!("w8a16 gemm: unsupported dtype {d:?}"),
+    };
+    let (tn_i, rows_i, k_i) = (tn as i32, rows as i32, k as i32);
+    cudarc::cublas::result::gemm_strided_batched_ex(
+        *dev.blas.handle(),
+        sys::cublasOperation_t::CUBLAS_OP_T,
+        sys::cublasOperation_t::CUBLAS_OP_N,
+        tn_i,
+        rows_i,
+        k_i,
+        alpha,
+        a as *const _,
+        data_type,
+        k_i,
+        (tn * k) as i64,
+        b as *const _,
+        data_type,
+        k_i,
+        (rows * k) as i64,
+        beta,
+        c as *mut _,
+        data_type,
+        ldc as i32,
+        (rows * tn) as i64,
+        1,
+        compute,
+        sys::cublasGemmAlgo_t::CUBLAS_GEMM_DEFAULT_TENSOR_OP,
+    )
+    .w()
 }
 
 #[cfg(test)]
