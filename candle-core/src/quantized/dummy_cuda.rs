@@ -28,6 +28,32 @@ impl QCudaStorage {
         Err(Error::NotCompiledWithCudaSupport)
     }
 
+    pub fn dequantize_to(&self, _elem_count: usize, _dtype: crate::DType) -> Result<CudaStorage> {
+        Err(Error::NotCompiledWithCudaSupport)
+    }
+
+    pub fn dequantize_range_to(
+        &self,
+        _elem_offset: usize,
+        _elem_count: usize,
+        _dtype: crate::DType,
+    ) -> Result<CudaStorage> {
+        Err(Error::NotCompiledWithCudaSupport)
+    }
+
+    pub fn exact_mv_supported(&self) -> bool {
+        false
+    }
+
+    pub fn fwd_exact_mv(
+        &self,
+        _self_shape: &crate::Shape,
+        _x: &CudaStorage,
+        _x_l: &crate::Layout,
+    ) -> Result<(CudaStorage, crate::Shape)> {
+        Err(Error::NotCompiledWithCudaSupport)
+    }
+
     pub fn quantize(&mut self, _src: &CudaStorage) -> Result<()> {
         Err(Error::NotCompiledWithCudaSupport)
     }

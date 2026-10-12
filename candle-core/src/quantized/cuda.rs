@@ -19,6 +19,21 @@ pub struct QCudaStorage {
     device: CudaDevice,
 }
 
+impl Drop for QCudaStorage {
+    fn drop(&mut self) {
+        // Make the owning context current before the `CudaSlice` field is dropped: without event
+        // tracking cudarc's `CudaSlice::drop` calls `cuMemFreeAsync` without binding, and on a
+        // thread with no (or another) current context the free fails and the memory leaks.
+        // Raw `cuCtxSetCurrent` on purpose: `CudaContext::bind_to_thread` returns early on a
+        // stale deferred error. Errors are ignored (nothing sensible can be done in drop).
+        let ctx = self.data.inner.stream().context().cu_ctx();
+        // SAFETY: the context outlives this storage (the slice holds an Arc to it).
+        unsafe {
+            let _ = cudarc::driver::sys::cuCtxSetCurrent(ctx);
+        }
+    }
+}
+
 pub(crate) static FORCE_DMMV: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
@@ -668,6 +683,10 @@ impl QCudaStorage {
         if fast_kernel {
             return dequantize_f32(&self.data, self.dtype, elem_count, self.device());
         }
+        if matches!(self.dtype, GgmlDType::F32 | GgmlDType::F16 | GgmlDType::BF16) {
+            // Float GGUF tensors: convert on the device (no dtoh / CPU / htod round trip).
+            return self.dequantize_to(elem_count, crate::DType::F32);
+        }
         // Run the dequantization on cpu.
 
         let buffer = self
@@ -698,7 +717,86 @@ impl QCudaStorage {
     }
 
     pub fn dequantize_f16(&self, elem_count: usize) -> Result<CudaStorage> {
+        if matches!(self.dtype, GgmlDType::F32 | GgmlDType::F16 | GgmlDType::BF16) {
+            return self.dequantize_to(elem_count, crate::DType::F16);
+        }
         dequantize_f16(&self.data, self.dtype, elem_count, self.device())
+    }
+
+    /// Dequantizes the first `elem_count` weights to `dtype` (F32 / F16 / BF16) on the device.
+    ///
+    /// Q8_0 / Q4_0 / Q4K / Q5K / Q6K and the F32 / F16 / BF16 element types go through one
+    /// direct kernel (one rounding, bit exact with `dequantize` on the CPU followed by
+    /// `to_dtype`, no f32 intermediate); the other block types use the f32 dequantization
+    /// kernel followed by a device cast.
+    pub fn dequantize_to(&self, elem_count: usize, dtype: crate::DType) -> Result<CudaStorage> {
+        self.dequantize_range_to(0, elem_count, dtype)
+    }
+
+    /// Like [`Self::dequantize_to`] for the `elem_count` weights starting at weight
+    /// `elem_offset`, which must be a multiple of the block size (e.g. a row boundary).
+    pub fn dequantize_range_to(
+        &self,
+        elem_offset: usize,
+        elem_count: usize,
+        dtype: crate::DType,
+    ) -> Result<CudaStorage> {
+        use crate::backend::BackendStorage;
+        let bs = self.dtype.block_size();
+        if !elem_offset.is_multiple_of(bs) {
+            crate::bail!("dequantize_range_to: offset {elem_offset} is not a multiple of {bs}")
+        }
+        let byte_off = elem_offset / bs * self.dtype.type_size();
+        let byte_len = elem_count.div_ceil(bs) * self.dtype.type_size();
+        if byte_off + byte_len > self.data.len {
+            crate::bail!(
+                "dequantize_range_to: weights {elem_offset}..{} out of range",
+                elem_offset + elem_count
+            )
+        }
+        if super::w8a16::dq_supported(self.dtype) {
+            let view = self.data.inner.slice(byte_off..byte_off + byte_len);
+            return super::w8a16::dequantize(&self.device, &view, self.dtype, elem_count, dtype);
+        }
+        if elem_offset != 0 {
+            crate::bail!("dequantize_range_to: {:?} only supports offset 0", self.dtype)
+        }
+        let f32s = self.dequantize(elem_count)?;
+        if dtype == crate::DType::F32 {
+            Ok(f32s)
+        } else {
+            f32s.to_dtype(&crate::Layout::contiguous(elem_count), dtype)
+        }
+    }
+
+    /// Whether [`Self::fwd_exact_mv`] has a kernel for this weight type.
+    pub fn exact_mv_supported(&self) -> bool {
+        super::w8a16::mv_supported(self.dtype)
+    }
+
+    /// Exact weight-only quantized mat-vec: `x · dequant(W)ᵀ` for at most
+    /// `w8a16::MV_MAX_ROWS` input rows without quantizing the activations. `x` must be
+    /// contiguous F32 / F16 / BF16 with a 16 byte aligned start; the output has the dtype of `x`.
+    pub fn fwd_exact_mv(
+        &self,
+        self_shape: &crate::Shape,
+        x: &CudaStorage,
+        x_l: &crate::Layout,
+    ) -> Result<(CudaStorage, crate::Shape)> {
+        let (n, k) = self_shape.dims2()?;
+        let dims = x_l.shape().dims();
+        if dims.is_empty() || dims[dims.len() - 1] != k {
+            crate::bail!("fwd_exact_mv: input {:?} incompatible with {self_shape:?}", x_l.shape())
+        }
+        let Some((o1, _)) = x_l.contiguous_offsets() else {
+            crate::bail!("fwd_exact_mv: input must be contiguous")
+        };
+        let rows = x_l.shape().elem_count() / k;
+        let out = super::w8a16::matvec(&self.device, &self.data.inner, self.dtype, n, k, x, o1, rows)?;
+        let mut out_shape = dims.to_vec();
+        out_shape.pop();
+        out_shape.push(n);
+        Ok((out, out_shape.into()))
     }
 
     pub fn quantize(&mut self, src: &CudaStorage) -> Result<()> {
