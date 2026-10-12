@@ -35,10 +35,18 @@ fn ctype(sfx: &str) -> Option<&'static str> {
 }
 
 /// The instantiation line of a fused attention kernel name (`fa_row_bf16_fp8`,
-/// `fa2_d128_f16_f16`, `fa_combine_f32`, ...).
+/// `fa_rowp_f32_f16`, `fa2_d128_f16_f16`, `fa_combine_f32`, ...).
 pub fn flash_attn_instantiation(name: &str) -> Option<String> {
     if let Some(o) = name.strip_prefix("fa_combine_") {
         return Some(format!("FA_COMBINE_KERNEL({name}, {})", ctype(o)?));
+    }
+    if let Some(rest) = name.strip_prefix("fa_rowp_") {
+        let (q, kv) = rest.split_once('_')?;
+        return Some(format!(
+            "FA_ROWP_KERNEL({name}, {}, {})",
+            ctype(q)?,
+            ctype(kv)?
+        ));
     }
     if let Some(rest) = name.strip_prefix("fa_row_") {
         let (q, kv) = rest.split_once('_')?;
@@ -106,6 +114,14 @@ mod tests {
             "FA_ROW_KERNEL(fa_row_f16_fp8, ax_f16, ax_fp8)"
         );
         assert_eq!(
+            flash_attn_instantiation("fa_rowp_f32_bf16").unwrap(),
+            "FA_ROWP_KERNEL(fa_rowp_f32_bf16, float, ax_bf16)"
+        );
+        assert_eq!(
+            flash_attn_instantiation("fa2_d256_f32_f16").unwrap(),
+            "FA_TILE_KERNEL(fa2_d256_f32_f16, float, ax_f16, 8, 16, 256)"
+        );
+        assert_eq!(
             flash_attn_instantiation("fa_combine_bf16").unwrap(),
             "FA_COMBINE_KERNEL(fa_combine_bf16, ax_bf16)"
         );
@@ -131,8 +147,11 @@ mod tests {
             ("f32", "fp8"),
             ("f16", "fp8"),
             ("bf16", "fp8"),
+            ("f32", "f16"),
+            ("f32", "bf16"),
         ] {
             names.push(format!("fa_row_{q}_{kv}"));
+            names.push(format!("fa_rowp_{q}_{kv}"));
             for v in [2, 3] {
                 for d in [64, 128, 256] {
                     names.push(format!("fa{v}_d{d}_{q}_{kv}"));

@@ -6,9 +6,10 @@ use super::kernels::Module;
 use super::utils::LaunchArgs;
 use super::RocmStorage;
 use crate::accel::attention::{
-    self as att, AttnGeometry, FaExtra, FlashAttnParams, FA_THREADS, MAX_GRID_X,
+    self as att, AttnGeometry, FaExtra, FaPlan, FlashAttnParams, PageTable, PagedKv, FA_THREADS,
+    MAX_GRID_X,
 };
-use crate::accel::turbo::{TqAttnArgs, TqRowArgs, TQ_THREADS};
+use crate::accel::turbo::{tq_attn_kernel, TqAttnArgs, TqRowArgs, TQ_THREADS};
 use crate::{bail, DType, Result};
 
 fn null() -> *const u8 {
@@ -30,6 +31,21 @@ fn grid_rows(n: usize) -> u32 {
 
 fn grid_elems(n: usize) -> u32 {
     n.div_ceil(TQ_THREADS).clamp(1, 1 << 20) as u32
+}
+
+/// Device addresses of the blocks of a paged call.
+fn page_table(blocks: &[PagedKv<'_, RocmStorage>]) -> Result<PageTable> {
+    let mut table = PageTable::default();
+    for bl in blocks {
+        table.push(
+            bl.k.ptr_at(bl.k_offset) as usize as u64,
+            bl.v.ptr_at(bl.v_offset) as usize as u64,
+            bl.rows,
+            bl.k_cap,
+            bl.v_cap,
+        )?;
+    }
+    Ok(table)
 }
 
 impl RocmStorage {
@@ -123,7 +139,117 @@ impl RocmStorage {
                 comb,
                 (grid_rows(rows), 1, 1),
                 (FA_THREADS as u32, 1, 1),
-                0,
+                (splits * 4) as u32,
+                &mut a,
+            )?;
+        }
+        Ok(Self::new(out, self.dtype, self.device.clone()))
+    }
+
+    /// Decoding attention of `self` (queries, geometry from `AttnGeometry::paged`) over the K/V
+    /// blocks of a paged cache without concatenating them (`fa_rowp_*`). Output contiguous in
+    /// the query dtype.
+    pub fn flash_attn_paged(
+        &self,
+        blocks: &[PagedKv<'_, Self>],
+        geom: &AttnGeometry,
+        p: &FlashAttnParams,
+        extra: &FaExtra<'_, Self>,
+    ) -> Result<Self> {
+        let Some(first) = blocks.first() else {
+            bail!("paged flash-attn: no blocks")
+        };
+        let kv_dtype = first.k.dtype;
+        if blocks
+            .iter()
+            .any(|b| b.k.dtype != kv_dtype || b.v.dtype != kv_dtype)
+        {
+            bail!("paged flash-attn: every block needs the same k / v dtype")
+        }
+        if geom.varlen || extra.cu_seqlens.is_some() {
+            bail!("paged flash-attn: varlen batches are not supported")
+        }
+        let table = page_table(blocks)?;
+        if table.total_rows() != geom.lk {
+            bail!(
+                "paged flash-attn: blocks hold {} keys, geometry {}",
+                table.total_rows(),
+                geom.lk
+            )
+        }
+        let prof = self.device.accel_profile();
+        let plan = FaPlan::Row {
+            splits: att::split_count(geom, p.split_kv, prof.compute_units),
+        };
+        let name = att::paged_kernel_name(self.dtype, kv_dtype)?;
+        let rows = geom.out_rows();
+        let d = geom.d;
+        let out = self.device.alloc(rows * d * self.esz())?;
+        if rows == 0 || d == 0 {
+            return Ok(Self::new(out, self.dtype, self.device.clone()));
+        }
+        let func = self.device.get_func(Module::FlashAttn, &name)?;
+        let (grid, smem, splits) = att::launch_dims(geom, &plan);
+        let part = if splits > 1 {
+            Some((
+                self.device.alloc(splits * rows * d * 4)?,
+                self.device.alloc(splits * rows * 4)?,
+            ))
+        } else {
+            None
+        };
+        let (alibi, alibi_bs) = match extra.alibi {
+            Some((s, off, bs)) => (s.ptr_at(off), bs),
+            None => (null(), 0),
+        };
+        let mut a = LaunchArgs::new();
+        a.ptr(self.ptr_at(geom.q_offset))
+            .ptr(null())
+            .ptr(null())
+            .ptr(out.as_ptr())
+            .ptr(part.as_ref().map(|p| p.0.as_ptr()).unwrap_or(null()))
+            .ptr(part.as_ref().map(|p| p.1.as_ptr()).unwrap_or(null()))
+            .ptr(alibi)
+            .ptr(null())
+            .ptr(null())
+            .u32(geom.lq as u32)
+            .u32(geom.lk as u32)
+            .u32(geom.hq as u32)
+            .u32(geom.hkv as u32)
+            .u32(d as u32);
+        for s in [geom.q_strides, geom.k_strides, geom.v_strides] {
+            a.usize(s[0]).usize(s[1]).usize(s[2]);
+        }
+        a.f32(p.softmax_scale)
+            .f32(p.softcap)
+            .u32(p.window_left as u32)
+            .u32(p.window_right as u32)
+            .f32(p.k_descale)
+            .f32(p.v_descale)
+            .u32(splits as u32)
+            .u32(alibi_bs as u32)
+            .u32(0)
+            .usize(rows)
+            .words(table.to_words());
+        self.device
+            .launch(func, grid, (FA_THREADS as u32, 1, 1), smem as u32, &mut a)?;
+        if let Some((po, pl)) = part {
+            let sfx = half_sfx(self.dtype, "flash-attn")?;
+            let comb = self
+                .device
+                .get_func(Module::FlashAttn, &format!("fa_combine_{sfx}"))?;
+            let mut a = LaunchArgs::new();
+            a.ptr(po.as_ptr())
+                .ptr(pl.as_ptr())
+                .ptr(out.as_ptr())
+                .usize(rows)
+                .u32(d as u32)
+                .u32(splits as u32);
+            self.device.launch(
+                comb,
+                (grid_rows(rows), 1, 1),
+                (FA_THREADS as u32, 1, 1),
+                (splits * 4) as u32,
                 &mut a,
             )?;
         }
@@ -285,12 +411,51 @@ impl RocmStorage {
     }
 
     /// Attention of the rotated query rows `self` (F32) over packed K/V rows. Output: F32
-    /// `(b, hq, lq, d)` in the rotated domain.
+    /// `(b, hq, lq, d)` in the rotated domain. FP8 K and V rows run the specialized kernel
+    /// (bit-identical results).
     #[allow(clippy::too_many_arguments)]
     pub fn tq_attention(
         &self,
         kd: &Self,
         vd: &Self,
+        tab: &Self,
+        tab_off: usize,
+        alibi: Option<(&Self, usize)>,
+        a: &TqAttnArgs,
+    ) -> Result<Self> {
+        self.tq_attention_impl(Some((kd, vd)), None, tab, tab_off, alibi, a)
+    }
+
+    /// [`Self::tq_attention`] over the packed K/V rows of paged `blocks` (in order, `a.lk` keys in
+    /// total; `a.k_strides[2]` / `a.v_strides[2]` are the row strides in words), without
+    /// concatenating them.
+    pub fn tq_attention_paged(
+        &self,
+        blocks: &[PagedKv<'_, Self>],
+        tab: &Self,
+        tab_off: usize,
+        alibi: Option<(&Self, usize)>,
+        a: &TqAttnArgs,
+    ) -> Result<Self> {
+        if blocks.is_empty() {
+            bail!("paged turbo-quant attention: no blocks")
+        }
+        let table = page_table(blocks)?;
+        if table.total_rows() != a.lk {
+            bail!(
+                "paged turbo-quant attention: blocks hold {} keys, args {}",
+                table.total_rows(),
+                a.lk
+            )
+        }
+        self.tq_attention_impl(None, Some(&table), tab, tab_off, alibi, a)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn tq_attention_impl(
+        &self,
+        dense: Option<(&Self, &Self)>,
+        table: Option<&PageTable>,
         tab: &Self,
         tab_off: usize,
         alibi: Option<(&Self, usize)>,
@@ -317,11 +482,16 @@ impl RocmStorage {
         } else {
             None
         };
-        let func = self.device.get_func(Module::TurboQuant, "tq_attn")?;
+        let name = tq_attn_kernel(&a.k, &a.v, table.is_some());
+        let func = self.device.get_func(Module::TurboQuant, name)?;
+        let (k_p, v_p) = match dense {
+            Some((kd, vd)) => (kd.ptr_at(a.k_offset), vd.ptr_at(a.v_offset)),
+            None => (null(), null()),
+        };
         let mut l = LaunchArgs::new();
         l.ptr(self.ptr_at(a.q_offset))
-            .ptr(kd.ptr_at(a.k_offset))
-            .ptr(vd.ptr_at(a.v_offset))
+            .ptr(k_p)
+            .ptr(v_p)
             .ptr(tab.ptr_at(tab_off))
             .ptr(alibi.map(|(s, o)| s.ptr_at(o)).unwrap_or(null()))
             .ptr(out.as_ptr())
@@ -356,6 +526,9 @@ impl RocmStorage {
             .u32(splits as u32)
             .u32(a.alibi_bstride as u32)
             .usize(rows);
+        if let Some(t) = table {
+            l.words(t.to_words());
+        }
         let grid = (
             (a.lq * a.hq).clamp(1, MAX_GRID_X) as u32,
             splits as u32,
@@ -381,7 +554,7 @@ impl RocmStorage {
                 comb,
                 (grid_rows(rows), 1, 1),
                 (TQ_THREADS as u32, 1, 1),
-                0,
+                (splits * 4) as u32,
                 &mut l,
             )?;
         }

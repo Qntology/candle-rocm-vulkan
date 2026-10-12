@@ -103,6 +103,26 @@ AX_DEV long long ax_min_ll(long long a, long long b) { return a < b ? a : b; }
 AX_DEV long long ax_max_ll(long long a, long long b) { return a > b ? a : b; }
 
 // ---------------------------------------------------------------------------
+// Paged K/V (block table passed by value, keep in sync with accel::attention::PageTable)
+// ---------------------------------------------------------------------------
+
+#define AX_MAX_PAGES 128
+
+// Block i holds rows[i] keys: element / word pointers k[i] / v[i] of its (batch 0, kv head 0,
+// row 0), laid out (batch, kv head, capacity, row) with a row stride shared by every block,
+// head stride k_cap[i] (v_cap[i]) rows and batch stride Hkv head strides. The keys of the call
+// are the concatenation of the blocks in order.
+struct ax_pages {
+    ax_u64 k[AX_MAX_PAGES];
+    ax_u64 v[AX_MAX_PAGES];
+    ax_u32 rows[AX_MAX_PAGES];
+    ax_u32 k_cap[AX_MAX_PAGES];
+    ax_u32 v_cap[AX_MAX_PAGES];
+    ax_u32 n;
+    ax_u32 pad;
+};
+
+// ---------------------------------------------------------------------------
 // 16 bit floats
 // ---------------------------------------------------------------------------
 
@@ -151,6 +171,19 @@ AX_DEV float ax_e4m3_to_f(ax_u32 c) {
     if (e == 15u && m == 7u) return ax_u2f(0x7fc00000u);
     const float v = e == 0 ? (float)m * 0.001953125f : ax_u2f(((e + 120u) << 23) | (m << 20));
     return (c & 0x80u) ? -v : v;
+}
+
+// Branch-free ax_e4m3_to_f for the decode loops: the same value, bit for bit, for all 256 codes
+// (normals rebias the exponent with one add, subnormals use the same m * 2^-9 product, and the
+// NaN code keeps the positive quiet NaN of ax_e4m3_to_f). No float subnormal is formed, so the
+// result does not depend on flush-to-zero settings.
+AX_DEV float ax_e4m3_to_f_fast(ax_u32 c) {
+    const ax_u32 mag = c & 0x7fu;
+    const float nrm = ax_u2f((mag << 20) + (120u << 23));
+    const float sub = (float)mag * 0.001953125f;
+    float v = mag >= 8u ? nrm : sub;
+    v = (c & 0x80u) ? -v : v;
+    return mag == 0x7fu ? ax_u2f(0x7fc00000u) : v;
 }
 
 AX_DEV ax_u32 ax_f_to_e4m3(float f) {

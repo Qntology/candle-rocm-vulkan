@@ -46,8 +46,47 @@ AX_DEV float fa_logit(float dot, float softcap, float slope, long long dist) {
     return s;
 }
 
-template <typename TQ, typename TKV>
-AX_DEV void fa_row_impl(FA_PARAMS(TQ, TKV)) {
+// One window of up to FA_NT keys [kb, min(kb + FA_NT, e)) of the row kernel: key j sits at row
+// j - j0 of kp / vp. Updates the online softmax state (m, l) and the two output accumulators.
+template <typename TKV>
+AX_DEV void fa_row_window(const float *qs, float *red, float *pr, const TKV *kp, const TKV *vp,
+                          ax_u64 k_ss, ax_u64 v_ss, long long j0, long long kb, long long e,
+                          ax_u32 D, float kd, float softcap, float slope, long long pos, float &m,
+                          float &l, float &acc0, float &acc1) {
+    const ax_u32 t = AX_TID;
+    const long long j = kb + t;
+    float s = -AX_INF;
+    if (j < e) {
+        const TKV *kr = kp + (ax_u64)(j - j0) * k_ss;
+        float dot = 0.0f;
+        for (ax_u32 d = 0; d < D; ++d) dot += qs[d] * ax_load(kr, d);
+        s = fa_logit(dot * kd, softcap, slope, pos - j);
+    }
+    const float m_new = fmaxf(m, ax_block_max<FA_NT>(s, red));
+    const float p = s == -AX_INF ? 0.0f : expf(s - m_new);
+    pr[t] = p;
+    const float lt = ax_block_sum<FA_NT>(p, red); // also publishes pr
+    const float alpha = m == -AX_INF ? 0.0f : expf(m - m_new);
+    l = l * alpha + lt;
+    acc0 *= alpha;
+    acc1 *= alpha;
+    const int cnt = (int)ax_min_ll(FA_NT, e - kb);
+    for (int u = 0; u < cnt; ++u) {
+        const float pu = pr[u];
+        if (pu != 0.0f) {
+            const TKV *vr = vp + (ax_u64)(kb + u - j0) * v_ss;
+            if (t < D) acc0 += pu * ax_load(vr, t);
+            if (t + FA_NT < D) acc1 += pu * ax_load(vr, t + FA_NT);
+        }
+    }
+    m = m_new;
+    AX_SYNC();
+}
+
+// Row kernel over dense K/V (PAGED = false) or over the blocks of `pg` (PAGED = true: k / v are
+// unused, no varlen; k_ss / v_ss are the row strides shared by all blocks).
+template <typename TQ, typename TKV, bool PAGED>
+AX_DEV void fa_row_core(FA_PARAMS(TQ, TKV), const ax_pages *pg) {
     float *sm = ax_smem();
     float *qs = sm;          // D
     float *red = sm + D;     // FA_NT
@@ -70,8 +109,6 @@ AX_DEV void fa_row_impl(FA_PARAMS(TQ, TKV)) {
         if (i >= lq) continue; // uniform over the workgroup
         const ax_u32 hk = h / group;
         const TQ *qp = varlen ? q + (q0 + i) * q_ss + h * q_sh : q + b * q_sb + i * q_ss + h * q_sh;
-        const TKV *kp = varlen ? k + k0 * k_ss + hk * k_sh : k + b * k_sb + hk * k_sh;
-        const TKV *vp = varlen ? v + k0 * v_ss + hk * v_sh : v + b * v_sb + hk * v_sh;
         const ax_u64 orow = (q0 + i) * Hq + h;
         AX_SYNC();
         for (ax_u32 d = t; d < D; d += FA_NT) qs[d] = scale * ax_load(qp, d);
@@ -88,34 +125,30 @@ AX_DEV void fa_row_impl(FA_PARAMS(TQ, TKV)) {
         if (s_hi < s_lo) s_hi = s_lo;
         const float slope = alibi ? alibi[(ax_u64)b * alibi_bs + h] : 0.0f;
         float m = -AX_INF, l = 0.0f, acc0 = 0.0f, acc1 = 0.0f;
-        for (long long kb = s_lo; kb < s_hi; kb += FA_NT) {
-            const long long j = kb + t;
-            float s = -AX_INF;
-            if (j < s_hi) {
-                const TKV *kr = kp + (ax_u64)j * k_ss;
-                float dot = 0.0f;
-                for (ax_u32 d = 0; d < D; ++d) dot += qs[d] * ax_load(kr, d);
-                s = fa_logit(dot * kd, softcap, slope, pos - j);
-            }
-            const float m_new = fmaxf(m, ax_block_max<FA_NT>(s, red));
-            const float p = s == -AX_INF ? 0.0f : expf(s - m_new);
-            pr[t] = p;
-            const float lt = ax_block_sum<FA_NT>(p, red); // also publishes pr
-            const float alpha = m == -AX_INF ? 0.0f : expf(m - m_new);
-            l = l * alpha + lt;
-            acc0 *= alpha;
-            acc1 *= alpha;
-            const int cnt = (int)ax_min_ll(FA_NT, s_hi - kb);
-            for (int u = 0; u < cnt; ++u) {
-                const float pu = pr[u];
-                if (pu != 0.0f) {
-                    const TKV *vr = vp + (ax_u64)(kb + u) * v_ss;
-                    if (t < D) acc0 += pu * ax_load(vr, t);
-                    if (t + FA_NT < D) acc1 += pu * ax_load(vr, t + FA_NT);
+        if (!PAGED) {
+            const TKV *kp = varlen ? k + k0 * k_ss + hk * k_sh : k + b * k_sb + hk * k_sh;
+            const TKV *vp = varlen ? v + k0 * v_ss + hk * v_sh : v + b * v_sb + hk * v_sh;
+            for (long long kb = s_lo; kb < s_hi; kb += FA_NT)
+                fa_row_window<TKV>(qs, red, pr, kp, vp, k_ss, v_ss, 0, kb, s_hi, D, kd, softcap,
+                                   slope, pos, m, l, acc0, acc1);
+        } else {
+            // windows never straddle two blocks; the block loop is uniform over the workgroup
+            long long j0 = 0;
+            for (ax_u32 bi = 0; bi < pg->n && j0 < s_hi; ++bi) {
+                const long long j1 = j0 + (long long)pg->rows[bi];
+                const long long a = ax_max_ll(s_lo, j0), e = ax_min_ll(s_hi, j1);
+                if (a < e) {
+                    const ax_u64 kh = (ax_u64)pg->k_cap[bi] * k_ss;
+                    const ax_u64 vh = (ax_u64)pg->v_cap[bi] * v_ss;
+                    const ax_u64 bh = (ax_u64)b * Hkv + hk;
+                    const TKV *kp = reinterpret_cast<const TKV *>(pg->k[bi]) + bh * kh;
+                    const TKV *vp = reinterpret_cast<const TKV *>(pg->v[bi]) + bh * vh;
+                    for (long long kb = a; kb < e; kb += FA_NT)
+                        fa_row_window<TKV>(qs, red, pr, kp, vp, k_ss, v_ss, j0, kb, e, D, kd,
+                                           softcap, slope, pos, m, l, acc0, acc1);
                 }
+                j0 = j1;
             }
-            m = m_new;
-            AX_SYNC();
         }
         const float inv = l > 0.0f ? vd / l : 0.0f;
         if (n_splits == 1) {
@@ -128,6 +161,17 @@ AX_DEV void fa_row_impl(FA_PARAMS(TQ, TKV)) {
             if (t == 0) part_lse[prow] = l > 0.0f ? m + logf(l) : -AX_INF;
         }
     }
+}
+
+template <typename TQ, typename TKV>
+AX_DEV void fa_row_impl(FA_PARAMS(TQ, TKV)) {
+    fa_row_core<TQ, TKV, false>(FA_ARGS, nullptr);
+}
+
+// Row kernel over a paged K/V block table (decoding without concatenating the blocks).
+template <typename TQ, typename TKV>
+AX_DEV void fa_rowp_impl(FA_PARAMS(TQ, TKV), const ax_pages &pg) {
+    fa_row_core<TQ, TKV, true>(FA_ARGS, &pg);
 }
 
 template <typename TQ, typename TKV, int BR, int BC, int DMAX>
@@ -245,24 +289,30 @@ AX_DEV void fa_tile_impl(FA_PARAMS(TQ, TKV)) {
     }
 }
 
-// Merges the normalized partial outputs of n_splits key splits with their log-sum-exp.
+// Merges the normalized partial outputs of n_splits key splits with their log-sum-exp. The
+// split weights exp(lse_s - max) are computed once per row (shared memory: n_splits floats);
+// the sums run in the same order as with per-element weights, so the result is unchanged.
 template <typename TO>
 AX_DEV void fa_combine_impl(const float *part_o, const float *part_lse, TO *o, ax_u64 rows,
                             ax_u32 D, ax_u32 n_splits) {
+    float *w = ax_smem(); // n_splits
     const ax_u32 t = AX_TID;
     for (ax_u64 row = AX_BID_X; row < rows; row += AX_NBLK_X) {
         float mx = -AX_INF;
         for (ax_u32 s = 0; s < n_splits; ++s) mx = fmaxf(mx, part_lse[(ax_u64)s * rows + row]);
-        float wsum = 0.0f;
-        for (ax_u32 s = 0; s < n_splits; ++s) {
+        AX_SYNC();
+        for (ax_u32 s = t; s < n_splits; s += FA_NT) {
             const float e = part_lse[(ax_u64)s * rows + row];
-            wsum += e == -AX_INF ? 0.0f : expf(e - mx);
+            w[s] = e == -AX_INF ? 0.0f : expf(e - mx);
         }
+        AX_SYNC();
+        float wsum = 0.0f;
+        for (ax_u32 s = 0; s < n_splits; ++s) wsum += w[s];
         for (ax_u32 d = t; d < D; d += FA_NT) {
             float acc = 0.0f;
             for (ax_u32 s = 0; s < n_splits; ++s) {
-                const float e = part_lse[(ax_u64)s * rows + row];
-                if (e != -AX_INF) acc += expf(e - mx) * part_o[((ax_u64)s * rows + row) * D + d];
+                const float ws = w[s];
+                if (ws != 0.0f) acc += ws * part_o[((ax_u64)s * rows + row) * D + d];
             }
             ax_store(o, row * D + d, wsum > 0.0f ? acc / wsum : 0.0f);
         }
@@ -272,6 +322,12 @@ AX_DEV void fa_combine_impl(const float *part_o, const float *part_lse, TO *o, a
 // Kernel entry points. NAME is the exported symbol.
 #define FA_ROW_KERNEL(NAME, TQ, TKV)                                                               \
     AX_KERNEL void AX_BOUNDS(FA_NT) NAME(FA_PARAMS(TQ, TKV)) { fa_row_impl<TQ, TKV>(FA_ARGS); }
+
+// Paged row kernel: the FA_PARAMS (k / v unused) followed by the block table by value.
+#define FA_ROWP_KERNEL(NAME, TQ, TKV)                                                              \
+    AX_KERNEL void AX_BOUNDS(FA_NT) NAME(FA_PARAMS(TQ, TKV), const ax_pages pg) {                  \
+        fa_rowp_impl<TQ, TKV>(FA_ARGS, pg);                                                        \
+    }
 
 #define FA_TILE_KERNEL(NAME, TQ, TKV, BR, BC, DMAX)                                                \
     AX_KERNEL void AX_BOUNDS(FA_NT) NAME(FA_PARAMS(TQ, TKV)) {                                     \
@@ -297,5 +353,6 @@ AX_DEV void fa_combine_impl(const float *part_o, const float *part_lse, TO *o, a
 
 #define FA_ALL_FOR(Q, KV, TQ, TKV)                                                                 \
     FA_ROW_KERNEL(fa_row_##Q##_##KV, TQ, TKV)                                                      \
+    FA_ROWP_KERNEL(fa_rowp_##Q##_##KV, TQ, TKV)                                                    \
     FA2_TILES(Q, KV, TQ, TKV)                                                                      \
     FA3_TILES(Q, KV, TQ, TKV)

@@ -529,6 +529,27 @@ pub struct TqAttnArgs {
     pub alibi_bstride: usize,
 }
 
+/// Kernel of a `tq_attn` call: the FP8 specialization when keys and values are both per-vector
+/// FP8 rows (bit-identical results to the generic kernel; `CANDLE_TURBO_QUANT_FP8_FAST=0` forces
+/// the generic one), the `tq_attnp*` variants for paged block tables.
+pub fn tq_attn_kernel(k: &TqSide, v: &TqSide, paged: bool) -> &'static str {
+    use super::formats::mode;
+    static FAST: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let fast = *FAST.get_or_init(|| {
+        !matches!(
+            std::env::var("CANDLE_TURBO_QUANT_FP8_FAST").as_deref(),
+            Ok("0") | Ok("off") | Ok("false")
+        )
+    });
+    let fp8 = fast && k.mode == mode::FP8 && v.mode == mode::FP8;
+    match (paged, fp8) {
+        (false, false) => "tq_attn",
+        (false, true) => "tq_attn_fp8",
+        (true, false) => "tq_attnp",
+        (true, true) => "tq_attnp_fp8",
+    }
+}
+
 impl TqAttnArgs {
     /// Output rows `b * hq * lq` (layout `(b, hq, lq, d)`).
     pub fn out_rows(&self) -> usize {
