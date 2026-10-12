@@ -117,6 +117,62 @@ impl TensorInfo {
             device,
         )
     }
+
+    /// Like [`TensorInfo::read`], but takes the bytes from an in-memory image of the whole file,
+    /// typically a memory map (`&mmap[..]`). There is no intermediate heap buffer: a GPU upload
+    /// reads the mapped pages directly, which saves one copy of the tensor per load and keeps the
+    /// process heap flat when layers are streamed from disk again and again (a CPU device still
+    /// copies the bytes into its own storage, like [`TensorInfo::read`]).
+    pub fn read_from_slice(
+        &self,
+        file: &[u8],
+        tensor_data_offset: u64,
+        device: &Device,
+    ) -> Result<QTensor> {
+        let tensor_elems = self.shape.elem_count();
+        let block_size = self.ggml_dtype.block_size();
+        if !tensor_elems.is_multiple_of(block_size) {
+            crate::bail!(
+            "the number of elements {tensor_elems} is not divisible by the block size {block_size}"
+        )
+        }
+        let size_in_bytes = tensor_elems / block_size * self.ggml_dtype.type_size();
+        let tensor_start = tensor_data_offset.saturating_add(self.offset);
+        let start = usize::try_from(tensor_start).map_err(|_| {
+            crate::Error::Msg(format!(
+                "tensor offset {tensor_start} does not fit in memory"
+            ))
+        })?;
+        let remaining = file.len().saturating_sub(start);
+        if size_in_bytes > remaining {
+            crate::bail!(
+                "tensor needs {size_in_bytes} bytes at offset {tensor_start}, only {remaining} remaining in file"
+            )
+        }
+        let raw = &file[start..start + size_in_bytes];
+        // The loaders reinterpret the bytes as GGML blocks (f16 / f32 fields): GGUF aligns tensor
+        // data (32 bytes by default) and maps start on a page, so this only copies for an image
+        // at an odd address.
+        if (raw.as_ptr() as usize) % 4 != 0 {
+            let mut words = vec![0u32; size_in_bytes.div_ceil(4)];
+            let bytes = unsafe {
+                std::slice::from_raw_parts_mut(words.as_mut_ptr() as *mut u8, size_in_bytes)
+            };
+            bytes.copy_from_slice(raw);
+            return super::ggml_file::qtensor_from_ggml(
+                self.ggml_dtype,
+                bytes,
+                self.shape.dims().to_vec(),
+                device,
+            );
+        }
+        super::ggml_file::qtensor_from_ggml(
+            self.ggml_dtype,
+            raw,
+            self.shape.dims().to_vec(),
+            device,
+        )
+    }
 }
 
 #[derive(Debug)]
@@ -577,6 +633,17 @@ impl Content {
             None => crate::bail!("cannot find tensor info for {name}"),
         };
         tensor_info.read(reader, self.tensor_data_offset, device)
+    }
+
+    /// Like [`Content::tensor`], but reads the tensor from an in-memory image of the whole file
+    /// (typically `&mmap[..]`) without an intermediate heap copy (see
+    /// [`TensorInfo::read_from_slice`]).
+    pub fn tensor_from_slice(&self, file: &[u8], name: &str, device: &Device) -> Result<QTensor> {
+        let tensor_info = match self.tensor_infos.get(name) {
+            Some(tensor_info) => tensor_info,
+            None => crate::bail!("cannot find tensor info for {name}"),
+        };
+        tensor_info.read_from_slice(file, self.tensor_data_offset, device)
     }
 }
 
