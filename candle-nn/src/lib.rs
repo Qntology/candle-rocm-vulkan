@@ -22,6 +22,7 @@ pub mod conv;
 pub mod cpu_flash_attention;
 pub mod embedding;
 pub mod encoding;
+pub mod flash_attn;
 pub mod func;
 pub mod group_norm;
 pub mod init;
@@ -36,6 +37,7 @@ pub mod rnn;
 pub mod rotary_emb;
 pub mod sampling;
 pub mod sequential;
+pub mod turbo_quant;
 pub mod var_builder;
 pub mod var_map;
 /// Re-export of [`attention::varlen`] for backward compatibility.

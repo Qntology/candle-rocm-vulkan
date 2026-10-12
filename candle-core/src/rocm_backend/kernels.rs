@@ -12,6 +12,10 @@ pub enum Module {
     Nn,
     Quantized,
     Gemm,
+    /// Fused attention (`flash_attn.hip`, `flash-attn` feature).
+    FlashAttn,
+    /// TurboQuant / microscaling quantization (`turbo_quant.hip`, `turbo-quant` feature).
+    TurboQuant,
 }
 
 pub const UNARY: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/unary.co"));
@@ -24,6 +28,8 @@ pub const TERNARY: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/ternary.co"
 pub const NN: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/nn.co"));
 pub const QUANTIZED: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/quantized.co"));
 pub const GEMM: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/gemm.co"));
+pub const FLASH_ATTN: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/flash_attn.co"));
+pub const TURBO_QUANT: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/turbo_quant.co"));
 
 /// GPU architectures the embedded code objects were built for.
 pub const COMPILED_ARCHS: &str = env!("CANDLE_ROCM_ARCHS");
@@ -42,7 +48,7 @@ pub fn compiled_for(arch: &str) -> bool {
 }
 
 impl Module {
-    pub const ALL: [Module; 10] = [
+    pub const ALL: [Module; 12] = [
         Module::Unary,
         Module::Binary,
         Module::Cast,
@@ -53,6 +59,8 @@ impl Module {
         Module::Nn,
         Module::Quantized,
         Module::Gemm,
+        Module::FlashAttn,
+        Module::TurboQuant,
     ];
 
     pub fn index(self) -> usize {
@@ -71,6 +79,8 @@ impl Module {
             Module::Nn => "nn",
             Module::Quantized => "quantized",
             Module::Gemm => "gemm",
+            Module::FlashAttn => "flash_attn",
+            Module::TurboQuant => "turbo_quant",
         }
     }
 
@@ -86,6 +96,8 @@ impl Module {
             Module::Nn => NN,
             Module::Quantized => QUANTIZED,
             Module::Gemm => GEMM,
+            Module::FlashAttn => FLASH_ATTN,
+            Module::TurboQuant => TURBO_QUANT,
         }
     }
 }

@@ -185,11 +185,11 @@ impl RocmStorage {
         &self.device
     }
 
-    fn esz(&self) -> usize {
+    pub(crate) fn esz(&self) -> usize {
         elem_bytes(self.dtype)
     }
 
-    fn ptr_at(&self, elem_offset: usize) -> *const u8 {
+    pub(crate) fn ptr_at(&self, elem_offset: usize) -> *const u8 {
         unsafe { self.buf.as_ptr().add(elem_offset * self.esz()) }
     }
 

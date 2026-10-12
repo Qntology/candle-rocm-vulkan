@@ -1,0 +1,596 @@
+//! Parameters, kernel planning and the CPU reference of the fused attention.
+//!
+//! Semantics follow FlashAttention (Dao-AILab): `softmax(scale · Q Kᵀ + bias) V` per head with
+//!
+//! * layouts `(batch, seq, heads, head_dim)` (dense) or `(total_tokens, heads, head_dim)` with
+//!   cumulative `u32` sequence offsets (varlen); any strides, the last dim contiguous;
+//! * grouped / multi-query attention when K/V have fewer heads (`hq % hkv == 0`);
+//! * masks aligned to the bottom right: query `i` sits at key position `i + lk - lq`; a key `j`
+//!   is visible when `pos - window_left <= j <= pos + window_right` (negative = unbounded,
+//!   `window_right = 0` is causal);
+//! * optional soft-capping `cap · tanh(s / cap)` and ALiBi `-slope · |pos - j|`;
+//! * FP8 (e4m3) K/V multiplied by `k_descale` / `v_descale`.
+//!
+//! Rows whose keys are all masked produce zeros.
+
+use super::config::{FlashAttnVersion, SplitKv};
+use crate::{bail, DType, Layout, Result, Shape};
+use rayon::prelude::*;
+
+/// Threads per workgroup of every attention kernel.
+pub const FA_THREADS: usize = 128;
+/// Largest head dim of the fused kernels.
+pub const FA_MAX_HEAD_DIM: usize = 256;
+/// Queries up to this length run the row (flash-decoding) kernel.
+pub const FA_DECODE_MAX_Q: usize = 4;
+/// Upper bound of the split-KV factor.
+pub const FA_MAX_SPLITS: usize = 64;
+
+/// Run time parameters of one attention call.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct FlashAttnParams {
+    pub softmax_scale: f32,
+    /// Soft-capping value, 0 disables it.
+    pub softcap: f32,
+    /// Left window (keys before the diagonal), negative = unbounded.
+    pub window_left: i32,
+    /// Right window (keys after the diagonal), negative = unbounded, 0 = causal.
+    pub window_right: i32,
+    /// Factor applied to FP8 keys (1 otherwise).
+    pub k_descale: f32,
+    /// Factor applied to FP8 values (1 otherwise).
+    pub v_descale: f32,
+    pub version: FlashAttnVersion,
+    pub split_kv: SplitKv,
+}
+
+impl FlashAttnParams {
+    pub fn new(softmax_scale: f32) -> Self {
+        Self {
+            softmax_scale,
+            softcap: 0.0,
+            window_left: -1,
+            window_right: -1,
+            k_descale: 1.0,
+            v_descale: 1.0,
+            version: FlashAttnVersion::V2,
+            split_kv: SplitKv::Auto,
+        }
+    }
+
+    /// Window from the `candle-flash-attn` convention (`None` = unbounded).
+    pub fn with_window(mut self, left: Option<usize>, right: Option<usize>) -> Self {
+        let cv = |w: Option<usize>| w.map(|v| v.min(i32::MAX as usize) as i32).unwrap_or(-1);
+        self.window_left = cv(left);
+        self.window_right = cv(right);
+        self
+    }
+
+    pub fn causal(&self) -> bool {
+        self.window_left < 0 && self.window_right == 0
+    }
+}
+
+/// Visible key range `[lo, hi)` of query `i` (bottom-right aligned masks).
+#[inline]
+pub fn key_range(i: usize, lq: usize, lk: usize, wl: i32, wr: i32) -> (usize, usize) {
+    let pos = i as i64 + lk as i64 - lq as i64;
+    let lo = if wl >= 0 { (pos - wl as i64).max(0) } else { 0 };
+    let hi = if wr >= 0 {
+        (pos + wr as i64 + 1).min(lk as i64)
+    } else {
+        lk as i64
+    };
+    let lo = lo.min(lk as i64);
+    (lo as usize, hi.max(lo) as usize)
+}
+
+/// Shapes and strides of one attention call, from the candle layouts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AttnGeometry {
+    pub batch: usize,
+    /// Query length (the maximum one for varlen).
+    pub lq: usize,
+    /// Key length (the maximum one for varlen).
+    pub lk: usize,
+    pub hq: usize,
+    pub hkv: usize,
+    pub d: usize,
+    /// `(batch, seq, head)` strides in elements; the batch stride is unused for varlen.
+    pub q_strides: [usize; 3],
+    pub k_strides: [usize; 3],
+    pub v_strides: [usize; 3],
+    pub q_offset: usize,
+    pub k_offset: usize,
+    pub v_offset: usize,
+    pub varlen: bool,
+    /// Output tokens: `batch * lq` (dense) or the total number of query tokens (varlen).
+    pub total_q: usize,
+}
+
+fn check_last_contiguous(name: &str, l: &Layout) -> Result<()> {
+    let s = l.stride();
+    let d = l.dims();
+    if *s.last().unwrap_or(&1) != 1 && *d.last().unwrap_or(&1) > 1 {
+        bail!("flash-attn: the last dim of {name} must be contiguous (strides {s:?})")
+    }
+    Ok(())
+}
+
+impl AttnGeometry {
+    /// `q: (b, lq, hq, d)`, `k`/`v: (b, lk, hkv, d)`.
+    pub fn dense(q_l: &Layout, k_l: &Layout, v_l: &Layout) -> Result<Self> {
+        let (b, lq, hq, d) = q_l.shape().dims4()?;
+        let (bk, lk, hkv, dk) = k_l.shape().dims4()?;
+        let (bv, lv, hv, dv) = v_l.shape().dims4()?;
+        if bk != b || bv != b {
+            bail!("flash-attn: batch mismatch q {b}, k {bk}, v {bv}")
+        }
+        if lv != lk || hv != hkv {
+            bail!(
+                "flash-attn: k {:?} and v {:?} shapes differ",
+                k_l.dims(),
+                v_l.dims()
+            )
+        }
+        Self::finish(
+            b,
+            lq,
+            lk,
+            hq,
+            hkv,
+            [d, dk, dv],
+            [q_l, k_l, v_l],
+            false,
+            b * lq,
+        )
+    }
+
+    /// `q: (total_q, hq, d)`, `k`/`v: (total_k, hkv, d)` with `batch` sequences.
+    pub fn varlen(
+        q_l: &Layout,
+        k_l: &Layout,
+        v_l: &Layout,
+        batch: usize,
+        max_q: usize,
+        max_k: usize,
+    ) -> Result<Self> {
+        let (tq, hq, d) = q_l.shape().dims3()?;
+        let (tk, hkv, dk) = k_l.shape().dims3()?;
+        let (tv, hv, dv) = v_l.shape().dims3()?;
+        if tv != tk || hv != hkv {
+            bail!(
+                "flash-attn varlen: k {:?} and v {:?} shapes differ",
+                k_l.dims(),
+                v_l.dims()
+            )
+        }
+        Self::finish(
+            batch,
+            max_q,
+            max_k,
+            hq,
+            hkv,
+            [d, dk, dv],
+            [q_l, k_l, v_l],
+            true,
+            tq,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn finish(
+        batch: usize,
+        lq: usize,
+        lk: usize,
+        hq: usize,
+        hkv: usize,
+        ds: [usize; 3],
+        ls: [&Layout; 3],
+        varlen: bool,
+        total_q: usize,
+    ) -> Result<Self> {
+        let d = ds[0];
+        if ds[1] != d || ds[2] != d {
+            bail!(
+                "flash-attn: head dims differ q {}, k {}, v {}",
+                ds[0],
+                ds[1],
+                ds[2]
+            )
+        }
+        if hkv == 0 || hq % hkv != 0 {
+            bail!("flash-attn: {hq} query heads are not a multiple of {hkv} kv heads")
+        }
+        for (n, l) in ["q", "k", "v"].iter().zip(ls.iter()) {
+            check_last_contiguous(n, l)?;
+        }
+        let st = |l: &Layout| -> [usize; 3] {
+            let s = l.stride();
+            if varlen {
+                [0, s[0], s[1]]
+            } else {
+                [s[0], s[1], s[2]]
+            }
+        };
+        Ok(Self {
+            batch,
+            lq,
+            lk,
+            hq,
+            hkv,
+            d,
+            q_strides: st(ls[0]),
+            k_strides: st(ls[1]),
+            v_strides: st(ls[2]),
+            q_offset: ls[0].start_offset(),
+            k_offset: ls[1].start_offset(),
+            v_offset: ls[2].start_offset(),
+            varlen,
+            total_q,
+        })
+    }
+
+    pub fn out_shape(&self) -> Shape {
+        if self.varlen {
+            Shape::from((self.total_q, self.hq, self.d))
+        } else {
+            Shape::from((self.batch, self.lq, self.hq, self.d))
+        }
+    }
+
+    /// Output rows (`total_q * hq`), each of `d` elements.
+    pub fn out_rows(&self) -> usize {
+        self.total_q * self.hq
+    }
+
+    /// Whether the fused kernels support this shape.
+    pub fn kernel_supported(&self) -> bool {
+        self.d > 0
+            && self.d <= FA_MAX_HEAD_DIM
+            && self.lq <= u32::MAX as usize / 2
+            && self.lk <= u32::MAX as usize / 2
+            && self.batch <= 65535
+            && (self.total_q * self.hq) < (1usize << 31)
+    }
+}
+
+/// Optional device inputs of a fused attention call on a backend storage type `S`.
+pub struct FaExtra<'a, S> {
+    /// f32 slopes: storage, start offset (elements) and batch stride (0 or `hq`).
+    pub alibi: Option<(&'a S, usize, usize)>,
+    /// Varlen `u32` cumulative sequence offsets of the queries and keys: storages and start
+    /// offsets.
+    pub cu_seqlens: Option<(&'a S, usize, &'a S, usize)>,
+}
+
+impl<S> Default for FaExtra<'_, S> {
+    fn default() -> Self {
+        Self {
+            alibi: None,
+            cu_seqlens: None,
+        }
+    }
+}
+
+/// Largest grid size along x of the GPU launches.
+pub const MAX_GRID_X: usize = (1 << 31) - 1;
+
+/// Grid and shared memory of a plan: `((x, y, z), shared bytes, splits)`.
+pub fn launch_dims(geom: &AttnGeometry, plan: &FaPlan) -> ((u32, u32, u32), usize, usize) {
+    match *plan {
+        FaPlan::Row { splits } => (
+            (
+                (geom.lq * geom.hq).clamp(1, MAX_GRID_X) as u32,
+                splits as u32,
+                geom.batch as u32,
+            ),
+            row_smem_bytes(geom.d),
+            splits,
+        ),
+        FaPlan::Tile { br, bc, .. } => (
+            (
+                geom.lq.div_ceil(br).clamp(1, MAX_GRID_X) as u32,
+                geom.hq as u32,
+                geom.batch as u32,
+            ),
+            tile_smem_bytes(geom.d, br, bc),
+            1,
+        ),
+    }
+}
+
+/// Kernel launch plan.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FaPlan {
+    /// One workgroup per query row (and key split); FA1 tier and decoding.
+    Row { splits: usize },
+    /// Q tiles of `br` rows, K/V tiles of `bc` keys, head dim instantiated up to `dmax`.
+    Tile {
+        version: FlashAttnVersion,
+        dmax: usize,
+        br: usize,
+        bc: usize,
+    },
+}
+
+/// `(dmax, br, bc)` of the tile kernel of a version for head dim `d`.
+pub fn tile_config(version: FlashAttnVersion, d: usize) -> (usize, usize, usize) {
+    let dmax = if d <= 64 {
+        64
+    } else if d <= 128 {
+        128
+    } else {
+        256
+    };
+    // V2 tiles fit in 32 KiB of shared memory (the Vulkan minimum of most desktop GPUs), V3
+    // tiles in 64 KiB (AMD LDS, NVIDIA with the dynamic shared memory opt-in).
+    let (br, bc) = match (version, dmax) {
+        (FlashAttnVersion::V3, 64) => (64, 64),
+        (FlashAttnVersion::V3, 128) => (32, 64),
+        (FlashAttnVersion::V3, _) => (16, 32),
+        (_, 64) => (32, 32),
+        (_, 128) => (16, 32),
+        (_, _) => (8, 16),
+    };
+    (dmax, br, bc)
+}
+
+/// Dynamic shared memory of the tile kernel for head dim `d` (Q and K/V rows padded by one
+/// float against bank conflicts).
+pub fn tile_smem_bytes(d: usize, br: usize, bc: usize) -> usize {
+    ((br + bc) * (d + 1) + br * bc) * 4
+}
+
+/// Dynamic shared memory of the row kernel for head dim `d`.
+pub fn row_smem_bytes(d: usize) -> usize {
+    (d + 2 * FA_THREADS) * 4
+}
+
+/// Number of key splits for the row kernel.
+pub fn split_count(geom: &AttnGeometry, policy: SplitKv, compute_units: usize) -> usize {
+    split_count_for(geom.out_rows(), geom.lk, policy, compute_units)
+}
+
+/// Number of key splits for `rows` query rows over `lk` keys: enough workgroups to fill the GPU
+/// twice, at least 256 keys per split.
+pub fn split_count_for(rows: usize, lk: usize, policy: SplitKv, compute_units: usize) -> usize {
+    match policy {
+        SplitKv::Off => 1,
+        SplitKv::Fixed(n) => n.clamp(1, FA_MAX_SPLITS),
+        SplitKv::Auto => {
+            let rows = rows.max(1);
+            let target = 2 * compute_units.max(1);
+            if rows >= target {
+                return 1;
+            }
+            let by_occupancy = target.div_ceil(rows);
+            let by_keys = lk.div_ceil(256).max(1);
+            by_occupancy.min(by_keys).clamp(1, FA_MAX_SPLITS)
+        }
+    }
+}
+
+/// Picks the kernel for a call. `max_smem` is the shared memory a workgroup may use.
+pub fn plan(
+    geom: &AttnGeometry,
+    params: &FlashAttnParams,
+    max_smem: usize,
+    compute_units: usize,
+) -> FaPlan {
+    let row = FaPlan::Row {
+        splits: split_count(geom, params.split_kv, compute_units),
+    };
+    if params.version == FlashAttnVersion::V1 || geom.lq <= FA_DECODE_MAX_Q {
+        return row;
+    }
+    for version in [params.version, FlashAttnVersion::V2] {
+        let (dmax, br, bc) = tile_config(version, geom.d);
+        if tile_smem_bytes(geom.d, br, bc) <= max_smem {
+            return FaPlan::Tile {
+                version,
+                dmax,
+                br,
+                bc,
+            };
+        }
+    }
+    row
+}
+
+/// Suffix of a kernel element type: `f32`, `f16`, `bf16`, `fp8`.
+pub fn dtype_suffix(dtype: DType) -> Option<&'static str> {
+    match dtype {
+        DType::F32 => Some("f32"),
+        DType::F16 => Some("f16"),
+        DType::BF16 => Some("bf16"),
+        DType::F8E4M3 => Some("fp8"),
+        _ => None,
+    }
+}
+
+/// Kernel name of a plan for query / KV dtypes.
+pub fn kernel_name(plan: &FaPlan, q: DType, kv: DType) -> Result<String> {
+    let (Some(qs), Some(ks)) = (dtype_suffix(q), dtype_suffix(kv)) else {
+        bail!("flash-attn: unsupported dtypes q {q:?}, kv {kv:?}")
+    };
+    if q == DType::F8E4M3 {
+        bail!("flash-attn: FP8 queries are not supported, use f32/f16/bf16 queries")
+    }
+    if kv != q && kv != DType::F8E4M3 {
+        bail!("flash-attn: k/v dtype {kv:?} must match q {q:?} or be F8E4M3")
+    }
+    Ok(match plan {
+        FaPlan::Row { .. } => format!("fa_row_{qs}_{ks}"),
+        FaPlan::Tile { version, dmax, .. } => {
+            let v = match version {
+                FlashAttnVersion::V3 => 3,
+                _ => 2,
+            };
+            format!("fa{v}_d{dmax}_{qs}_{ks}")
+        }
+    })
+}
+
+/// ALiBi slopes `(hq)` or `(batch, hq)`: returns the batch stride (0 or `hq`).
+pub fn alibi_batch_stride(shape: &Shape, batch: usize, hq: usize) -> Result<usize> {
+    match shape.dims() {
+        [h] if *h == hq => Ok(0),
+        [b, h] if *b == batch && *h == hq => Ok(hq),
+        d => bail!("flash-attn: alibi slopes must be ({hq}) or ({batch}, {hq}), got {d:?}"),
+    }
+}
+
+/// Inputs of [`reference_attention`]: contiguous f32 data, already decoded from FP8.
+pub struct ReferenceInputs<'a> {
+    /// `(b, lq, hq, d)` or `(total_q, hq, d)`.
+    pub q: &'a [f32],
+    /// `(b, lk, hkv, d)` or `(total_k, hkv, d)`.
+    pub k: &'a [f32],
+    pub v: &'a [f32],
+    pub batch: usize,
+    pub lq: usize,
+    pub lk: usize,
+    pub hq: usize,
+    pub hkv: usize,
+    pub d: usize,
+    pub cu_q: Option<&'a [u32]>,
+    pub cu_k: Option<&'a [u32]>,
+    /// Slopes and their batch stride.
+    pub alibi: Option<(&'a [f32], usize)>,
+}
+
+/// Multi-threaded CPU attention with the kernel semantics. Returns `(rows, d)` with
+/// `row = q_token * hq + head`.
+pub fn reference_attention(inp: &ReferenceInputs<'_>, p: &FlashAttnParams) -> Result<Vec<f32>> {
+    let (hq, hkv, d) = (inp.hq, inp.hkv, inp.d);
+    if hkv == 0 || hq % hkv != 0 {
+        bail!("flash-attn: {hq} query heads are not a multiple of {hkv} kv heads")
+    }
+    let total_q = match inp.cu_q {
+        Some(c) => *c.last().unwrap_or(&0) as usize,
+        None => inp.batch * inp.lq,
+    };
+    let mut out = vec![0f32; total_q * hq * d];
+    let group = hq / hkv;
+    out.par_chunks_mut(d).enumerate().for_each(|(row, o)| {
+        let tok = row / hq;
+        let h = row % hq;
+        let (b, i, lq_b, lk_b, k0) = match (inp.cu_q, inp.cu_k) {
+            (Some(cq), Some(ck)) => {
+                let b = cq.partition_point(|&c| c as usize <= tok).saturating_sub(1);
+                let lq_b = (cq[b + 1] - cq[b]) as usize;
+                let lk_b = (ck[b + 1] - ck[b]) as usize;
+                (b, tok - cq[b] as usize, lq_b, lk_b, ck[b] as usize)
+            }
+            _ => {
+                let b = tok / inp.lq;
+                (b, tok % inp.lq, inp.lq, inp.lk, b * inp.lk)
+            }
+        };
+        let hk = h / group;
+        let qv = &inp.q[(tok * hq + h) * d..(tok * hq + h + 1) * d];
+        let (lo, hi) = key_range(i, lq_b, lk_b, p.window_left, p.window_right);
+        if lo >= hi {
+            return;
+        }
+        let slope = inp.alibi.map(|(s, bs)| s[b * bs + h]).unwrap_or(0.0);
+        let pos = i as i64 + lk_b as i64 - lq_b as i64;
+        let mut s = Vec::with_capacity(hi - lo);
+        let mut m = f32::NEG_INFINITY;
+        for j in lo..hi {
+            let kv = &inp.k[((k0 + j) * hkv + hk) * d..((k0 + j) * hkv + hk + 1) * d];
+            let dot: f32 = qv.iter().zip(kv).map(|(a, b)| a * b).sum::<f32>() * p.k_descale;
+            let mut l = dot * p.softmax_scale;
+            if p.softcap > 0.0 {
+                l = p.softcap * (l / p.softcap).tanh();
+            }
+            if slope != 0.0 {
+                l -= slope * (pos - j as i64).abs() as f32;
+            }
+            m = m.max(l);
+            s.push(l);
+        }
+        let mut sum = 0f32;
+        for x in s.iter_mut() {
+            *x = (*x - m).exp();
+            sum += *x;
+        }
+        for (t, j) in (lo..hi).enumerate() {
+            let w = s[t] / sum * p.v_descale;
+            let vv = &inp.v[((k0 + j) * hkv + hk) * d..((k0 + j) * hkv + hk + 1) * d];
+            for (oe, ve) in o.iter_mut().zip(vv) {
+                *oe += w * ve;
+            }
+        }
+    });
+    Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ranges() {
+        // causal, square
+        assert_eq!(key_range(0, 4, 4, -1, 0), (0, 1));
+        assert_eq!(key_range(3, 4, 4, -1, 0), (0, 4));
+        // causal, decoding one token against 10 keys
+        assert_eq!(key_range(0, 1, 10, -1, 0), (0, 10));
+        // sliding window of 2 to the left
+        assert_eq!(key_range(5, 8, 8, 2, 0), (3, 6));
+        // no mask
+        assert_eq!(key_range(1, 3, 7, -1, -1), (0, 7));
+        // more queries than keys: the first rows see nothing
+        assert_eq!(key_range(0, 4, 2, -1, 0), (0, 0));
+    }
+
+    #[test]
+    fn plans() {
+        let geom = AttnGeometry {
+            batch: 1,
+            lq: 512,
+            lk: 512,
+            hq: 8,
+            hkv: 8,
+            d: 128,
+            q_strides: [0; 3],
+            k_strides: [0; 3],
+            v_strides: [0; 3],
+            q_offset: 0,
+            k_offset: 0,
+            v_offset: 0,
+            varlen: false,
+            total_q: 512,
+        };
+        let mut p = FlashAttnParams::new(1.0);
+        p.version = FlashAttnVersion::V3;
+        assert_eq!(
+            plan(&geom, &p, 64 * 1024, 60),
+            FaPlan::Tile {
+                version: FlashAttnVersion::V3,
+                dmax: 128,
+                br: 32,
+                bc: 64
+            }
+        );
+        // not enough shared memory for the V3 tiles: V2 tiles
+        assert!(matches!(
+            plan(&geom, &p, 32 * 1024, 60),
+            FaPlan::Tile {
+                version: FlashAttnVersion::V2,
+                ..
+            }
+        ));
+        let dec = AttnGeometry {
+            lq: 1,
+            total_q: 1,
+            lk: 8192,
+            ..geom
+        };
+        assert_eq!(plan(&dec, &p, 64 * 1024, 60), FaPlan::Row { splits: 15 });
+        p.split_kv = SplitKv::Off;
+        assert_eq!(plan(&dec, &p, 64 * 1024, 60), FaPlan::Row { splits: 1 });
+    }
+}

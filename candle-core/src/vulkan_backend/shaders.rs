@@ -370,7 +370,7 @@ impl ExecState {
 }
 
 /// Records and runs one dispatch of `k` over `buffers` and waits for it.
-fn run(
+pub(crate) fn run(
     dev: &VulkanDevice,
     k: &Kernel,
     buffers: &[&VulkanStorage],

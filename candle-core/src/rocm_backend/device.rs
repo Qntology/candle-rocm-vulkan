@@ -140,6 +140,7 @@ struct DeviceInner {
     rng: Mutex<RngState>,
     arch: Option<GpuArch>,
     gemm_backend: AtomicU8,
+    accel: OnceLock<crate::accel::AccelProfile>,
 }
 
 /// A ROCm (HIP) GPU device. Clones share the same underlying context, rocBLAS handle and
@@ -247,6 +248,7 @@ impl RocmDevice {
                 }),
                 arch,
                 gemm_backend: AtomicU8::new(gemm_backend.as_u8()),
+                accel: OnceLock::new(),
             }),
         })
     }
@@ -280,6 +282,18 @@ impl RocmDevice {
     /// GPU architectures the embedded kernels were compiled for.
     pub fn compiled_archs() -> &'static str {
         super::kernels::COMPILED_ARCHS
+    }
+
+    /// Fused attention / TurboQuant profile of this GPU (see `candle_core::accel::profile`).
+    pub fn accel_profile(&self) -> crate::accel::AccelProfile {
+        self.inner
+            .accel
+            .get_or_init(|| {
+                let arch = self.inner.arch.as_ref().map(|a| a.name.as_str()).unwrap_or("unknown");
+                let cus = self.inner.hip.compute_units().unwrap_or(0).max(1) as usize;
+                crate::accel::AccelProfile::rocm(arch, cus)
+            })
+            .clone()
     }
 
     /// GPU target of this device (e.g. `gfx1100`), when the runtime reports it.

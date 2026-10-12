@@ -282,6 +282,14 @@ impl CudaFunc {
     pub fn builder(&self) -> cudarc::driver::LaunchArgs<'_> {
         self.stream.launch_builder(&self.func)
     }
+
+    /// Allows `bytes` of dynamic shared memory (needed above 48 KiB).
+    pub fn set_max_dynamic_shared_memory(&self, bytes: usize) -> Result<()> {
+        use cudarc::driver::sys::CUfunction_attribute_enum as A;
+        self.func
+            .set_attribute(A::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, bytes as i32)
+            .w()
+    }
 }
 
 impl CudaDevice {
@@ -356,6 +364,46 @@ impl CudaDevice {
             func,
             stream: self.stream.clone(),
         })
+    }
+
+    /// Function `fn_name` of the run-time compiled module `module_name`; `ptx` produces the
+    /// module the first time it is needed.
+    pub fn get_or_compile_func(
+        &self,
+        fn_name: &str,
+        module_name: &str,
+        ptx: impl FnOnce() -> Result<cudarc::nvrtc::Ptx>,
+    ) -> Result<CudaFunc> {
+        {
+            let ms = self.custom_modules.read().unwrap();
+            if let Some(mdl) = ms.get(module_name) {
+                let func = mdl.load_function(fn_name).w()?;
+                return Ok(CudaFunc {
+                    func,
+                    stream: self.stream.clone(),
+                });
+            }
+        }
+        let ptx = ptx()?;
+        let mut ms = self.custom_modules.write().unwrap();
+        let mdl = match ms.get(module_name) {
+            Some(m) => m.clone(),
+            None => {
+                let m = self.context.load_module(ptx).w()?;
+                ms.insert(module_name.to_string(), m.clone());
+                m
+            }
+        };
+        let func = mdl.load_function(fn_name).w()?;
+        Ok(CudaFunc {
+            func,
+            stream: self.stream.clone(),
+        })
+    }
+
+    /// A device attribute (compute capability, SM count, shared memory, ...).
+    pub fn device_attribute(&self, attr: cudarc::driver::sys::CUdevice_attribute) -> Result<i32> {
+        self.context.attribute(attr).w()
     }
 
     pub fn get_or_load_func(&self, fn_name: &str, mdl: &kernels::Module) -> Result<CudaFunc> {

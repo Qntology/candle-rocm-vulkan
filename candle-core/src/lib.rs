@@ -47,6 +47,7 @@
 //! - [candle-transformers](https://docs.rs/candle-transformers/). Candle implementation of many published transformer models.
 //!
 
+pub mod accel;
 #[cfg(feature = "accelerate")]
 mod accelerate;
 pub mod backend;
