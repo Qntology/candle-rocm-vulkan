@@ -31,6 +31,39 @@ impl CudaDevice {
     pub fn id(&self) -> DeviceId {
         DeviceId(0)
     }
+    pub fn ordinal(&self) -> usize {
+        fail!()
+    }
+    pub fn synchronize_all(&self) -> Result<()> {
+        Err(Error::NotCompiledWithCudaSupport)
+    }
+    pub fn bind_to_thread(&self) -> Result<()> {
+        Err(Error::NotCompiledWithCudaSupport)
+    }
+    pub fn take_deferred_error(&self) -> Option<String> {
+        None
+    }
+    pub fn mem_info(&self) -> Result<(usize, usize)> {
+        Err(Error::NotCompiledWithCudaSupport)
+    }
+    pub fn pool_idle_bytes(&self) -> Result<usize> {
+        Err(Error::NotCompiledWithCudaSupport)
+    }
+    pub fn effective_free_memory(&self) -> Result<usize> {
+        Err(Error::NotCompiledWithCudaSupport)
+    }
+    pub fn trim_memory_pool(&self, _keep_bytes: usize) -> Result<()> {
+        Err(Error::NotCompiledWithCudaSupport)
+    }
+    pub fn set_memory_pool_release_threshold(&self, _bytes: u64) -> Result<()> {
+        Err(Error::NotCompiledWithCudaSupport)
+    }
+    pub fn workspace_bytes(&self) -> usize {
+        0
+    }
+    pub fn release_workspaces(&self) -> Result<()> {
+        Err(Error::NotCompiledWithCudaSupport)
+    }
 }
 
 impl crate::backend::BackendStorage for CudaStorage {

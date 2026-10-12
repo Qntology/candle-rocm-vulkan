@@ -1,14 +1,10 @@
 //! CUDA fast path for GGUF matmul with BF16/F32 activations.
 
-use std::collections::HashMap;
-use std::sync::{Mutex, OnceLock};
-
 use super::cuda::{QCudaStorage, MATRIX_ROW_PADDING};
 use super::GgmlDType;
-use crate::cuda_backend::DeviceId;
-use crate::{backend::BackendStorage, CudaDevice, CudaStorage, DType, Result, Shape};
+use crate::{backend::BackendStorage, CudaStorage, DType, Result, Shape};
 
-use cudarc::driver::{CudaSlice, DevicePtr};
+use cudarc::driver::DevicePtr;
 
 const Q8_1_BLOCK_SIZE: usize = 32;
 const Q8_1_TYPE_SIZE: usize = 36; // 2 halves (4 bytes) + QK8_1 int8 = 4 + 32 = 36
@@ -37,48 +33,9 @@ fn supports(dtype: GgmlDType) -> bool {
 
 const MMVQ_MAX_BATCH: usize = 8;
 
-// ---------------------------------------------------------------------------
-// Per-device Q8_1 scratch workspace (grows-only, reused across calls).
-// ---------------------------------------------------------------------------
-
-struct WorkspaceSlot {
-    slice: CudaSlice<u8>,
-    cap: usize,
-}
-
-static WORKSPACE: OnceLock<Mutex<HashMap<DeviceId, WorkspaceSlot>>> = OnceLock::new();
-
-/// Returns a device pointer to the scratch workspace, growing it if needed.
-/// The returned `MutexGuard` must be held alive until the kernels using
-/// this pointer have been launched (all launches are on the device's
-/// default stream, so they are serialised).
-fn workspace_ensure(
-    dev: &CudaDevice,
-    bytes: usize,
-) -> Result<(
-    u64,
-    std::sync::MutexGuard<'static, HashMap<DeviceId, WorkspaceSlot>>,
-)> {
-    let map = WORKSPACE.get_or_init(|| Mutex::new(HashMap::new()));
-    let device_key = dev.id();
-    let mut guard = map.lock().unwrap();
-    let slot = match guard.entry(device_key) {
-        std::collections::hash_map::Entry::Occupied(entry) => {
-            let slot = entry.into_mut();
-            if slot.cap < bytes {
-                slot.slice = unsafe { dev.alloc::<u8>(bytes)? };
-                slot.cap = bytes;
-            }
-            slot
-        }
-        std::collections::hash_map::Entry::Vacant(entry) => {
-            let slice = unsafe { dev.alloc::<u8>(bytes)? };
-            entry.insert(WorkspaceSlot { slice, cap: bytes })
-        }
-    };
-    let ptr = slot.slice.device_ptr(slot.slice.stream()).0;
-    Ok((ptr, guard))
-}
+/// Name of the Q8_1 activation scratch in `CudaDevice::workspaces` (owned by the device, freed by
+/// `CudaDevice::release_workspaces`, reallocated when a call needs more).
+const MMVQ_WORKSPACE: &str = "mmvq_q8_1";
 
 // ---------------------------------------------------------------------------
 // Launcher dispatch by weight dtype and output dtype.
@@ -203,7 +160,10 @@ pub fn try_fwd(
     let dst_row_bytes = num_blocks_per_row * Q8_1_TYPE_SIZE;
     let scratch_bytes = b_size * dst_row_bytes;
 
-    let (scratch_ptr, _workspace_guard) = workspace_ensure(dev, scratch_bytes)?;
+    // Held until the kernels are queued; the device stream orders them before any later reuse
+    // or free of the scratch.
+    let mut workspaces = dev.workspaces();
+    let scratch_ptr = workspaces.ensure(dev, MMVQ_WORKSPACE, scratch_bytes)?;
     let scratch_ptr = scratch_ptr as *mut std::ffi::c_void;
     let stride_col_y = (k_padded / Q8_1_BLOCK_SIZE) as i32;
     let stride_col_dst = nrows as i32;

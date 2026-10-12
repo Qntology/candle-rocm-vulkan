@@ -689,6 +689,14 @@ impl VulkanDevice {
         Ok(())
     }
 
+    /// Frees the scratch buffer of the GPU quantized matmuls once the queue is idle (it is
+    /// re-created on demand). The reuse pool is left alone, see [`Self::trim_memory_pool`].
+    pub fn release_workspaces(&self) -> Result<()> {
+        shaders::wait_idle(self)?;
+        self.inner.gpu.release_scratch(&self.inner.device);
+        Ok(())
+    }
+
     /// Whether the GPU kernels are in use (see [`shaders::native_enabled`]).
     pub fn native_kernels_enabled(&self) -> bool {
         shaders::native_enabled(self)

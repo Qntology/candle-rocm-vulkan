@@ -103,6 +103,9 @@ impl VulkanDevice {
     pub fn trim_memory_pool(&self) -> Result<()> {
         Err(Error::NotCompiledWithVulkanSupport)
     }
+    pub fn release_workspaces(&self) -> Result<()> {
+        Err(Error::NotCompiledWithVulkanSupport)
+    }
     pub fn native_kernels_enabled(&self) -> bool {
         false
     }
