@@ -89,9 +89,11 @@ AX_DEV void tq_quant_impl(const T *src, ax_u32 *out, const float *tab, ax_u64 ro
             am = fmaxf(am, fabsf(v));
         }
         // the norm is only used by the codebook modes, the row maximum by NVFP4 / FP8 (the mode
-        // is uniform over the workgroup)
+        // is uniform over the workgroup). The MX modes read y[] across lanes below, so they
+        // still need the barrier that the skipped reductions would have given.
         if (mode <= TQ_PROD) ss = ax_block_sum<TQ_NT>(ss, red);
-        if (mode == TQ_NVFP4 || mode == TQ_FP8) am = ax_block_max<TQ_NT>(am, red);
+        else if (mode == TQ_NVFP4 || mode == TQ_FP8) am = ax_block_max<TQ_NT>(am, red);
+        else AX_SYNC();
         float rsc0 = 1.0f;
         if (mode <= TQ_PROD) {
             const float norm = sqrtf(ss);

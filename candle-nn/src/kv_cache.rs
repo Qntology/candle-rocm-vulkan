@@ -55,23 +55,40 @@ impl Cache {
         self.all_data = None;
     }
 
+    /// Capacity after growing to hold `need` positions: the current one plus half of it (at
+    /// least `grow_by`) per step.
+    fn grown_capacity(&self, need: usize) -> usize {
+        let mut cap = self.max_seq_len;
+        while cap < need {
+            cap += self.grow_by.max(cap / 2).max(1);
+        }
+        cap
+    }
+
     pub fn append(&mut self, src: &Tensor) -> Result<()> {
         let seq_len = src.dim(self.dim)?;
         // This doesn't seem very idiomatic but because the creation can fail, it's tricky to use
         // self.all_data.get_or_insert_with.
         if self.all_data.is_none() {
+            self.max_seq_len = self.grown_capacity(seq_len);
             let mut shape = src.dims().to_vec();
             shape[self.dim] = self.max_seq_len;
             let ad = Tensor::zeros(shape, src.dtype(), src.device())?;
             self.all_data = Some(ad)
         };
+        let need = self.current_seq_len + seq_len;
+        let cap = self.grown_capacity(need);
         let ad = self.all_data.as_mut().unwrap();
-        while self.current_seq_len + seq_len > self.max_seq_len {
+        if cap > self.max_seq_len {
+            // Geometric growth (by half the capacity, at least `grow_by`): one new buffer and one
+            // copy of the old contents, instead of a zero chunk plus a concatenation per
+            // `grow_by` step (which briefly needed old + chunk + new).
             let mut shape = src.dims().to_vec();
-            shape[self.dim] = self.grow_by;
+            shape[self.dim] = cap;
             let next_ad = Tensor::zeros(shape, src.dtype(), src.device())?;
-            *ad = Tensor::cat(&[&*ad, &next_ad], self.dim)?;
-            self.max_seq_len += self.grow_by;
+            next_ad.slice_set(&*ad, self.dim, 0)?;
+            *ad = next_ad;
+            self.max_seq_len = cap;
         }
         ad.slice_set(src, self.dim, self.current_seq_len)?;
         self.current_seq_len += seq_len;

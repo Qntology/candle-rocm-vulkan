@@ -20,7 +20,10 @@
 //! format of the GPU when it has one (NVFP4 on Blackwell, MXFP4 on MI350, ...), TurboQuant
 //! codebooks otherwise.
 
-use crate::flash_attn::{flash_attn_bhsd, FlashAttnConfig};
+use crate::flash_attn::{cat_blocks, check_blocks, flash_attn_bhsd, FlashAttnConfig};
+#[cfg(any(feature = "cuda", feature = "rocm"))]
+use crate::flash_attn::paged_block_layout;
+pub use crate::flash_attn::KvBlockRef;
 use crate::kv_cache::Cache;
 use candle::accel::attention as att;
 use candle::accel::formats::{row_layout, RowLayout};
@@ -29,7 +32,7 @@ use candle::accel::{self, RotationKind, TurboQuantOptions};
 use candle::backend::BackendStorage;
 use candle::{bail, CpuStorage, DType, Device, Layout, Result, Shape, Tensor};
 use rayon::prelude::*;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 pub use candle::accel::QuantFormat;
 
@@ -63,6 +66,9 @@ pub struct TurboQuantizer {
     qjl: Option<(Tensor, Tensor)>,
     /// Codebook table (32 f32).
     tab: Tensor,
+    /// Table of the attention kernels (this table, then the value quantizer's), cached per value
+    /// quantizer table.
+    pair_tab: Arc<Mutex<Option<(candle::TensorId, Tensor)>>>,
     device: Device,
 }
 
@@ -125,6 +131,7 @@ impl TurboQuantizer {
             rot,
             qjl,
             tab,
+            pair_tab: Arc::new(Mutex::new(None)),
             device: device.clone(),
         })
     }
@@ -835,6 +842,18 @@ impl TurboKvCache {
         })
     }
 
+    /// [`Self::with_options`] sized for `capacity` positions: the K/V buffers are allocated once
+    /// with that many rows at the first append (e.g. the planned prompt + generation length), so
+    /// the cache does not grow while it stays within it (past it, it grows geometrically).
+    pub fn with_capacity(
+        o: &TurboQuantOptions,
+        dim: usize,
+        capacity: usize,
+        device: &Device,
+    ) -> Result<Self> {
+        Self::with_options(o, dim, capacity, device)
+    }
+
     /// A compressed cache with explicit formats.
     pub fn with_formats(
         key: QuantFormat,
@@ -1050,32 +1069,91 @@ pub fn attention_packed(
     flash_attn_bhsd(q, &k, &v, cfg)
 }
 
-/// The fused kernel over `kd` / `vd` (`(b, hkv, capacity, words)`, contiguous, same capacity),
-/// `Ok(None)` when it does not apply (CPU, kernels off, shape out of range).
-fn fused_attention_rows(
+/// Attention of `q: (batch, q_heads, seq_q, head_dim)` over packed rows that live in paged
+/// cache blocks (`(batch, kv_heads, capacity, words)` u32 tensors packed by `kq` / `vq`, the
+/// first `rows` positions of each block valid), without concatenating them: on CUDA / ROCm one
+/// `tq_attnp*` launch reads the blocks through a block table (up to 128 blocks, any query
+/// length). Other devices, blocks on another device, more blocks or other layouts concatenate
+/// the valid rows and run [`attention_packed`], which gives the same result up to the
+/// summation order. Masks, soft-capping and ALiBi of `cfg` are bottom-right aligned over the
+/// concatenated keys. Output in `q`'s dtype, `(batch, q_heads, seq_q, head_dim)`.
+pub fn attention_packed_blocks(
     q: &Tensor,
-    kd: &Tensor,
-    vd: &Tensor,
-    lk: usize,
+    blocks: &[KvBlockRef<'_>],
     kq: &TurboQuantizer,
     vq: &TurboQuantizer,
     cfg: &FlashAttnConfig,
-) -> Result<Option<Tensor>> {
-    if q.device().is_cpu() || !accel::config().turbo_quant_kernels_allowed(q.device()) {
+) -> Result<Tensor> {
+    let (b, _, _, d) = q.dims4()?;
+    let (hkv, lk) = check_blocks(blocks, b, "turbo-quant blocks")?;
+    let (kw, vw) = (blocks[0].k.dim(3)?, blocks[0].v.dim(3)?);
+    if blocks[0].k.dtype() != DType::U32 || blocks[0].v.dtype() != DType::U32 {
+        bail!("turbo-quant blocks: packed rows must be u32")
+    }
+    if kw != kq.row_words() || vw != vq.row_words() || d != kq.dim() || d != vq.dim() {
+        bail!(
+            "turbo-quant blocks: rows of {kw} / {vw} words and head dim {d} do not match the quantizers ({} / {} words, dim {})",
+            kq.row_words(),
+            vq.row_words(),
+            kq.dim()
+        )
+    }
+    let conf = accel::config();
+    if cfg.fused.unwrap_or(conf.turbo_quant.fused_attention) {
+        match paged_attention_rows(q, blocks, hkv, lk, kq, vq, cfg, &conf) {
+            Ok(Some(o)) => return Ok(o),
+            Ok(None) => {}
+            Err(e) if cfg.strict => return Err(e),
+            Err(e) => warn_cpu_fallback("paged attention", &e),
+        }
+    }
+    let (k_rows, v_rows) = cat_blocks(blocks, q.device())?;
+    attention_packed(q, &k_rows, &v_rows, lk, kq, vq, cfg)
+}
+
+/// Kernel inputs of a `tq_attn*` call shared by the dense and the paged paths.
+struct TqPrep {
+    /// Rotated queries (followed by `S·q` for prod keys), contiguous `(b, hq, lq, w)` f32.
+    qx: Tensor,
+    args: TqAttnArgs,
+    tab: Tensor,
+    alibi: Option<Tensor>,
+}
+
+/// The combined 64-float table (key centroids, value centroids) of a quantizer pair, built
+/// once per value quantizer and kept by the key quantizer.
+fn pair_tab(kq: &TurboQuantizer, vq: &TurboQuantizer) -> Result<Tensor> {
+    let mut g = kq.pair_tab.lock().unwrap_or_else(|p| p.into_inner());
+    if let Some((id, t)) = g.as_ref() {
+        if *id == vq.tab.id() {
+            return Ok(t.clone());
+        }
+    }
+    let t = Tensor::cat(&[&kq.tab, &vq.tab], 0)?;
+    *g = Some((vq.tab.id(), t.clone()));
+    Ok(t)
+}
+
+/// Queries, arguments and tables of a fused call over `lk` keys whose K / V rows have the
+/// `(batch, head, row)` word strides `k_strides` / `v_strides`; `Ok(None)` when the fused
+/// kernels do not apply (CPU, kernels off, shape out of range).
+#[allow(clippy::too_many_arguments)]
+fn tq_prepare(
+    q: &Tensor,
+    hkv: usize,
+    lk: usize,
+    k_strides: [usize; 3],
+    v_strides: [usize; 3],
+    kq: &TurboQuantizer,
+    vq: &TurboQuantizer,
+    cfg: &FlashAttnConfig,
+    conf: &accel::AccelConfig,
+) -> Result<Option<TqPrep>> {
+    if q.device().is_cpu() || !conf.turbo_quant_kernels_allowed(q.device()) {
         return Ok(None);
     }
     let (b, hq, lq, d) = q.dims4()?;
-    let (bk, hkv, cap, kw) = kd.dims4()?;
-    let vw = vd.dim(3)?;
-    if bk != b
-        || d != kq.dim()
-        || hkv == 0
-        || hq % hkv != 0
-        || d > att::FA_MAX_HEAD_DIM
-        || vd.dim(2)? != cap
-        || lk > cap
-        || lk == 0
-    {
+    if d != kq.dim() || hkv == 0 || hq % hkv != 0 || d > att::FA_MAX_HEAD_DIM || lk == 0 {
         return Ok(None);
     }
     // rotated queries, plus S·q for prod keys
@@ -1086,16 +1164,7 @@ fn fused_attention_rows(
     }
     .contiguous()?;
     let w = qx.dim(3)?;
-    let conf = accel::config();
-    let cus = accel::profile(q.device()).compute_units;
-    let (wl, wr) = (
-        cfg.window_size_left
-            .map(|v| v.min(i32::MAX as usize) as i32)
-            .unwrap_or(-1),
-        cfg.window_size_right
-            .map(|v| v.min(i32::MAX as usize) as i32)
-            .unwrap_or(-1),
-    );
+    let win = |v: Option<usize>| v.map(|v| v.min(i32::MAX as usize) as i32).unwrap_or(-1);
     let alibi = match &cfg.alibi_slopes {
         Some(t) => Some(
             t.to_device(q.device())?
@@ -1117,27 +1186,194 @@ fn fused_attention_rows(
         d,
         q_strides: [hq * lq * w, lq * w, w],
         q_offset: 0,
-        k_strides: [hkv * cap * kw, cap * kw, kw],
+        k_strides,
         k_offset: 0,
-        v_strides: [hkv * cap * vw, cap * vw, vw],
+        v_strides,
         v_offset: 0,
         k: TqSide::new(kq.format(), d)?,
         v: TqSide::new(vq.format(), d)?,
         scale: cfg.softmax_scale,
         softcap: cfg.softcap.unwrap_or(0.0),
-        window_left: wl,
-        window_right: wr,
+        window_left: win(cfg.window_size_left),
+        window_right: win(cfg.window_size_right),
         splits: att::split_count_for(
             b * hq * lq,
             lk,
             cfg.split_kv.unwrap_or(conf.flash_attn.split_kv),
-            cus,
+            accel::profile(q.device()).compute_units,
         ),
         alibi_bstride,
     };
-    let tab = Tensor::cat(&[&kq.tab, &vq.tab], 0)?;
-    let o = qx.apply_op3_no_bwd(kd, vd, &TqAttn { args, tab, alibi })?;
+    Ok(Some(TqPrep {
+        qx,
+        args,
+        tab: pair_tab(kq, vq)?,
+        alibi,
+    }))
+}
+
+/// The fused kernel over `kd` / `vd` (`(b, hkv, capacity, words)`, contiguous, same capacity),
+/// `Ok(None)` when it does not apply (CPU, kernels off, shape out of range).
+fn fused_attention_rows(
+    q: &Tensor,
+    kd: &Tensor,
+    vd: &Tensor,
+    lk: usize,
+    kq: &TurboQuantizer,
+    vq: &TurboQuantizer,
+    cfg: &FlashAttnConfig,
+) -> Result<Option<Tensor>> {
+    let (b, _, _, _) = q.dims4()?;
+    let (bk, hkv, cap, kw) = kd.dims4()?;
+    let vw = vd.dim(3)?;
+    if bk != b || vd.dim(2)? != cap || lk > cap {
+        return Ok(None);
+    }
+    let conf = accel::config();
+    let Some(p) = tq_prepare(
+        q,
+        hkv,
+        lk,
+        [hkv * cap * kw, cap * kw, kw],
+        [hkv * cap * vw, cap * vw, vw],
+        kq,
+        vq,
+        cfg,
+        &conf,
+    )?
+    else {
+        return Ok(None);
+    };
+    let o = p.qx.apply_op3_no_bwd(
+        kd,
+        vd,
+        &TqAttn {
+            args: p.args,
+            tab: p.tab,
+            alibi: p.alibi,
+        },
+    )?;
     Ok(Some(vq.unrotate(&o)?.to_dtype(q.dtype())?))
+}
+
+/// The paged kernel over the blocks (`tq_attnp*`), `Ok(None)` when it does not apply.
+#[allow(clippy::too_many_arguments)]
+#[cfg_attr(
+    not(any(feature = "cuda", feature = "rocm")),
+    allow(unused_variables, clippy::needless_return)
+)]
+fn paged_attention_rows(
+    q: &Tensor,
+    blocks: &[KvBlockRef<'_>],
+    hkv: usize,
+    lk: usize,
+    kq: &TurboQuantizer,
+    vq: &TurboQuantizer,
+    cfg: &FlashAttnConfig,
+    conf: &accel::AccelConfig,
+) -> Result<Option<Tensor>> {
+    #[cfg(not(any(feature = "cuda", feature = "rocm")))]
+    return Ok(None);
+    #[cfg(any(feature = "cuda", feature = "rocm"))]
+    {
+        use att::PagedKv;
+        if !matches!(q.device(), Device::Cuda(_) | Device::Rocm(_))
+            || blocks.len() > att::FA_MAX_PAGES
+            || blocks.iter().any(|x| {
+                !x.k.device().same_device(q.device()) || !x.v.device().same_device(q.device())
+            })
+        {
+            return Ok(None);
+        }
+        // (rows, k offset, k capacity, v offset, v capacity) of the non-empty blocks
+        let mut place = Vec::with_capacity(blocks.len());
+        let (mut k_row, mut v_row) = (None, None);
+        for blk in blocks.iter().filter(|x| x.rows > 0) {
+            let (Some((ko, kr, kc)), Some((vo, vr, vc))) = (
+                paged_block_layout(blk.k, blk.rows)?,
+                paged_block_layout(blk.v, blk.rows)?,
+            ) else {
+                return Ok(None);
+            };
+            if *k_row.get_or_insert(kr) != kr || *v_row.get_or_insert(vr) != vr {
+                return Ok(None);
+            }
+            place.push((blk.rows, ko, kc, vo, vc));
+        }
+        let (Some(k_row), Some(v_row)) = (k_row, v_row) else {
+            return Ok(None);
+        };
+        let Some(p) = tq_prepare(
+            q,
+            hkv,
+            lk,
+            [0, 0, k_row],
+            [0, 0, v_row],
+            kq,
+            vq,
+            cfg,
+            conf,
+        )?
+        else {
+            return Ok(None);
+        };
+        let (qg, ql) = p.qx.storage_and_layout();
+        let mut a = p.args;
+        a.q_offset = contiguous_offset(ql, "the queries")?;
+        let guards: Vec<_> = blocks
+            .iter()
+            .filter(|x| x.rows > 0)
+            .map(|blk| (blk.k.storage_and_layout().0, blk.v.storage_and_layout().0))
+            .collect();
+        let alibi_g = p.alibi.as_ref().map(|t| t.storage_and_layout());
+        macro_rules! launch {
+            ($variant:ident, $qs:ident) => {{
+                let mut pk = Vec::with_capacity(place.len());
+                for (&(rows, ko, kc, vo, vc), (kg, vg)) in place.iter().zip(guards.iter()) {
+                    let (candle::Storage::$variant(ks), candle::Storage::$variant(vs)) =
+                        (&**kg, &**vg)
+                    else {
+                        bail!("turbo-quant blocks: a block is on another device")
+                    };
+                    pk.push(PagedKv {
+                        k: ks,
+                        k_offset: ko,
+                        v: vs,
+                        v_offset: vo,
+                        rows,
+                        k_cap: kc,
+                        v_cap: vc,
+                    });
+                }
+                let alibi = match alibi_g.as_ref() {
+                    Some((g, l)) => {
+                        let candle::Storage::$variant(s) = &**g else {
+                            bail!("turbo-quant: the alibi slopes are on another device")
+                        };
+                        Some((s, l.start_offset()))
+                    }
+                    None => None,
+                };
+                let out = with_tab!(p.tab, $variant, |t, to| $qs
+                    .tq_attention_paged(&pk, t, to, alibi, &a))?;
+                candle::Storage::$variant(out)
+            }};
+        }
+        let out = match &*qg {
+            #[cfg(feature = "cuda")]
+            candle::Storage::Cuda(qs) => launch!(Cuda, qs),
+            #[cfg(feature = "rocm")]
+            candle::Storage::Rocm(qs) => launch!(Rocm, qs),
+            _ => return Ok(None),
+        };
+        let o = Tensor::from_storage(
+            out,
+            (a.b, a.hq, a.lq, a.d),
+            candle::op::BackpropOp::none(),
+            false,
+        );
+        Ok(Some(vq.unrotate(&o)?.to_dtype(q.dtype())?))
+    }
 }
 
 #[cfg(test)]

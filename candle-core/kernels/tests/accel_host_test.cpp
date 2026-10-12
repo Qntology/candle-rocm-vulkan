@@ -101,6 +101,28 @@ static float to_f32(float v) { return v; }
 static float to_f32(ax_f16 v) { return ax_h2f(v.b); }
 static float to_f32(ax_bf16 v) { return ax_bf2f(v.b); }
 
+// Block table from pg_off_k / pg_off_v (u64 element or word offsets into the k / v arrays),
+// pg_rows, pg_cap_k and pg_cap_v (u32).
+static ax_pages make_pages(const Arrays &in, ax_u64 kbase, ax_u64 vbase, size_t esz) {
+    const Arr &rows = need(in, "pg_rows");
+    const ax_u64 *ok = need(in, "pg_off_k").as<ax_u64>();
+    const ax_u64 *ov = need(in, "pg_off_v").as<ax_u64>();
+    const ax_u32 *ck = need(in, "pg_cap_k").as<ax_u32>();
+    const ax_u32 *cv = need(in, "pg_cap_v").as<ax_u32>();
+    ax_pages pg;
+    memset(&pg, 0, sizeof(pg));
+    pg.n = (ax_u32)rows.len<ax_u32>();
+    if (pg.n > AX_MAX_PAGES) throw std::runtime_error("too many pages");
+    for (ax_u32 i = 0; i < pg.n; ++i) {
+        pg.k[i] = kbase + ok[i] * esz;
+        pg.v[i] = vbase + ov[i] * esz;
+        pg.rows[i] = rows.as<ax_u32>()[i];
+        pg.k_cap[i] = ck[i];
+        pg.v_cap[i] = cv[i];
+    }
+    return pg;
+}
+
 // ---------------------------------------------------------------------------
 // flash attention
 // ---------------------------------------------------------------------------
@@ -143,14 +165,26 @@ template <typename TQ, typename TKV> static Arrays op_fa(const Arrays &in) {
     const ax_u32 alibi_bs = cfg[6];
     if (kind == 0) {
         std::vector<float> po(splits > 1 ? splits * rows * D : 1), pl(splits > 1 ? splits * rows : 1);
-        candle_emu::launch(gx, splits, B, FA_NT, (D + 2 * FA_NT) * 4, [&] {
-            fa_row_impl<TQ, TKV>(q.data(), k.data(), v.data(), o.data(), po.data(), pl.data(), alibi, cu_q,
-                                 cu_k, Lq, Lk, Hq, Hkv, D, st[0], st[1], st[2], st[3], st[4], st[5], st[6],
-                                 st[7], st[8], fp[0], fp[1], ip[0], ip[1], fp[2], fp[3], splits, alibi_bs,
-                                 varlen, rows);
-        });
+        if (opt(in, "pg_rows")) {
+            // paged row kernel: the blocks live inside k / v at the given element offsets
+            const ax_pages pg = make_pages(in, reinterpret_cast<ax_u64>(k.data()),
+                                           reinterpret_cast<ax_u64>(v.data()), sizeof(TKV));
+            candle_emu::launch(gx, splits, B, FA_NT, (D + 2 * FA_NT) * 4, [&] {
+                fa_rowp_impl<TQ, TKV>(q.data(), nullptr, nullptr, o.data(), po.data(), pl.data(), alibi,
+                                      nullptr, nullptr, Lq, Lk, Hq, Hkv, D, st[0], st[1], st[2], st[3], st[4],
+                                      st[5], st[6], st[7], st[8], fp[0], fp[1], ip[0], ip[1], fp[2], fp[3],
+                                      splits, alibi_bs, 0, rows, pg);
+            });
+        } else {
+            candle_emu::launch(gx, splits, B, FA_NT, (D + 2 * FA_NT) * 4, [&] {
+                fa_row_impl<TQ, TKV>(q.data(), k.data(), v.data(), o.data(), po.data(), pl.data(), alibi, cu_q,
+                                     cu_k, Lq, Lk, Hq, Hkv, D, st[0], st[1], st[2], st[3], st[4], st[5], st[6],
+                                     st[7], st[8], fp[0], fp[1], ip[0], ip[1], fp[2], fp[3], splits, alibi_bs,
+                                     varlen, rows);
+            });
+        }
         if (splits > 1) {
-            candle_emu::launch((unsigned)std::min<ax_u64>(rows, 7), 1, 1, FA_NT, 0, [&] {
+            candle_emu::launch((unsigned)std::min<ax_u64>(rows, 7), 1, 1, FA_NT, splits * 4, [&] {
                 fa_combine_impl<TQ>(po.data(), pl.data(), o.data(), rows, D, splits);
             });
         }
@@ -177,8 +211,11 @@ template <typename TQ, typename TKV> static Arrays op_fa(const Arrays &in) {
 }
 
 static Arrays op_fa_dispatch(const Arrays &in) {
-    const ax_u32 *dt = need(in, "dtypes").as<ax_u32>(); // q: 0 f32 1 f16 2 bf16; kv: 0 same 1 fp8
+    // q: 0 f32 1 f16 2 bf16; kv: 0 same 1 fp8 (2 f16 / 3 bf16 with f32 queries)
+    const ax_u32 *dt = need(in, "dtypes").as<ax_u32>();
     const ax_u32 qd = dt[0], kv8 = dt[1];
+    if (qd == 0 && kv8 == 2) return op_fa<float, ax_f16>(in);
+    if (qd == 0 && kv8 == 3) return op_fa<float, ax_bf16>(in);
     if (qd == 0) return kv8 ? op_fa<float, ax_fp8>(in) : op_fa<float, float>(in);
     if (qd == 1) return kv8 ? op_fa<ax_f16, ax_fp8>(in) : op_fa<ax_f16, ax_f16>(in);
     return kv8 ? op_fa<ax_bf16, ax_fp8>(in) : op_fa<ax_bf16, ax_bf16>(in);
@@ -251,8 +288,9 @@ static Arrays op_tq_dequant(const Arrays &in) {
     return res;
 }
 
-// u: B Lq Lk Hq Hkv D k_mode k_cb k_cw k_rsc v_mode v_cb v_cw v_rsc splits gx alibi_bs
+// u: B Lq Lk Hq Hkv D k_mode k_cb k_cw k_rsc v_mode v_cb v_cw v_rsc splits gx alibi_bs fp8
 // s: q_sb q_sh q_ss k_sb k_sh k_ss v_sb v_sh v_ss ; f: scale softcap ; i: wl wr
+// Optional block table pg_* (word offsets into kd / vd): the paged kernels.
 static Arrays op_tq_attn(const Arrays &in) {
     const ax_u32 *u = need(in, "uparams").as<ax_u32>();
     const ax_u64 *s = need(in, "strides").as<ax_u64>();
@@ -263,18 +301,73 @@ static Arrays op_tq_attn(const Arrays &in) {
     std::vector<float> o(rows * D), po(splits > 1 ? splits * rows * D : 1), pl(splits > 1 ? splits * rows : 1);
     const Arr *al = opt(in, "alibi");
     const size_t smem = (2 * D + 2 * TQ_NT + 32) * 4;
+    const ax_u32 *kd = need(in, "kd").as<ax_u32>(), *vd = need(in, "vd").as<ax_u32>();
+    const float *qx = need(in, "q").as<float>(), *tab = need(in, "tab").as<float>();
+    const float *alibi = al ? al->as<float>() : nullptr;
+    // the FP8 specialization (both sides FP8 rows)
+    const bool fp8 = need(in, "uparams").len<ax_u32>() > 17 && u[17] != 0;
+    const bool paged = opt(in, "pg_rows") != nullptr;
+    ax_pages pg;
+    memset(&pg, 0, sizeof(pg));
+    if (paged) pg = make_pages(in, reinterpret_cast<ax_u64>(kd), reinterpret_cast<ax_u64>(vd), 4);
     candle_emu::launch(u[15], splits, B, TQ_NT, smem, [&] {
-        tq_attn_impl(need(in, "q").as<float>(), need(in, "kd").as<ax_u32>(), need(in, "vd").as<ax_u32>(),
-                     need(in, "tab").as<float>(), al ? al->as<float>() : nullptr, o.data(), po.data(), pl.data(),
-                     Lq, Lk, Hq, Hkv, D, s[0], s[1], s[2], s[3], s[4], s[5], s[6], s[7], s[8], u[6], u[7], u[8],
-                     u[9], u[10],
-                     u[11], u[12], u[13], f[0], f[1], ip[0], ip[1], splits, u[16], rows);
+        const ax_u32 *k = paged ? nullptr : kd, *v = paged ? nullptr : vd;
+#define TQ_HOST_ARGS                                                                               \
+    qx, k, v, tab, alibi, o.data(), po.data(), pl.data(), Lq, Lk, Hq, Hkv, D, s[0], s[1], s[2], s[3], \
+        s[4], s[5], s[6], s[7], s[8], u[6], u[7], u[8], u[9], u[10], u[11], u[12], u[13], f[0], f[1],  \
+        ip[0], ip[1], splits, u[16], rows
+        if (paged && fp8) tq_attnp_fp8_impl(TQ_HOST_ARGS, pg);
+        else if (paged) tq_attnp_impl(TQ_HOST_ARGS, pg);
+        else if (fp8) tq_attn_fp8_impl(TQ_HOST_ARGS);
+        else tq_attn_impl(TQ_HOST_ARGS);
+#undef TQ_HOST_ARGS
     });
     if (splits > 1) {
-        candle_emu::launch(5, 1, 1, TQ_NT, 0, [&] { tq_combine_impl(po.data(), pl.data(), o.data(), rows, D, splits); });
+        candle_emu::launch(5, 1, 1, TQ_NT, splits * 4,
+                           [&] { tq_combine_impl(po.data(), pl.data(), o.data(), rows, D, splits); });
     }
     Arrays res;
     res["o"] = make_arr(o, 0);
+    return res;
+}
+
+// fa_combine before the per-row weights (one expf per element and split), for the check that
+// the per-row weights give the same bits.
+static void fa_combine_legacy(const float *part_o, const float *part_lse, float *o, ax_u64 rows, ax_u32 D,
+                              ax_u32 n_splits) {
+    for (ax_u64 row = 0; row < rows; ++row) {
+        float mx = -AX_INF;
+        for (ax_u32 s = 0; s < n_splits; ++s) mx = fmaxf(mx, part_lse[(ax_u64)s * rows + row]);
+        float wsum = 0.0f;
+        for (ax_u32 s = 0; s < n_splits; ++s) {
+            const float e = part_lse[(ax_u64)s * rows + row];
+            wsum += e == -AX_INF ? 0.0f : expf(e - mx);
+        }
+        for (ax_u32 d = 0; d < D; ++d) {
+            float acc = 0.0f;
+            for (ax_u32 s = 0; s < n_splits; ++s) {
+                const float e = part_lse[(ax_u64)s * rows + row];
+                if (e != -AX_INF) acc += expf(e - mx) * part_o[((ax_u64)s * rows + row) * D + d];
+            }
+            o[row * D + d] = wsum > 0.0f ? acc / wsum : 0.0f;
+        }
+    }
+}
+
+// p: rows D splits ; part_o, part_lse -> o (fa_combine), t (tq_combine), legacy
+static Arrays op_combine(const Arrays &in) {
+    const ax_u32 *p = need(in, "params").as<ax_u32>();
+    const ax_u64 rows = p[0];
+    const ax_u32 D = p[1], splits = p[2];
+    const float *po = need(in, "part_o").as<float>(), *pl = need(in, "part_lse").as<float>();
+    std::vector<float> o(rows * D), t(rows * D), legacy(rows * D);
+    candle_emu::launch(3, 1, 1, FA_NT, splits * 4, [&] { fa_combine_impl<float>(po, pl, o.data(), rows, D, splits); });
+    candle_emu::launch(2, 1, 1, TQ_NT, splits * 4, [&] { tq_combine_impl(po, pl, t.data(), rows, D, splits); });
+    fa_combine_legacy(po, pl, legacy.data(), rows, D, splits);
+    Arrays res;
+    res["o"] = make_arr(o, 0);
+    res["t"] = make_arr(t, 0);
+    res["legacy"] = make_arr(legacy, 0);
     return res;
 }
 
@@ -293,6 +386,7 @@ int main(int argc, char **argv) {
         else if (op == "tq_signs") out = op_tq_signs(in);
         else if (op == "tq_dequant") out = op_tq_dequant(in);
         else if (op == "tq_attn") out = op_tq_attn(in);
+        else if (op == "combine") out = op_combine(in);
         else throw std::runtime_error("unknown op " + op);
         write_arrays(argv[2], out);
     } catch (const std::exception &e) {

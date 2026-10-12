@@ -174,6 +174,10 @@ struct FaCase {
     gx: u32,
     /// q stored as (b, h, s, d) and passed through strides
     q_bhsd: bool,
+    /// exact 16-bit K/V with f32 queries: 2 f16, 3 bf16 (0: K/V in the query dtype or FP8)
+    kvh: u32,
+    /// paged row kernel over blocks of (valid rows, capacity); the rows add up to lk
+    pages: Option<Vec<(usize, usize)>>,
 }
 
 impl FaCase {
@@ -195,6 +199,8 @@ impl FaCase {
             kind,
             gx: 0,
             q_bhsd: false,
+            kvh: 0,
+            pages: None,
         }
     }
 }
@@ -212,7 +218,13 @@ fn check_fa(c: &FaCase) {
         return;
     }
     let mut rng = SplitMix64::new(
-        (c.b * 131 + c.lq * 7 + c.lk * 3 + c.d + c.qd as usize * 1000 + c.kv8 as usize) as u64,
+        (c.b * 131
+            + c.lq * 7
+            + c.lk * 3
+            + c.d
+            + c.qd as usize * 1000
+            + c.kv8 as usize
+            + c.kvh as usize * 10) as u64,
     );
     let (total_q, total_k) = match &c.varlen {
         Some((cq, ck)) => (*cq.last().unwrap() as usize, *ck.last().unwrap() as usize),
@@ -228,6 +240,8 @@ fn check_fa(c: &FaCase) {
     let kv_round = |x: f32| {
         if c.kv8 {
             e4m3_to_f32(f32_to_e4m3(x))
+        } else if c.kvh > 0 {
+            round_q(x, c.kvh - 1)
         } else {
             round_q(x, c.qd)
         }
@@ -278,7 +292,7 @@ fn check_fa(c: &FaCase) {
             [(c.lq * hq * d) as u64, (hq * d) as u64, d as u64],
         )
     };
-    let ks = [(c.lk * hkv * d) as u64, (hkv * d) as u64, d as u64];
+    let mut ks = [(c.lk * hkv * d) as u64, (hkv * d) as u64, d as u64];
     let (kind, dmax, version, splits) = match c.kind {
         Kind::Row { splits } => (0u32, 0u32, 0u32, splits),
         Kind::Tile { version, dmax } => (1, dmax, version, 1),
@@ -302,8 +316,42 @@ fn check_fa(c: &FaCase) {
         }
     };
     let mut a = Arrays::default();
+    // paged: every block (b, hkv, capacity, d) one after the other, junk in the spare rows
+    let (k, v) = match &c.pages {
+        None => (k, v),
+        Some(pages) => {
+            assert_eq!(pages.iter().map(|p| p.0).sum::<usize>(), c.lk);
+            let (mut km, mut vm) = (Vec::new(), Vec::new());
+            let (mut offs, mut rows, mut caps) = (Vec::new(), Vec::new(), Vec::new());
+            let mut j0 = 0;
+            for &(r, cap) in pages {
+                offs.push(km.len() as u64);
+                rows.push(r as u32);
+                caps.push(cap as u32);
+                for b in 0..c.b {
+                    for h in 0..hkv {
+                        for t in 0..cap {
+                            for e in 0..d {
+                                let src = ((b * c.lk + j0 + t) * hkv + h) * d + e;
+                                km.push(if t < r { k[src] } else { 7.0 });
+                                vm.push(if t < r { v[src] } else { -7.0 });
+                            }
+                        }
+                    }
+                }
+                j0 += r;
+            }
+            a.u64("pg_off_k", &offs)
+                .u64("pg_off_v", &offs)
+                .u32("pg_rows", &rows)
+                .u32("pg_cap_k", &caps)
+                .u32("pg_cap_v", &caps);
+            ks = [0, d as u64, 0];
+            (km, vm)
+        }
+    };
     a.str("op", "fa")
-        .u32("dtypes", &[c.qd, c.kv8 as u32])
+        .u32("dtypes", &[c.qd, if c.kv8 { 1 } else { c.kvh }])
         .u32(
             "dims",
             &[
@@ -484,6 +532,240 @@ fn fa_varlen_kernels() {
         c.varlen = Some((cu_q.clone(), cu_k.clone()));
         c.wr = 0;
         check_fa(&c);
+    }
+}
+
+#[test]
+fn fa_half_kv_with_f32_queries() {
+    for kvh in [2u32, 3] {
+        // decode row kernel with splits and the V2 / V3 tile kernels
+        let mut c = FaCase::new(1, 2, 70, 4, 2, 64, Kind::Row { splits: 2 });
+        c.kvh = kvh;
+        c.wr = 0;
+        check_fa(&c);
+        for (version, dmax, d) in [(2u32, 128u32, 96usize), (3, 256, 256)] {
+            let mut c = FaCase::new(1, 21, 30, 2, 1, d, Kind::Tile { version, dmax });
+            c.kvh = kvh;
+            c.wr = 0;
+            check_fa(&c);
+        }
+    }
+}
+
+#[test]
+fn fa_paged_row_kernel() {
+    // 1..5 blocks, partial last block, batch > 1 (batch stride = kv heads x capacity rows)
+    for n in 1..=5usize {
+        let mut pages: Vec<(usize, usize)> = (0..n).map(|i| (20 + 3 * i, 24 + 3 * i)).collect();
+        pages.last_mut().unwrap().0 = 5;
+        let lk: usize = pages.iter().map(|p| p.0).sum();
+        for (splits, lq) in [(1u32, 1usize), (3, 2), (2, 4)] {
+            let mut c = FaCase::new(2, lq, lk, 4, 2, 64, Kind::Row { splits });
+            c.wr = 0;
+            c.pages = Some(pages.clone());
+            check_fa(&c);
+        }
+    }
+    // FP8 K/V with bf16 queries, sliding window crossing block borders, softcap
+    let mut c = FaCase::new(1, 1, 90, 8, 2, 128, Kind::Row { splits: 4 });
+    c.qd = 2;
+    c.kv8 = true;
+    c.wl = 33;
+    c.wr = 0;
+    c.softcap = 20.0;
+    c.pages = Some(vec![(40, 40), (30, 64), (20, 21)]);
+    check_fa(&c);
+    // f16 K/V with f32 queries
+    let mut c = FaCase::new(1, 3, 50, 2, 1, 256, Kind::Row { splits: 2 });
+    c.kvh = 2;
+    c.pages = Some(vec![(17, 32), (33, 33)]);
+    check_fa(&c);
+}
+
+#[test]
+fn fa_combine_matches_previous_formula() {
+    if harness().is_none() {
+        return;
+    }
+    let mut rng = SplitMix64::new(5);
+    for (rows, d, splits) in [(5usize, 64usize, 2u32), (9, 256, 7), (3, 160, 64), (130, 32, 3)] {
+        let po = randn(&mut rng, splits as usize * rows * d, 1.0);
+        let mut pl = randn(&mut rng, splits as usize * rows, 3.0);
+        // an empty split (all keys masked) and one row without any key
+        pl[1] = f32::NEG_INFINITY;
+        for s in 0..splits as usize {
+            pl[s * rows + rows - 1] = f32::NEG_INFINITY;
+        }
+        let mut a = Arrays::default();
+        a.str("op", "combine")
+            .u32("params", &[rows as u32, d as u32, splits])
+            .f32("part_o", &po)
+            .f32("part_lse", &pl);
+        let out = run(&a);
+        let bits = |n: &str| -> Vec<u32> { out.get_f32(n).iter().map(|x| x.to_bits()).collect() };
+        let legacy = bits("legacy");
+        assert_eq!(bits("o"), legacy, "fa_combine rows {rows} d {d} splits {splits}");
+        assert_eq!(bits("t"), legacy, "tq_combine rows {rows} d {d} splits {splits}");
+    }
+}
+
+/// Runs `tq_attn` on the host emulator over rows `(b, hkv, lk)` with a row stride of `rw`
+/// words, or over the same rows as paged blocks of `(rows, capacity)` when `pages` is set (the
+/// spare rows hold junk with a huge scale). `fp8` selects the FP8 specialization.
+#[allow(clippy::too_many_arguments)]
+fn host_tq_attn(
+    ck: &RowCodec,
+    cv: &RowCodec,
+    kd: &[u32],
+    vd: &[u32],
+    qx: &[f32],
+    tab: &[f32],
+    dims: (usize, usize, usize, usize, usize, usize),
+    rw: usize,
+    splits: u32,
+    fp8: bool,
+    pages: Option<&[(usize, usize)]>,
+) -> Vec<f32> {
+    let (b, lq, lk, hq, hkv, d) = dims;
+    let (lkk, lvv) = (ck.layout, cv.layout);
+    let qw = qx.len() / (b * hq * lq);
+    let mut a = Arrays::default();
+    let (kd, vd, kst) = match pages {
+        None => (
+            kd.to_vec(),
+            vd.to_vec(),
+            [(hkv * lk * rw) as u64, (lk * rw) as u64, rw as u64],
+        ),
+        Some(pages) => {
+            let (mut km, mut vm) = (Vec::new(), Vec::new());
+            let (mut offs, mut rows, mut caps) = (Vec::new(), Vec::new(), Vec::new());
+            let mut j0 = 0;
+            for &(r, cap) in pages {
+                offs.push(km.len() as u64);
+                rows.push(r as u32);
+                caps.push(cap as u32);
+                for bi in 0..b {
+                    for h in 0..hkv {
+                        for t in 0..cap {
+                            let src = ((bi * hkv + h) * lk + j0 + t.min(r - 1)) * rw;
+                            for w in 0..rw {
+                                let junk = t >= r && w == lkk.rsc_offset();
+                                km.push(if junk { 1e4f32.to_bits() } else { kd[src + w] });
+                                vm.push(vd[src + w]);
+                            }
+                        }
+                    }
+                }
+                j0 += r;
+            }
+            a.u64("pg_off_k", &offs)
+                .u64("pg_off_v", &offs)
+                .u32("pg_rows", &rows)
+                .u32("pg_cap_k", &caps)
+                .u32("pg_cap_v", &caps);
+            (km, vm, [0, 0, rw as u64])
+        }
+    };
+    a.str("op", "tq_attn")
+        .f32("q", qx)
+        .u32("kd", &kd)
+        .u32("vd", &vd)
+        .f32("tab", tab)
+        .u32(
+            "uparams",
+            &[
+                b as u32,
+                lq as u32,
+                lk as u32,
+                hq as u32,
+                hkv as u32,
+                d as u32,
+                ck.format.mode_id(),
+                lkk.code_bits,
+                lkk.code_words as u32,
+                lkk.rsc_offset() as u32,
+                cv.format.mode_id(),
+                lvv.code_bits,
+                lvv.code_words as u32,
+                lvv.rsc_offset() as u32,
+                splits,
+                (lq * hq).min(5) as u32,
+                0,
+                fp8 as u32,
+            ],
+        )
+        .u64(
+            "strides",
+            &[
+                (hq * lq * qw) as u64,
+                (lq * qw) as u64,
+                qw as u64,
+                kst[0],
+                kst[1],
+                kst[2],
+                kst[0],
+                kst[1],
+                kst[2],
+            ],
+        )
+        .f32("fparams", &[1.0 / (d as f32).sqrt(), 0.0])
+        .i32("iparams", &[-1, 0]);
+    run(&a).get_f32("o")
+}
+
+#[test]
+fn tq_attention_fp8_fast_and_paged() {
+    if harness().is_none() {
+        return;
+    }
+    let mut rng = SplitMix64::new(4321);
+    let bits = |x: &[f32]| x.iter().map(|v| v.to_bits()).collect::<Vec<_>>();
+    for (fk, fv, b, lq, hq, hkv, d) in [
+        (QuantFormat::Fp8, QuantFormat::Fp8, 2usize, 1usize, 4usize, 2usize, 64usize),
+        (QuantFormat::Fp8, QuantFormat::Fp8, 1, 3, 2, 1, 256),
+        (
+            QuantFormat::TurboMse { bits: 4 },
+            QuantFormat::TurboMse { bits: 3 },
+            1,
+            2,
+            4,
+            2,
+            128,
+        ),
+    ] {
+        let pages = [(40usize, 48usize), (64, 64), (9, 30)];
+        let lk: usize = pages.iter().map(|p| p.0).sum();
+        let ck = RowCodec::new(fk, d, 1).unwrap();
+        let cv = RowCodec::new(fv, d, 2).unwrap();
+        let rw = ck.layout.row_words.max(cv.layout.row_words);
+        let n_rows = b * hkv * lk;
+        let (mut kd, mut vd) = (vec![0u32; n_rows * rw], vec![0u32; n_rows * rw]);
+        for r in 0..n_rows {
+            let (kx, vx) = (randn(&mut rng, d, 1.5), randn(&mut rng, d, 1.0));
+            ck.quantize_row(&kx, &mut kd[r * rw..r * rw + ck.layout.row_words]);
+            cv.quantize_row(&vx, &mut vd[r * rw..r * rw + cv.layout.row_words]);
+        }
+        let qx = randn(&mut rng, b * hq * lq * d, 1.0);
+        let mut tab = vec![0f32; 64];
+        tab[..32].copy_from_slice(&tq_tab(&ck));
+        tab[32..].copy_from_slice(&tq_tab(&cv));
+        let dims = (b, lq, lk, hq, hkv, d);
+        for splits in [1u32, 3] {
+            let run = |fp8: bool, pg: Option<&[(usize, usize)]>| {
+                host_tq_attn(&ck, &cv, &kd, &vd, &qx, &tab, dims, rw, splits, fp8, pg)
+            };
+            let dense = run(false, None);
+            let paged = run(false, Some(&pages));
+            assert_close(&format!("paged {fk}"), &paged, &dense, 1e-6, 1e-5);
+            if fk == QuantFormat::Fp8 && fv == QuantFormat::Fp8 {
+                assert_eq!(bits(&run(true, None)), bits(&dense), "fp8 fast, splits {splits}");
+                assert_eq!(
+                    bits(&run(true, Some(&pages))),
+                    bits(&paged),
+                    "paged fp8 fast, splits {splits}"
+                );
+            }
+        }
     }
 }
 
@@ -817,6 +1099,7 @@ fn tq_attention_matches_reference() {
                     lvv.rsc_offset() as u32,
                     splits,
                     (lq * hq).min(5) as u32,
+                    0,
                     0,
                 ],
             )
