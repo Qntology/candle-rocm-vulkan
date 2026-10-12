@@ -71,6 +71,8 @@ impl Workspaces {
     ) -> Result<u64> {
         let bytes = bytes.max(1);
         if self.slots.get(name).map_or(true, |s| s.len() < bytes) {
+            // The old buffer is freed right below: the context must be current.
+            dev.bind_to_thread()?;
             self.slots.remove(name);
             let slice = unsafe { dev.alloc::<u8>(bytes)? };
             self.slots.insert(name, slice);

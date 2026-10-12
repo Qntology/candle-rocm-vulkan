@@ -114,6 +114,11 @@ name = "conv_tests"
 path = "tests/conv_tests.rs"
 
 [[test]]
+name = "cuda_memory_tests"
+path = "tests/cuda_memory_tests.rs"
+required-features = ["cuda"]
+
+[[test]]
 name = "custom_op_tests"
 path = "tests/custom_op_tests.rs"
 

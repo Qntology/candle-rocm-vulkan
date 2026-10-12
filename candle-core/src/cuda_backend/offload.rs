@@ -252,7 +252,7 @@ impl Drop for CopyEvent {
     fn drop(&mut self) {
         if !self.waited.load(Ordering::Acquire) {
             // Orders the frees the compute stream issues from now on after the copy.
-            let _ = self.wait_on_compute(&self.device.clone());
+            let _ = self.wait_on_compute(&self.device);
         }
     }
 }
@@ -305,10 +305,11 @@ impl CopyStream {
         Ok(())
     }
 
-    /// Makes the copy stream wait for the work queued so far on the compute stream.
-    fn after_compute(&self) -> Result<()> {
+    /// Makes the copy stream wait for the work queued so far on the stream of `compute` (the
+    /// device that owns the buffer: its allocation and earlier kernels are ordered on it).
+    fn after_compute(&self, compute: &CudaDevice) -> Result<()> {
         let ev = RawEvent::new(&self.stream.ctx)?;
-        ev.record(self.device.cuda_stream().cu_stream())?;
+        ev.record(compute.cuda_stream().cu_stream())?;
         unsafe {
             drv::stream::wait_event(
                 self.stream.stream,
@@ -319,13 +320,13 @@ impl CopyStream {
         .w()
     }
 
-    fn finish(&self, host: &PinnedHostBuffer) -> Result<CopyEvent> {
+    fn finish(&self, host: &PinnedHostBuffer, buffer_device: &CudaDevice) -> Result<CopyEvent> {
         let ev = Arc::new(RawEvent::new(&self.stream.ctx)?);
         ev.record(self.stream.stream)?;
         host.track(&ev);
         Ok(CopyEvent {
             event: ev,
-            device: self.device.clone(),
+            device: buffer_device.clone(),
             waited: AtomicBool::new(false),
         })
     }
@@ -353,7 +354,7 @@ impl CopyStream {
             bail!("copy stream upload: destination range {dst_off}+{bytes} exceeds {dst_len} bytes")
         }
         bind_context_raw(&self.stream.ctx).w()?;
-        self.after_compute()?;
+        self.after_compute(&dst.device)?;
         if bytes > 0 {
             unsafe {
                 sys::cuMemcpyHtoDAsync_v2(
@@ -366,7 +367,7 @@ impl CopyStream {
             }
             .w()?;
         }
-        self.finish(src)
+        self.finish(src, &dst.device)
     }
 
     /// Queues the copy of `bytes` bytes of `src` from byte offset `src_off` into
@@ -393,7 +394,7 @@ impl CopyStream {
             )
         }
         bind_context_raw(&self.stream.ctx).w()?;
-        self.after_compute()?;
+        self.after_compute(&src.device)?;
         if bytes > 0 {
             unsafe {
                 sys::cuMemcpyDtoHAsync_v2(
@@ -406,7 +407,7 @@ impl CopyStream {
             }
             .w()?;
         }
-        self.finish(dst)
+        self.finish(dst, &src.device)
     }
 
     /// Blocks until every copy queued so far on this stream has completed.
