@@ -393,3 +393,105 @@ fn release_workspaces_after_quantized_matmul() -> Result<()> {
     assert_eq!(dev.take_deferred_error(), None);
     Ok(())
 }
+
+#[test]
+fn strided_kernel_parameter_uploads() -> Result<()> {
+    let _g = serial();
+    let dev = device()?;
+    let (rows, cols) = (64usize, 48usize);
+    let base: Vec<f32> = (0..rows * cols).map(|i| i as f32).collect();
+    // (cols, rows) view with strides (1, cols): every copy of a narrow of it is a strided kernel
+    // with its own dims/strides upload, queued on the shared stream without waiting.
+    let t = Tensor::from_vec(base, (rows, cols), &dev)?.t()?;
+    let mut sums = Vec::new();
+    let mut want = Vec::new();
+    for i in 0..5_000usize {
+        let start = i % 40;
+        let len = 1 + (i * 7) % (cols - start);
+        sums.push(t.narrow(0, start, len)?.contiguous()?.sum_all()?);
+        // Element (r, c) of the view is c * cols + r.
+        let r_sum: usize = (start..start + len).sum();
+        want.push((len * cols * (rows * (rows - 1) / 2) + rows * r_sum) as f32);
+    }
+    let mut got = Vec::with_capacity(sums.len());
+    for chunk in sums.chunks(1000) {
+        got.extend(Tensor::stack(chunk, 0)?.to_vec1::<f32>()?);
+    }
+    assert_eq!(got, want);
+    assert_eq!(dev.take_deferred_error(), None);
+    Ok(())
+}
+
+/// Host-to-device bandwidth of the pinned copy stream against a pageable upload
+/// (`cargo test --test cuda_memory_tests -- --ignored --nocapture`).
+#[test]
+#[ignore]
+fn bench_pinned_copy_stream_vs_pageable_upload() -> Result<()> {
+    let _g = serial();
+    let dev = device()?;
+    let cuda = dev.as_cuda_device()?.clone();
+    let copy = cuda.copy_stream()?;
+    for &mib in &[1usize, 8, 64] {
+        let bytes = mib * MIB;
+        let data: Vec<f32> = (0..bytes / 4).map(|i| i as f32).collect();
+        let mut host = cuda.alloc_pinned(bytes)?;
+        host.as_mut_slice().copy_from_slice(&f32_bytes(&data));
+        let dst = Tensor::zeros(bytes / 4, DType::F32, &dev)?;
+        dev.synchronize()?;
+        let reps = 10;
+
+        let t0 = std::time::Instant::now();
+        for _ in 0..reps {
+            let t = Tensor::from_slice(&data, bytes / 4, &dev)?;
+            drop(t);
+        }
+        dev.synchronize()?;
+        let pageable = t0.elapsed().as_secs_f64() / reps as f64;
+
+        let t0 = std::time::Instant::now();
+        for _ in 0..reps {
+            let ev = with_cuda_storage(&dst, |s| copy.upload(&host, 0, s, 0, bytes))?;
+            ev.wait_on_compute(&cuda)?;
+        }
+        dev.synchronize()?;
+        let pinned = t0.elapsed().as_secs_f64() / reps as f64;
+        eprintln!(
+            "{mib:3} MiB: pageable {:7.2} ms ({:5.2} GB/s) | pinned copy stream {:7.2} ms ({:5.2} GB/s)",
+            pageable * 1e3,
+            bytes as f64 / pageable / 1e9,
+            pinned * 1e3,
+            bytes as f64 / pinned / 1e9
+        );
+
+        // Overlap with compute queued after the upload: the pageable upload runs on the compute
+        // stream before the kernels, the copy stream runs next to them. (An upload always starts
+        // after the compute work queued before it, see the offload module docs.)
+        let time = |f: &dyn Fn() -> Result<()>| -> Result<f64> {
+            dev.synchronize_all()?;
+            let t0 = std::time::Instant::now();
+            f()?;
+            dev.synchronize_all()?;
+            Ok(t0.elapsed().as_secs_f64() * 1e3)
+        };
+        let busy = time(&|| queue_busy_work(&dev).map(drop))?;
+        let seq = time(&|| {
+            let t = Tensor::from_slice(&data, bytes / 4, &dev)?;
+            let b = queue_busy_work(&dev)?;
+            drop((b, t));
+            Ok(())
+        })?;
+        let other = Tensor::zeros(bytes / 4, DType::F32, &dev)?;
+        let overlap = time(&|| {
+            let ev = with_cuda_storage(&other, |s| copy.upload(&host, 0, s, 0, bytes))?;
+            let b = queue_busy_work(&dev)?;
+            // The kernels above do not read `other`; a reader would call `wait_on_compute` first.
+            ev.synchronize()?;
+            drop(b);
+            Ok(())
+        })?;
+        eprintln!(
+            "        busy work {busy:7.2} ms | + pageable upload {seq:7.2} ms | + copy stream upload {overlap:7.2} ms"
+        );
+    }
+    Ok(())
+}
