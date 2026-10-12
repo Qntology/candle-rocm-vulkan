@@ -19,6 +19,7 @@
 //! independently created handles of the same GPU.
 #![allow(clippy::missing_safety_doc)]
 
+mod accel;
 pub(crate) mod qgpu;
 pub mod shaders;
 
@@ -44,6 +45,8 @@ pub(crate) struct Limits {
     pub max_storage_buffer_range: u64,
     pub max_workgroup_count: [u32; 3],
     pub max_push_constants_size: u32,
+    pub max_shared_memory: u32,
+    pub max_invocations: u32,
 }
 
 /// One Vulkan logical device with its queue, kernel cache and allocator state.
@@ -517,6 +520,8 @@ fn init_vulkan(gpu_id: usize) -> Result<VulkanContext> {
         max_storage_buffer_range: props.limits.max_storage_buffer_range as u64,
         max_workgroup_count: props.limits.max_compute_work_group_count,
         max_push_constants_size: props.limits.max_push_constants_size,
+        max_shared_memory: props.limits.max_compute_shared_memory_size,
+        max_invocations: props.limits.max_compute_work_group_invocations,
     };
 
     let unified = props.device_type == vk::PhysicalDeviceType::INTEGRATED_GPU

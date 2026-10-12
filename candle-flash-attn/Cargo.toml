@@ -1,0 +1,34 @@
+[package]
+name = "candle-flash-attn"
+version = "0.11.0"
+edition = "2021"
+description = "Drop-in replacement of candle-flash-attn: fused attention on CUDA, ROCm, Vulkan and the CPU (FlashAttention v1 / v2 / v3 tiers per GPU)."
+readme = "README.md"
+keywords = ["attention", "flash-attention", "rocm", "vulkan", "cuda"]
+categories = ["science"]
+license = "Apache-2.0"
+repository = "https://github.com/Qntology/candle-rocm-vulkan"
+
+[features]
+default = ["flash-attn"]
+# Fused kernels of candle-core (on by default). Without it every call runs the unfused path.
+flash-attn = ["candle/flash-attn", "candle-nn/flash-attn"]
+cuda = ["candle/cuda", "candle-nn/cuda"]
+cudnn = ["candle/cudnn", "candle-nn/cudnn"]
+rocm = ["candle/rocm", "candle-nn/rocm"]
+vulkan = ["candle/vulkan", "candle-nn/vulkan"]
+
+[dependencies.candle]
+version = "0.11.0"
+path = "../candle-core"
+package = "candle-core"
+default-features = false
+
+[dependencies.candle-nn]
+version = "0.11.0"
+path = "../candle-nn"
+default-features = false
+
+[[test]]
+name = "api"
+path = "tests/api.rs"

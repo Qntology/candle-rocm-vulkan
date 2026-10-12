@@ -20,13 +20,17 @@ license = "Apache-2.0"
 repository = "https://github.com/Qntology/candle-rocm-vulkan"
 
 [features]
+# Fused attention / TurboQuant kernels of candle-core (see candle_nn::flash_attn and
+# candle_nn::turbo_quant); without them those APIs run their unfused / CPU paths.
+default = ["flash-attn", "turbo-quant"]
+flash-attn = ["candle/flash-attn"]
+turbo-quant = ["candle/turbo-quant"]
 accelerate = [
     "dep:accelerate-src",
     "candle/accelerate",
 ]
 cuda = ["candle/cuda"]
 cudnn = ["candle/cudnn"]
-default = []
 metal = [
     "candle/metal",
     "dep:candle-metal-kernels",
@@ -56,6 +60,10 @@ path = "examples/basic_optimizer.rs"
 [[example]]
 name = "cpu_benchmarks"
 path = "examples/cpu_benchmarks.rs"
+
+[[test]]
+name = "accel_config"
+path = "tests/accel_config.rs"
 
 [[test]]
 name = "batch_norm"
@@ -108,6 +116,11 @@ path = "tests/vulkan_ops.rs"
 required-features = ["vulkan"]
 
 [[test]]
+name = "accel_vulkan"
+path = "tests/accel_vulkan.rs"
+required-features = ["vulkan"]
+
+[[test]]
 name = "sdpa"
 path = "tests/sdpa.rs"
 
@@ -128,6 +141,7 @@ optional = true
 version = "0.11.0"
 path = "../candle-core"
 package = "candle-core"
+default-features = false
 
 [dependencies.candle-metal-kernels]
 version = "0.11.0"

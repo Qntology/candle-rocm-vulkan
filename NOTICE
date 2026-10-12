@@ -12,7 +12,9 @@ texts are in the licenses/ directory.
    Copyright Hugging Face, Inc. and the candle contributors.
    Licensed under "MIT OR Apache-2.0"; used here under the Apache License 2.0.
    License texts: licenses/LICENSE-APACHE-2.0.txt, licenses/LICENSE-MIT-candle.txt
-   Applies to: candle-core/, candle-nn/
+   Applies to: candle-core/, candle-nn/, and the public API (function names,
+               signatures and documentation) of candle-flash-attn 0.11.0 mirrored
+               by candle-flash-attn/
 
 2. Vulkan and OpenCL backends for candle-core / candle-nn
    https://github.com/rexlunae/candle-core
@@ -37,3 +39,15 @@ kernels for Vulkan (candle-core/src/vulkan_backend/qgpu.rs), Vulkan device and
 queue selection, ROCm memory-pool and runtime-cache management, and related
 fixes. Modified files are distributed under the Apache License 2.0; the
 third-party notices above continue to apply to the portions they cover.
+
+The fused attention and TurboQuant code (candle-core/src/accel/,
+candle-core/kernels/accel_common.h, flash_attn_impl.h, turbo_quant_impl.h,
+candle-core/src/*_backend/accel.rs, candle-nn/src/flash_attn.rs,
+candle-nn/src/turbo_quant.rs, candle-flash-attn/) was written for this project
+and implements published algorithms; it contains no code from the projects
+that describe them:
+  - FlashAttention v1 / v2 / v3, Tri Dao et al.
+    https://github.com/Dao-AILab/flash-attention
+  - TurboQuant, Amir Zandieh et al. (reference implementation:
+    https://github.com/abdelstark/turboquant), and QJL
+  - OCP Microscaling (MX) formats v1.0 and NVIDIA NVFP4

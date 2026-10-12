@@ -14,6 +14,16 @@ const KERNELS: &[&str] = &[
     "gemm",
 ];
 
+/// Kernels behind Cargo features: (file stem, `CARGO_FEATURE_*` variable). A disabled one is
+/// embedded as an empty image and its module reports that it was not built.
+const OPTIONAL_KERNELS: &[(&str, &str)] = &[
+    ("flash_attn", "CARGO_FEATURE_FLASH_ATTN"),
+    ("turbo_quant", "CARGO_FEATURE_TURBO_QUANT"),
+];
+
+/// Headers shared by the kernels.
+const HEADERS: &[&str] = &["common.h", "accel_common.h", "flash_attn_impl.h", "turbo_quant_impl.h"];
+
 /// Targets used when no GPU is detected, per ROCm track (see `hip-sys/build.rs`).
 /// `legacy` (ROCm / HIP SDK 6.x - 7.2) keeps the RDNA2 / RDNA3 set used so far.
 const LEGACY_DEFAULT_ARCHS: &[&str] = &["gfx1030", "gfx1100", "gfx1101", "gfx1102"];
@@ -352,8 +362,18 @@ fn main() {
     let manifest_dir = PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").unwrap());
     let kernel_dir = manifest_dir.join("kernels");
     let out_dir = PathBuf::from(std::env::var("OUT_DIR").unwrap());
-    println!("cargo:rerun-if-changed={}", kernel_dir.join("common.h").display());
-    for k in KERNELS {
+    for h in HEADERS {
+        println!("cargo:rerun-if-changed={}", kernel_dir.join(h).display());
+    }
+    let mut kernels: Vec<&str> = KERNELS.to_vec();
+    for (k, feature) in OPTIONAL_KERNELS {
+        if std::env::var(feature).is_ok() {
+            kernels.push(k);
+        } else {
+            std::fs::write(out_dir.join(format!("{k}.co")), b"").unwrap();
+        }
+    }
+    for k in kernels.iter() {
         println!("cargo:rerun-if-changed={}", kernel_dir.join(format!("{k}.hip")).display());
     }
 
@@ -371,7 +391,7 @@ fn main() {
         .map(|v| !v.is_empty() && v != "0")
         .unwrap_or(false);
     if skip {
-        for k in KERNELS {
+        for k in kernels.iter() {
             std::fs::write(out_dir.join(format!("{k}.co")), b"").unwrap();
         }
         println!("cargo:rustc-env=CANDLE_ROCM_ARCHS=none");
@@ -478,7 +498,7 @@ fn main() {
     };
 
     let results: Vec<(String, Result<(), String>)> = std::thread::scope(|scope| {
-        let handles: Vec<_> = KERNELS
+        let handles: Vec<_> = kernels
             .iter()
             .map(|k| {
                 let compile = &compile;
