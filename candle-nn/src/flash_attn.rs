@@ -203,6 +203,7 @@ impl FlashAttnOp {
             .or(conf.flash_attn.version)
             .unwrap_or(auto_version);
         p.split_kv = self.cfg.split_kv.unwrap_or(conf.flash_attn.split_kv);
+        p.gqa_pack = conf.flash_attn.gqa_decode;
         p
     }
 

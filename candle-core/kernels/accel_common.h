@@ -126,16 +126,15 @@ struct ax_pages {
 // 16 bit floats
 // ---------------------------------------------------------------------------
 
+// Exact f16 -> f32 without branches (selects only): subnormals as m * 2^-24, infinities and
+// NaNs keep their payload, the sign is applied last (also to zero and NaN).
 AX_DEV float ax_h2f(ax_u16 h) {
-    const ax_u32 s = ((ax_u32)(h & 0x8000u)) << 16;
     const ax_u32 e = (h >> 10) & 0x1fu;
     const ax_u32 m = h & 0x3ffu;
-    if (e == 0) {
-        const float v = (float)m * 5.9604644775390625e-8f; // m * 2^-24
-        return s ? -v : v;
-    }
-    if (e == 31) return ax_u2f(s | 0x7f800000u | (m << 13));
-    return ax_u2f(s | ((e + 112u) << 23) | (m << 13));
+    const float sub = (float)m * 5.9604644775390625e-8f; // m * 2^-24
+    const ax_u32 big = (e == 31u ? 0x7f800000u : ((e + 112u) << 23)) | (m << 13);
+    const float v = e == 0u ? sub : ax_u2f(big);
+    return (h & 0x8000u) ? -v : v;
 }
 
 AX_DEV ax_u16 ax_f2h(float f) {
@@ -243,7 +242,7 @@ AX_DEV ax_u32 ax_mx_scale_code(float amax, int emax_elem) {
 AX_DEV float ax_load(const float *p, ax_u64 i) { return p[i]; }
 AX_DEV float ax_load(const ax_f16 *p, ax_u64 i) { return ax_h2f(p[i].b); }
 AX_DEV float ax_load(const ax_bf16 *p, ax_u64 i) { return ax_bf2f(p[i].b); }
-AX_DEV float ax_load(const ax_fp8 *p, ax_u64 i) { return ax_e4m3_to_f(p[i].b); }
+AX_DEV float ax_load(const ax_fp8 *p, ax_u64 i) { return ax_e4m3_to_f_fast(p[i].b); }
 
 AX_DEV void ax_store(float *p, ax_u64 i, float v) { p[i] = v; }
 AX_DEV void ax_store(ax_f16 *p, ax_u64 i, float v) { p[i].b = ax_f2h(v); }
@@ -279,4 +278,27 @@ AX_DEV float ax_block_max(float v, float *red) {
     const float r = red[0];
     AX_SYNC();
     return r;
+}
+
+// G maxima / sums over the workgroup in one tree (red: G * NT floats, the trees of
+// ax_block_max / ax_block_sum per head).
+template <int NT, int G, bool MAX>
+AX_DEV void ax_block_reduce_g(const float *v, float *red, float *out) {
+    const ax_u32 t = AX_TID;
+    AX_UNROLL
+    for (int g = 0; g < G; ++g) red[g * NT + t] = v[g];
+    AX_SYNC();
+    for (ax_u32 s = NT / 2; s > 0; s >>= 1) {
+        if (t < s) {
+            AX_UNROLL
+            for (int g = 0; g < G; ++g) {
+                float *r = red + g * NT;
+                r[t] = MAX ? fmaxf(r[t], r[t + s]) : r[t] + r[t + s];
+            }
+        }
+        AX_SYNC();
+    }
+    AX_UNROLL
+    for (int g = 0; g < G; ++g) out[g] = red[g * NT];
+    AX_SYNC();
 }

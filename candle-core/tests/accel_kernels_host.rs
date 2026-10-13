@@ -178,6 +178,8 @@ struct FaCase {
     kvh: u32,
     /// paged row kernel over blocks of (valid rows, capacity); the rows add up to lk
     pages: Option<Vec<(usize, usize)>>,
+    /// GQA-packed row kernel with this many query heads per workgroup (0 / 1: plain)
+    gqa: u32,
 }
 
 impl FaCase {
@@ -201,6 +203,7 @@ impl FaCase {
             q_bhsd: false,
             kvh: 0,
             pages: None,
+            gqa: 0,
         }
     }
 }
@@ -213,9 +216,11 @@ fn round_q(v: f32, qd: u32) -> f32 {
     }
 }
 
-fn check_fa(c: &FaCase) {
+/// Runs a flash-attention case on the host emulator, checks it against the reference and
+/// returns the kernel output (empty without a C++ compiler).
+fn check_fa(c: &FaCase) -> Vec<f32> {
     if harness().is_none() {
-        return;
+        return Vec::new();
     }
     let mut rng = SplitMix64::new(
         (c.b * 131
@@ -301,7 +306,7 @@ fn check_fa(c: &FaCase) {
         c.gx
     } else {
         match c.kind {
-            Kind::Row { .. } => (c.lq * hq) as u32,
+            Kind::Row { .. } => (c.lq * hq / c.gqa.max(1) as usize) as u32,
             Kind::Tile { version, dmax } => {
                 let br = match (version, dmax) {
                     (3, 64) => 64,
@@ -382,6 +387,7 @@ fn check_fa(c: &FaCase) {
                 c.varlen.is_some() as u32,
                 gx,
                 0,
+                c.gqa.max(1),
             ],
         )
         .f32("q", &q_mem)
@@ -400,6 +406,34 @@ fn check_fa(c: &FaCase) {
         _ => (1.6e-2, 1.6e-2),
     };
     assert_close("flash-attn", &got, &want, atol, rtol);
+    got
+}
+
+#[test]
+fn fa_gqa_packed_rows_bit_exact() {
+    // (hq, hkv, G): the packed kernel gives the bits of the plain row kernel
+    for (hq, hkv, g) in [(8usize, 2usize, 4u32), (8, 4, 2), (16, 2, 8), (16, 1, 8)] {
+        for (qd, kv8, kvh) in [(0u32, false, 0u32), (2, true, 0), (0, false, 2), (1, false, 0)] {
+            for splits in [1u32, 3] {
+                for paged in [false, true] {
+                    let mut c = FaCase::new(1, 2, 45, hq, hkv, 64, Kind::Row { splits });
+                    c.qd = qd;
+                    c.kv8 = kv8;
+                    c.kvh = kvh;
+                    c.wr = 0;
+                    c.alibi = true;
+                    if paged {
+                        c.pages = Some(vec![(20, 24), (25, 25)]);
+                    }
+                    let plain = check_fa(&c);
+                    c.gqa = g;
+                    let packed = check_fa(&c);
+                    let bits = |x: &[f32]| x.iter().map(|v| v.to_bits()).collect::<Vec<_>>();
+                    assert_eq!(bits(&plain), bits(&packed), "{hq}/{hkv} G {g} q {qd} paged {paged}");
+                }
+            }
+        }
+    }
 }
 
 #[test]
@@ -611,7 +645,8 @@ fn fa_combine_matches_previous_formula() {
 
 /// Runs `tq_attn` on the host emulator over rows `(b, hkv, lk)` with a row stride of `rw`
 /// words, or over the same rows as paged blocks of `(rows, capacity)` when `pages` is set (the
-/// spare rows hold junk with a huge scale). `fp8` selects the FP8 specialization.
+/// spare rows hold junk with a huge scale). `fp8` selects the FP8 specialization, `group` > 1
+/// the GQA-packed kernels.
 #[allow(clippy::too_many_arguments)]
 fn host_tq_attn(
     ck: &RowCodec,
@@ -625,6 +660,7 @@ fn host_tq_attn(
     splits: u32,
     fp8: bool,
     pages: Option<&[(usize, usize)]>,
+    group: u32,
 ) -> Vec<f32> {
     let (b, lq, lk, hq, hkv, d) = dims;
     let (lkk, lvv) = (ck.layout, cv.layout);
@@ -689,9 +725,10 @@ fn host_tq_attn(
                 lvv.code_words as u32,
                 lvv.rsc_offset() as u32,
                 splits,
-                (lq * hq).min(5) as u32,
+                (lq * hq / group as usize).min(5) as u32,
                 0,
                 fp8 as u32,
+                group,
             ],
         )
         .u64(
@@ -752,7 +789,7 @@ fn tq_attention_fp8_fast_and_paged() {
         let dims = (b, lq, lk, hq, hkv, d);
         for splits in [1u32, 3] {
             let run = |fp8: bool, pg: Option<&[(usize, usize)]>| {
-                host_tq_attn(&ck, &cv, &kd, &vd, &qx, &tab, dims, rw, splits, fp8, pg)
+                host_tq_attn(&ck, &cv, &kd, &vd, &qx, &tab, dims, rw, splits, fp8, pg, 1)
             };
             let dense = run(false, None);
             let paged = run(false, Some(&pages));
@@ -764,6 +801,56 @@ fn tq_attention_fp8_fast_and_paged() {
                     bits(&paged),
                     "paged fp8 fast, splits {splits}"
                 );
+            }
+        }
+    }
+}
+
+#[test]
+fn tq_attention_gqa_packed_bit_exact() {
+    if harness().is_none() {
+        return;
+    }
+    let mut rng = SplitMix64::new(99);
+    let bits = |x: &[f32]| x.iter().map(|v| v.to_bits()).collect::<Vec<_>>();
+    for (fk, fv) in [
+        (QuantFormat::Fp8, QuantFormat::Fp8),
+        (QuantFormat::TurboProd { bits: 4 }, QuantFormat::TurboMse { bits: 4 }),
+        (QuantFormat::Nvfp4, QuantFormat::Mxfp4),
+    ] {
+        for (hq, hkv, g) in [(8usize, 2usize, 4u32), (8, 4, 2), (16, 2, 8)] {
+            let (b, lq, d) = (1usize, 2usize, 64usize);
+            let pages = [(30usize, 32usize), (19, 40)];
+            let lk: usize = pages.iter().map(|p| p.0).sum();
+            let ck = RowCodec::new(fk, d, 3).unwrap();
+            let cv = RowCodec::new(fv, d, 4).unwrap();
+            let rw = ck.layout.row_words.max(cv.layout.row_words);
+            let n_rows = b * hkv * lk;
+            let (mut kd, mut vd) = (vec![0u32; n_rows * rw], vec![0u32; n_rows * rw]);
+            for r in 0..n_rows {
+                let (kx, vx) = (randn(&mut rng, d, 1.5), randn(&mut rng, d, 1.0));
+                ck.quantize_row(&kx, &mut kd[r * rw..r * rw + ck.layout.row_words]);
+                cv.quantize_row(&vx, &mut vd[r * rw..r * rw + cv.layout.row_words]);
+            }
+            let qw = if ck.qjl.is_some() { 2 * d } else { d };
+            let qx = randn(&mut rng, b * hq * lq * qw, 1.0);
+            let mut tab = vec![0f32; 64];
+            tab[..32].copy_from_slice(&tq_tab(&ck));
+            tab[32..].copy_from_slice(&tq_tab(&cv));
+            let dims = (b, lq, lk, hq, hkv, d);
+            let fp8 = fk == QuantFormat::Fp8 && fv == QuantFormat::Fp8;
+            for splits in [1u32, 3] {
+                for pg in [None, Some(&pages[..])] {
+                    let run = |group: u32| {
+                        host_tq_attn(&ck, &cv, &kd, &vd, &qx, &tab, dims, rw, splits, fp8, pg, group)
+                    };
+                    assert_eq!(
+                        bits(&run(g)),
+                        bits(&run(1)),
+                        "{fk}/{fv} {hq}/{hkv} G {g} splits {splits} paged {}",
+                        pg.is_some()
+                    );
+                }
             }
         }
     }

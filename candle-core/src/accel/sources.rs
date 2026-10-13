@@ -35,10 +35,19 @@ fn ctype(sfx: &str) -> Option<&'static str> {
 }
 
 /// The instantiation line of a fused attention kernel name (`fa_row_bf16_fp8`,
-/// `fa_rowp_f32_f16`, `fa2_d128_f16_f16`, `fa_combine_f32`, ...).
+/// `fa_rowp_f32_f16`, `fa_rowg4_f32_f16`, `fa_rowpg2_bf16_fp8`, `fa2_d128_f16_f16`,
+/// `fa_combine_f32`, ...).
 pub fn flash_attn_instantiation(name: &str) -> Option<String> {
     if let Some(o) = name.strip_prefix("fa_combine_") {
         return Some(format!("FA_COMBINE_KERNEL({name}, {})", ctype(o)?));
+    }
+    for (prefix, mac) in [("fa_rowpg", "FA_ROWPG_KERNEL"), ("fa_rowg", "FA_ROWG_KERNEL")] {
+        if let Some(rest) = name.strip_prefix(prefix) {
+            let (g, rest) = rest.split_once('_')?;
+            let g: usize = g.parse().ok().filter(|g| [2, 4, 8].contains(g))?;
+            let (q, kv) = rest.split_once('_')?;
+            return Some(format!("{mac}({name}, {}, {}, {g})", ctype(q)?, ctype(kv)?));
+        }
     }
     if let Some(rest) = name.strip_prefix("fa_rowp_") {
         let (q, kv) = rest.split_once('_')?;
@@ -118,6 +127,15 @@ mod tests {
             "FA_ROWP_KERNEL(fa_rowp_f32_bf16, float, ax_bf16)"
         );
         assert_eq!(
+            flash_attn_instantiation("fa_rowg4_f32_f16").unwrap(),
+            "FA_ROWG_KERNEL(fa_rowg4_f32_f16, float, ax_f16, 4)"
+        );
+        assert_eq!(
+            flash_attn_instantiation("fa_rowpg8_bf16_fp8").unwrap(),
+            "FA_ROWPG_KERNEL(fa_rowpg8_bf16_fp8, ax_bf16, ax_fp8, 8)"
+        );
+        assert!(flash_attn_instantiation("fa_rowg3_f32_f32").is_none());
+        assert_eq!(
             flash_attn_instantiation("fa2_d256_f32_f16").unwrap(),
             "FA_TILE_KERNEL(fa2_d256_f32_f16, float, ax_f16, 8, 16, 256)"
         );
@@ -152,6 +170,10 @@ mod tests {
         ] {
             names.push(format!("fa_row_{q}_{kv}"));
             names.push(format!("fa_rowp_{q}_{kv}"));
+            for g in [2, 4, 8] {
+                names.push(format!("fa_rowg{g}_{q}_{kv}"));
+                names.push(format!("fa_rowpg{g}_{q}_{kv}"));
+            }
             for v in [2, 3] {
                 for d in [64, 128, 256] {
                     names.push(format!("fa{v}_d{d}_{q}_{kv}"));

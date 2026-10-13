@@ -11,7 +11,7 @@ use crate::accel::attention::{
 };
 use crate::accel::profile::AccelProfile;
 use crate::accel::sources;
-use crate::accel::turbo::{tq_attn_kernel, TqAttnArgs, TqRowArgs, TQ_THREADS};
+use crate::accel::turbo::{tq_attn_group, tq_attn_kernel, TqAttnArgs, TqRowArgs, TQ_THREADS};
 use crate::{bail, DType, Result};
 use cudarc::driver::{DevicePtr, DevicePtrMut, LaunchConfig, PushKernelArg, SyncOnDrop};
 use std::collections::HashMap;
@@ -270,13 +270,30 @@ impl CudaStorage {
         let dev = &self.device;
         let prof = dev.accel_profile();
         let plan = att::plan(geom, p, prof.max_shared_mem, prof.compute_units);
-        let name = att::kernel_name(&plan, self.dtype(), k.dtype())?;
+        // row plans may pack the query heads of a kv head (fa_rowg*, same results)
+        let (name, grid, smem, splits) = match plan {
+            FaPlan::Row { .. } => {
+                let l = att::row_launch(
+                    geom,
+                    p,
+                    prof.compute_units,
+                    self.dtype(),
+                    k.dtype(),
+                    false,
+                )?;
+                (l.name, l.grid, l.shared_bytes, l.splits)
+            }
+            FaPlan::Tile { .. } => {
+                let name = att::kernel_name(&plan, self.dtype(), k.dtype())?;
+                let (grid, smem, splits) = att::launch_dims(geom, &plan);
+                (name, grid, smem, splits)
+            }
+        };
         let rows = geom.out_rows();
         let d = geom.d;
         let mut out = alloc(dev, self.dtype(), rows * d)?;
         if rows > 0 && d > 0 {
             let func = dev.accel_func(&name)?;
-            let (grid, smem, splits) = att::launch_dims(geom, &plan);
             if smem > 48 * 1024 {
                 func.set_max_dynamic_shared_memory(smem)?;
             }
@@ -394,16 +411,13 @@ impl CudaStorage {
         }
         let dev = &self.device;
         let prof = dev.accel_profile();
-        let plan = FaPlan::Row {
-            splits: att::split_count(geom, p.split_kv, prof.compute_units),
-        };
-        let name = att::paged_kernel_name(self.dtype(), kv_dtype)?;
+        let launch = att::row_launch(geom, p, prof.compute_units, self.dtype(), kv_dtype, true)?;
+        let (grid, smem, splits) = (launch.grid, launch.shared_bytes, launch.splits);
         let rows = geom.out_rows();
         let d = geom.d;
         let mut out = alloc(dev, self.dtype(), rows * d)?;
         if rows > 0 && d > 0 {
-            let func = dev.accel_func(&name)?;
-            let (grid, smem, splits) = att::launch_dims(geom, &plan);
+            let func = dev.accel_func(&launch.name)?;
             let stream = dev.cuda_stream();
             let mut part = alloc_parts(dev, splits, rows, d)?;
             {
@@ -724,7 +738,8 @@ impl CudaStorage {
             let stream = dev.cuda_stream();
             let mut part = alloc_parts(dev, splits, rows, d)?;
             {
-                let func = dev.accel_func(tq_attn_kernel(&a.k, &a.v, dense.is_none()))?;
+                let group = tq_attn_group(a.hq, a.hkv);
+                let func = dev.accel_func(&tq_attn_kernel(&a.k, &a.v, dense.is_none(), group))?;
                 let (table, _gt) = match dense {
                     Some(_) => (None, Vec::new()),
                     None => {
@@ -825,13 +840,13 @@ impl CudaStorage {
                     b.arg(t);
                 }
                 let grid = (
-                    (a.lq * a.hq).clamp(1, MAX_GRID_X) as u32,
+                    (a.lq * a.hq / group).clamp(1, MAX_GRID_X) as u32,
                     splits as u32,
                     a.b as u32,
                 );
-                // SAFETY: arguments match tq_attn / tq_attn_fp8 (TQ_ATTN_PARAMS), followed by the
-                // block table for tq_attnp / tq_attnp_fp8.
-                unsafe { b.launch(cfg(grid, a.smem_bytes())) }.w()?;
+                // SAFETY: arguments match tq_attn* (TQ_ATTN_PARAMS), followed by the block table
+                // for the paged tq_attnp* kernels.
+                unsafe { b.launch(cfg(grid, a.smem_bytes_for(group))) }.w()?;
             }
             launch_combine(dev, "tq_combine", &mut part, &mut out, rows, d, splits)?;
         }

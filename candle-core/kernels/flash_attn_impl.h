@@ -174,6 +174,159 @@ AX_DEV void fa_rowp_impl(FA_PARAMS(TQ, TKV), const ax_pages &pg) {
     fa_row_core<TQ, TKV, true>(FA_ARGS, &pg);
 }
 
+// ---------------------------------------------------------------------------
+// GQA-packed row kernel: one workgroup per (query row, pack of G query heads that share a kv
+// head, split), so every K/V element is loaded and widened once for G heads (G divides
+// Hq / Hkv). Each head's arithmetic is the one of fa_row (same products, same summation and
+// reduction order), so the results are bit-identical to fa_row; only the loads are shared.
+// Grid (min(Lq * Hq / G, 2^31 - 1), n_splits, B), no varlen. Shared memory: G * (D + 2 FA_NT)
+// floats.
+// ---------------------------------------------------------------------------
+
+template <typename TKV, int G>
+AX_DEV void fa_rowg_window(const float *qs, float *red, float *pr, const TKV *kp, const TKV *vp,
+                           ax_u64 k_ss, ax_u64 v_ss, long long j0, long long kb, long long e,
+                           ax_u32 D, float kd, float softcap, const float *slope, long long pos,
+                           float *m, float *l, float *acc0, float *acc1) {
+    const ax_u32 t = AX_TID;
+    const long long j = kb + t;
+    float s[G];
+    AX_UNROLL
+    for (int g = 0; g < G; ++g) s[g] = -AX_INF;
+    if (j < e) {
+        const TKV *kr = kp + (ax_u64)(j - j0) * k_ss;
+        float dot[G];
+        AX_UNROLL
+        for (int g = 0; g < G; ++g) dot[g] = 0.0f;
+        for (ax_u32 d = 0; d < D; ++d) {
+            const float kv = ax_load(kr, d);
+            AX_UNROLL
+            for (int g = 0; g < G; ++g) dot[g] += qs[g * D + d] * kv;
+        }
+        AX_UNROLL
+        for (int g = 0; g < G; ++g) s[g] = fa_logit(dot[g] * kd, softcap, slope[g], pos - j);
+    }
+    float mx[G], p[G], lt[G];
+    ax_block_reduce_g<FA_NT, G, true>(s, red, mx);
+    AX_UNROLL
+    for (int g = 0; g < G; ++g) {
+        mx[g] = fmaxf(m[g], mx[g]);
+        p[g] = s[g] == -AX_INF ? 0.0f : expf(s[g] - mx[g]);
+        pr[g * FA_NT + t] = p[g];
+    }
+    ax_block_reduce_g<FA_NT, G, false>(p, red, lt); // also publishes pr
+    AX_UNROLL
+    for (int g = 0; g < G; ++g) {
+        const float alpha = m[g] == -AX_INF ? 0.0f : expf(m[g] - mx[g]);
+        l[g] = l[g] * alpha + lt[g];
+        acc0[g] *= alpha;
+        acc1[g] *= alpha;
+        m[g] = mx[g];
+    }
+    const int cnt = (int)ax_min_ll(FA_NT, e - kb);
+    for (int u = 0; u < cnt; ++u) {
+        bool any = false;
+        AX_UNROLL
+        for (int g = 0; g < G; ++g) any = any || pr[g * FA_NT + u] != 0.0f;
+        if (any) {
+            const TKV *vr = vp + (ax_u64)(kb + u - j0) * v_ss;
+            const float v0 = t < D ? ax_load(vr, t) : 0.0f;
+            const float v1 = t + FA_NT < D ? ax_load(vr, t + FA_NT) : 0.0f;
+            AX_UNROLL
+            for (int g = 0; g < G; ++g) {
+                const float pu = pr[g * FA_NT + u];
+                if (pu != 0.0f) {
+                    acc0[g] += pu * v0;
+                    acc1[g] += pu * v1;
+                }
+            }
+        }
+    }
+    AX_SYNC();
+}
+
+template <typename TQ, typename TKV, int G, bool PAGED>
+AX_DEV void fa_rowg_core(FA_PARAMS(TQ, TKV), const ax_pages *pg) {
+    float *sm = ax_smem();
+    float *qs = sm;              // G * D
+    float *red = qs + G * D;     // G * FA_NT
+    float *pr = red + G * FA_NT; // G * FA_NT
+    const ax_u32 t = AX_TID;
+    const ax_u32 split = AX_BID_Y;
+    const ax_u32 b = AX_BID_Z;
+    const ax_u32 packs = Hq / G;
+    const ax_u32 group = Hq / Hkv;
+    for (ax_u64 rowi = AX_BID_X; rowi < (ax_u64)Lq * packs; rowi += AX_NBLK_X) {
+        const ax_u32 i = (ax_u32)(rowi / packs);
+        const ax_u32 h0 = (ax_u32)(rowi % packs) * G;
+        const ax_u32 hk = h0 / group;
+        AX_SYNC();
+        AX_UNROLL
+        for (int g = 0; g < G; ++g) {
+            const TQ *qp = q + b * q_sb + i * q_ss + (h0 + g) * q_sh;
+            for (ax_u32 d = t; d < D; d += FA_NT) qs[g * D + d] = scale * ax_load(qp, d);
+        }
+        AX_SYNC();
+        const long long pos = (long long)i + (long long)Lk - (long long)Lq;
+        long long lo = wl >= 0 ? ax_max_ll(pos - wl, 0) : 0;
+        long long hi = wr >= 0 ? ax_min_ll(pos + wr + 1, (long long)Lk) : (long long)Lk;
+        if (lo > (long long)Lk) lo = Lk;
+        if (hi < lo) hi = lo;
+        const long long chunk = (hi - lo + n_splits - 1) / n_splits;
+        long long s_lo = lo + (long long)split * chunk;
+        long long s_hi = ax_min_ll(s_lo + chunk, hi);
+        if (s_lo > hi) s_lo = hi;
+        if (s_hi < s_lo) s_hi = s_lo;
+        float slope[G], m[G], l[G], acc0[G], acc1[G];
+        AX_UNROLL
+        for (int g = 0; g < G; ++g) {
+            slope[g] = alibi ? alibi[(ax_u64)b * alibi_bs + h0 + g] : 0.0f;
+            m[g] = -AX_INF;
+            l[g] = 0.0f;
+            acc0[g] = 0.0f;
+            acc1[g] = 0.0f;
+        }
+        if (!PAGED) {
+            const TKV *kp = k + b * k_sb + hk * k_sh;
+            const TKV *vp = v + b * v_sb + hk * v_sh;
+            for (long long kb = s_lo; kb < s_hi; kb += FA_NT)
+                fa_rowg_window<TKV, G>(qs, red, pr, kp, vp, k_ss, v_ss, 0, kb, s_hi, D, kd, softcap,
+                                       slope, pos, m, l, acc0, acc1);
+        } else {
+            long long j0 = 0;
+            for (ax_u32 bi = 0; bi < pg->n && j0 < s_hi; ++bi) {
+                const long long j1 = j0 + (long long)pg->rows[bi];
+                const long long a = ax_max_ll(s_lo, j0), e = ax_min_ll(s_hi, j1);
+                if (a < e) {
+                    const ax_u64 bh = (ax_u64)b * Hkv + hk;
+                    const TKV *kp = reinterpret_cast<const TKV *>(pg->k[bi]) +
+                                    bh * ((ax_u64)pg->k_cap[bi] * k_ss);
+                    const TKV *vp = reinterpret_cast<const TKV *>(pg->v[bi]) +
+                                    bh * ((ax_u64)pg->v_cap[bi] * v_ss);
+                    for (long long kb = a; kb < e; kb += FA_NT)
+                        fa_rowg_window<TKV, G>(qs, red, pr, kp, vp, k_ss, v_ss, j0, kb, e, D, kd,
+                                               softcap, slope, pos, m, l, acc0, acc1);
+                }
+                j0 = j1;
+            }
+        }
+        AX_UNROLL
+        for (int g = 0; g < G; ++g) {
+            const ax_u64 orow = ((ax_u64)b * Lq + i) * Hq + h0 + g;
+            const float inv = l[g] > 0.0f ? vd / l[g] : 0.0f;
+            if (n_splits == 1) {
+                if (t < D) ax_store(o, orow * D + t, acc0[g] * inv);
+                if (t + FA_NT < D) ax_store(o, orow * D + t + FA_NT, acc1[g] * inv);
+            } else {
+                const ax_u64 prow = (ax_u64)split * rows_total + orow;
+                if (t < D) part_o[prow * D + t] = acc0[g] * inv;
+                if (t + FA_NT < D) part_o[prow * D + t + FA_NT] = acc1[g] * inv;
+                if (t == 0) part_lse[prow] = l[g] > 0.0f ? m[g] + logf(l[g]) : -AX_INF;
+            }
+        }
+    }
+}
+
 template <typename TQ, typename TKV, int BR, int BC, int DMAX>
 AX_DEV void fa_tile_impl(FA_PARAMS(TQ, TKV)) {
     const int TPR = FA_NT / BR;
@@ -329,6 +482,25 @@ AX_DEV void fa_combine_impl(const float *part_o, const float *part_lse, TO *o, a
         fa_rowp_impl<TQ, TKV>(FA_ARGS, pg);                                                        \
     }
 
+// GQA-packed row kernels, dense and paged (G query heads per workgroup).
+#define FA_ROWG_KERNEL(NAME, TQ, TKV, G)                                                           \
+    AX_KERNEL void AX_BOUNDS(FA_NT) NAME(FA_PARAMS(TQ, TKV)) {                                     \
+        fa_rowg_core<TQ, TKV, G, false>(FA_ARGS, nullptr);                                         \
+    }
+
+#define FA_ROWPG_KERNEL(NAME, TQ, TKV, G)                                                          \
+    AX_KERNEL void AX_BOUNDS(FA_NT) NAME(FA_PARAMS(TQ, TKV), const ax_pages pg) {                  \
+        fa_rowg_core<TQ, TKV, G, true>(FA_ARGS, &pg);                                              \
+    }
+
+#define FA_ROWG_ALL(Q, KV, TQ, TKV)                                                                \
+    FA_ROWG_KERNEL(fa_rowg2_##Q##_##KV, TQ, TKV, 2)                                                \
+    FA_ROWG_KERNEL(fa_rowg4_##Q##_##KV, TQ, TKV, 4)                                                \
+    FA_ROWG_KERNEL(fa_rowg8_##Q##_##KV, TQ, TKV, 8)                                                \
+    FA_ROWPG_KERNEL(fa_rowpg2_##Q##_##KV, TQ, TKV, 2)                                              \
+    FA_ROWPG_KERNEL(fa_rowpg4_##Q##_##KV, TQ, TKV, 4)                                              \
+    FA_ROWPG_KERNEL(fa_rowpg8_##Q##_##KV, TQ, TKV, 8)
+
 #define FA_TILE_KERNEL(NAME, TQ, TKV, BR, BC, DMAX)                                                \
     AX_KERNEL void AX_BOUNDS(FA_NT) NAME(FA_PARAMS(TQ, TKV)) {                                     \
         fa_tile_impl<TQ, TKV, BR, BC, DMAX>(FA_ARGS);                                              \
@@ -354,5 +526,6 @@ AX_DEV void fa_combine_impl(const float *part_o, const float *part_lse, TO *o, a
 #define FA_ALL_FOR(Q, KV, TQ, TKV)                                                                 \
     FA_ROW_KERNEL(fa_row_##Q##_##KV, TQ, TKV)                                                      \
     FA_ROWP_KERNEL(fa_rowp_##Q##_##KV, TQ, TKV)                                                    \
+    FA_ROWG_ALL(Q, KV, TQ, TKV)                                                                    \
     FA2_TILES(Q, KV, TQ, TKV)                                                                      \
     FA3_TILES(Q, KV, TQ, TKV)

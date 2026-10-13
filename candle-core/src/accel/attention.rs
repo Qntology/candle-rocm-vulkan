@@ -44,6 +44,9 @@ pub struct FlashAttnParams {
     pub v_descale: f32,
     pub version: FlashAttnVersion,
     pub split_kv: SplitKv,
+    /// Let the row kernels run the query heads that share a kv head in one workgroup
+    /// (`fa_rowg*`, bit-identical results, fewer K/V loads).
+    pub gqa_pack: bool,
 }
 
 impl FlashAttnParams {
@@ -57,6 +60,7 @@ impl FlashAttnParams {
             v_descale: 1.0,
             version: FlashAttnVersion::V2,
             split_kv: SplitKv::Auto,
+            gqa_pack: true,
         }
     }
 
@@ -448,7 +452,7 @@ pub fn tile_smem_bytes(d: usize, br: usize, bc: usize) -> usize {
     ((br + bc) * (d + 1) + br * bc) * 4
 }
 
-/// Dynamic shared memory of the row kernel for head dim `d`.
+/// Dynamic shared memory of the row kernel for head dim `d` (per query head of a GQA pack).
 pub fn row_smem_bytes(d: usize) -> usize {
     (d + 2 * FA_THREADS) * 4
 }
@@ -458,20 +462,26 @@ pub fn split_count(geom: &AttnGeometry, policy: SplitKv, compute_units: usize) -
     split_count_for(geom.out_rows(), geom.lk, policy, compute_units)
 }
 
-/// Number of key splits for `rows` query rows over `lk` keys: enough workgroups to fill the GPU
-/// twice, at least 256 keys per split.
+/// Workgroups per compute unit that [`split_count_for`] aims for.
+pub const SPLIT_WORKGROUPS_PER_CU: usize = 64;
+
+/// Number of key splits for `rows` query rows over `lk` keys (row kernels `fa_row*` / `tq_attn*`):
+/// one 128-key window per split, as long as the GPU gets fewer than
+/// [`SPLIT_WORKGROUPS_PER_CU`] workgroups per compute unit, at most [`FA_MAX_SPLITS`].
+///
+/// The row kernels are latency bound (one serial dot product per lane and key), so more,
+/// shorter splits keep winning until a split is a single window. Measured on an RTX 3050 laptop
+/// GPU (16 SMs) for decoding (16 or 64 query rows, 1K-8K keys, f32 / bf16 queries, f32 / f16 /
+/// bf16 / FP8 / TurboQuant FP8 K/V): within 3% of the best fixed split count on average (worst
+/// case 10%), 1.4x-3x faster than the previous rule (2 workgroups per CU, 256+ keys per split).
 pub fn split_count_for(rows: usize, lk: usize, policy: SplitKv, compute_units: usize) -> usize {
     match policy {
         SplitKv::Off => 1,
         SplitKv::Fixed(n) => n.clamp(1, FA_MAX_SPLITS),
         SplitKv::Auto => {
             let rows = rows.max(1);
-            let target = 2 * compute_units.max(1);
-            if rows >= target {
-                return 1;
-            }
-            let by_occupancy = target.div_ceil(rows);
-            let by_keys = lk.div_ceil(256).max(1);
+            let by_occupancy = (SPLIT_WORKGROUPS_PER_CU * compute_units.max(1)).div_ceil(rows);
+            let by_keys = lk.div_ceil(FA_THREADS).max(1);
             by_occupancy.min(by_keys).clamp(1, FA_MAX_SPLITS)
         }
     }
@@ -551,6 +561,63 @@ pub fn kv_dtype_supported(q: DType, kv: DType) -> bool {
 pub fn paged_kernel_name(q: DType, kv: DType) -> Result<String> {
     let name = kernel_name(&FaPlan::Row { splits: 1 }, q, kv)?;
     Ok(name.replacen("fa_row_", "fa_rowp_", 1))
+}
+
+/// Query heads per workgroup of the GQA-packed row kernels for `hq` query and `hkv` kv heads:
+/// the largest of 8, 4, 2 that divides `hq / hkv`, 1 (plain row kernel) otherwise.
+pub fn row_group(hq: usize, hkv: usize) -> usize {
+    let group = hq / hkv.max(1);
+    [8, 4, 2]
+        .into_iter()
+        .find(|g| group >= *g && group % g == 0)
+        .unwrap_or(1)
+}
+
+/// Launch of a row kernel (`fa_row*`, `fa_rowp*`, GQA-packed `fa_rowg{G}*` / `fa_rowpg{G}*`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RowLaunch {
+    pub name: String,
+    pub grid: (u32, u32, u32),
+    pub shared_bytes: usize,
+    pub splits: usize,
+    /// Query heads per workgroup.
+    pub group: usize,
+}
+
+/// Row kernel launch for a call: GQA packing when `p.gqa_pack` allows it (dense batches,
+/// `hq / hkv` a multiple of 2), key splits from [`split_count_for`] over the workgroups.
+pub fn row_launch(
+    geom: &AttnGeometry,
+    p: &FlashAttnParams,
+    compute_units: usize,
+    q: DType,
+    kv: DType,
+    paged: bool,
+) -> Result<RowLaunch> {
+    let base = kernel_name(&FaPlan::Row { splits: 1 }, q, kv)?;
+    let g = if p.gqa_pack && !geom.varlen {
+        row_group(geom.hq, geom.hkv)
+    } else {
+        1
+    };
+    let splits = split_count_for(geom.out_rows() / g, geom.lk, p.split_kv, compute_units);
+    let prefix = match (paged, g) {
+        (false, 1) => "fa_row_".to_string(),
+        (true, 1) => "fa_rowp_".to_string(),
+        (false, g) => format!("fa_rowg{g}_"),
+        (true, g) => format!("fa_rowpg{g}_"),
+    };
+    Ok(RowLaunch {
+        name: base.replacen("fa_row_", &prefix, 1),
+        grid: (
+            (geom.lq * geom.hq / g).clamp(1, MAX_GRID_X) as u32,
+            splits as u32,
+            geom.batch as u32,
+        ),
+        shared_bytes: g * row_smem_bytes(geom.d),
+        splits,
+        group: g,
+    })
 }
 
 /// ALiBi slopes `(hq)` or `(batch, hq)`: returns the batch stride (0 or `hq`).
@@ -710,7 +777,13 @@ mod tests {
             lk: 8192,
             ..geom
         };
-        assert_eq!(plan(&dec, &p, 64 * 1024, 60), FaPlan::Row { splits: 15 });
+        // one 128-key window per split, at most 64 splits
+        assert_eq!(plan(&dec, &p, 64 * 1024, 60), FaPlan::Row { splits: 64 });
+        let short = AttnGeometry { lk: 1000, ..dec };
+        assert_eq!(plan(&short, &p, 64 * 1024, 60), FaPlan::Row { splits: 8 });
+        // many rows: fewer splits, none past 64 workgroups per compute unit
+        assert_eq!(split_count_for(64, 2048, SplitKv::Auto, 16), 16);
+        assert_eq!(split_count_for(4096, 2048, SplitKv::Auto, 16), 1);
         p.split_kv = SplitKv::Off;
         assert_eq!(plan(&dec, &p, 64 * 1024, 60), FaPlan::Row { splits: 1 });
     }
@@ -726,6 +799,40 @@ mod tests {
             paged_kernel_name(DType::BF16, DType::F8E4M3).unwrap(),
             "fa_rowp_bf16_fp8"
         );
+    }
+
+    #[test]
+    fn row_launches() {
+        let geom = AttnGeometry {
+            batch: 1,
+            lq: 1,
+            lk: 2048,
+            hq: 16,
+            hkv: 4,
+            d: 256,
+            q_strides: [0; 3],
+            k_strides: [0; 3],
+            v_strides: [0; 3],
+            q_offset: 0,
+            k_offset: 0,
+            v_offset: 0,
+            varlen: false,
+            total_q: 1,
+        };
+        let mut p = FlashAttnParams::new(1.0);
+        let l = row_launch(&geom, &p, 16, DType::F32, DType::F16, false).unwrap();
+        assert_eq!(l.name, "fa_rowg4_f32_f16");
+        assert_eq!((l.grid, l.splits, l.group), ((4, 16, 1), 16, 4));
+        assert_eq!(l.shared_bytes, 4 * row_smem_bytes(256));
+        let l = row_launch(&geom, &p, 16, DType::BF16, DType::F8E4M3, true).unwrap();
+        assert_eq!(l.name, "fa_rowpg4_bf16_fp8");
+        p.gqa_pack = false;
+        let l = row_launch(&geom, &p, 16, DType::F32, DType::F32, true).unwrap();
+        assert_eq!((l.name.as_str(), l.grid.0, l.group), ("fa_rowp_f32_f32", 16, 1));
+        assert_eq!(row_group(16, 8), 2);
+        assert_eq!(row_group(32, 2), 8);
+        assert_eq!(row_group(12, 4), 1);
+        assert_eq!(row_group(8, 8), 1);
     }
 
     #[test]

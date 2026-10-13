@@ -532,15 +532,32 @@ pub struct TqAttnArgs {
 /// Kernel of a `tq_attn` call: the FP8 specialization when keys and values are both per-vector
 /// FP8 rows (bit-identical results to the generic kernel; switched off with
 /// `TurboQuantOptions::fp8_fast_path` / `CANDLE_TURBO_QUANT_FP8_FAST=0`), the `tq_attnp*`
-/// variants for paged block tables.
-pub fn tq_attn_kernel(k: &TqSide, v: &TqSide, paged: bool) -> &'static str {
+/// variants for paged block tables, `tq_attng{G}*` / `tq_attnpg{G}*` when `group` > 1 query
+/// heads share a workgroup (see [`tq_attn_group`]).
+pub fn tq_attn_kernel(k: &TqSide, v: &TqSide, paged: bool, group: usize) -> String {
     use super::formats::mode;
     let fp8 = k.mode == mode::FP8 && v.mode == mode::FP8 && super::config().turbo_quant.fp8_fast_path;
-    match (paged, fp8) {
-        (false, false) => "tq_attn",
-        (false, true) => "tq_attn_fp8",
-        (true, false) => "tq_attnp",
-        (true, true) => "tq_attnp_fp8",
+    let base = match (paged, group > 1) {
+        (false, false) => "tq_attn".to_string(),
+        (true, false) => "tq_attnp".to_string(),
+        (false, true) => format!("tq_attng{group}"),
+        (true, true) => format!("tq_attnpg{group}"),
+    };
+    if fp8 {
+        base + "_fp8"
+    } else {
+        base
+    }
+}
+
+/// Query heads per workgroup of the CUDA / ROCm `tq_attn*` kernels: the GQA packing of
+/// [`super::attention::row_group`] when `FlashAttnOptions::gqa_decode` is on (results are the
+/// same bit for bit), 1 otherwise.
+pub fn tq_attn_group(hq: usize, hkv: usize) -> usize {
+    if super::config().flash_attn.gqa_decode {
+        super::attention::row_group(hq, hkv)
+    } else {
+        1
     }
 }
 
@@ -551,7 +568,12 @@ impl TqAttnArgs {
     }
 
     pub fn smem_bytes(&self) -> usize {
-        (2 * self.d + 2 * TQ_THREADS + 32) * 4
+        self.smem_bytes_for(1)
+    }
+
+    /// Shared memory of a kernel that runs `group` query heads per workgroup.
+    pub fn smem_bytes_for(&self, group: usize) -> usize {
+        (2 * group * self.d + 2 * group * TQ_THREADS + 32) * 4
     }
 }
 

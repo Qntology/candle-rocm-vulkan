@@ -1196,8 +1196,13 @@ fn tq_prepare(
         softcap: cfg.softcap.unwrap_or(0.0),
         window_left: win(cfg.window_size_left),
         window_right: win(cfg.window_size_right),
+        // key splits per workgroup count (GQA-packed kernels run several heads per workgroup)
         splits: att::split_count_for(
-            b * hq * lq,
+            b * hq * lq
+                / match q.device() {
+                    Device::Cuda(_) | Device::Rocm(_) => accel::turbo::tq_attn_group(hq, hkv),
+                    _ => 1,
+                },
             lk,
             cfg.split_kv.unwrap_or(conf.flash_attn.split_kv),
             accel::profile(q.device()).compute_units,
@@ -1508,6 +1513,58 @@ mod tests {
         );
         // 4-bit rows: about 4.5 bits per value instead of 32
         assert!(cache.storage_bytes() < 2 * 32 * hkv * d * 4 / 6);
+    }
+
+    /// The paged entry points concatenate the valid rows on the CPU (and on GPUs when the paged
+    /// kernels do not apply): same results as the dense functions; bad blocks are errors.
+    #[test]
+    fn attention_blocks_cpu_fallback() {
+        use crate::flash_attn::flash_attn_blocks;
+        let (b, hq, hkv, d) = (1, 4, 2, 64);
+        let kq = TurboQuantizer::new(QuantFormat::Fp8, d, RotationKind::None, 3, &Device::Cpu)
+            .unwrap();
+        let vq = TurboQuantizer::new(QuantFormat::Fp8, d, RotationKind::None, 5, &Device::Cpu)
+            .unwrap();
+        let pack = |q: &TurboQuantizer, x: &Tensor| {
+            let (b, h, t, d) = x.dims4().unwrap();
+            q.quantize_rows(&x.reshape((b * h * t, d)).unwrap())
+                .unwrap()
+                .reshape((b, h, t, q.row_words()))
+                .unwrap()
+        };
+        let (k1, v1) = (rand(&[b, hkv, 16, d], 1), rand(&[b, hkv, 16, d], 2));
+        let (k2, v2) = (rand(&[b, hkv, 12, d], 3), rand(&[b, hkv, 12, d], 4));
+        let q = rand(&[b, hq, 1, d], 5);
+        let cfg = FlashAttnConfig::new(0.125).causal();
+        // dense blocks: 16 rows, then 9 of 12
+        let blocks = [
+            KvBlockRef { k: &k1, v: &v1, rows: 16 },
+            KvBlockRef { k: &k2, v: &v2, rows: 9 },
+        ];
+        let k = Tensor::cat(&[&k1, &k2.narrow(2, 0, 9).unwrap()], 2).unwrap();
+        let v = Tensor::cat(&[&v1, &v2.narrow(2, 0, 9).unwrap()], 2).unwrap();
+        let got = flash_attn_blocks(&q, &blocks, &cfg).unwrap();
+        let want = flash_attn_bhsd(&q, &k, &v, &cfg).unwrap();
+        assert!(rel_err(&got, &want) < 1e-6);
+        // packed blocks
+        let (pk1, pv1, pk2, pv2) = (pack(&kq, &k1), pack(&vq, &v1), pack(&kq, &k2), pack(&vq, &v2));
+        let pblocks = [
+            KvBlockRef { k: &pk1, v: &pv1, rows: 16 },
+            KvBlockRef { k: &pk2, v: &pv2, rows: 9 },
+        ];
+        let kr = Tensor::cat(&[&pk1, &pk2.narrow(2, 0, 9).unwrap()], 2).unwrap();
+        let vr = Tensor::cat(&[&pv1, &pv2.narrow(2, 0, 9).unwrap()], 2).unwrap();
+        let got = attention_packed_blocks(&q, &pblocks, &kq, &vq, &cfg).unwrap();
+        let want = attention_packed(&q, &kr, &vr, 25, &kq, &vq, &cfg).unwrap();
+        assert!(rel_err(&got, &want) < 1e-6);
+        // errors: no blocks, more rows than capacity, shape mismatch, no keys
+        assert!(attention_packed_blocks(&q, &[], &kq, &vq, &cfg).is_err());
+        let bad = [KvBlockRef { k: &pk2, v: &pv2, rows: 13 }];
+        assert!(attention_packed_blocks(&q, &bad, &kq, &vq, &cfg).is_err());
+        let mixed = [KvBlockRef { k: &pk1, v: &pv1, rows: 3 }, KvBlockRef { k: &k1, v: &v1, rows: 3 }];
+        assert!(attention_packed_blocks(&q, &mixed, &kq, &vq, &cfg).is_err());
+        let empty = [KvBlockRef { k: &k1, v: &v1, rows: 0 }];
+        assert!(flash_attn_blocks(&q, &empty, &cfg).is_err());
     }
 
     /// `attention_packed` over rows packed outside a cache (concatenated blocks, spare capacity)

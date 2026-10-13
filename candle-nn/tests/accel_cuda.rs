@@ -100,6 +100,49 @@ fn set_fp8_fast(on: bool) {
     accel::update_config(|c| c.turbo_quant.fp8_fast_path = on);
 }
 
+fn set_gqa(on: bool) {
+    accel::update_config(|c| c.flash_attn.gqa_decode = on);
+}
+
+/// The GQA-packed row kernels (query heads of a kv head in one workgroup) give the same bits
+/// as the plain row kernels, dense and paged, for every K/V dtype.
+#[test]
+fn gqa_packed_rows_are_bit_exact() {
+    let _g = LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    let Some(dev) = gpu() else { return };
+    for (hq, hkv, d, lk) in [(16, 4, 256, 1500), (16, 8, 128, 700), (32, 2, 64, 300), (12, 4, 128, 200)] {
+        for (qd, kvd) in [
+            (DType::F32, DType::F32),
+            (DType::F32, DType::F16),
+            (DType::F32, DType::BF16),
+            (DType::F32, DType::F8E4M3),
+            (DType::BF16, DType::BF16),
+            (DType::F16, DType::F8E4M3),
+        ] {
+            let (cap, n) = (160usize, (lk as usize).div_ceil(160));
+            let last = lk - (n - 1) * cap;
+            let blocks = make_blocks(n, cap, last, hkv, d, &|t: &Tensor| to_kv(t, kvd), &dev);
+            let (k, v) = cat_valid(&blocks);
+            for lq in [1usize, 3] {
+                let q = randn(&[1, hq, lq, d], &dev).to_dtype(qd).unwrap();
+                for split in [SplitKv::Off, SplitKv::Fixed(5)] {
+                    let cfg = strict(1.0 / (d as f32).sqrt()).split_kv(split);
+                    set_gqa(false);
+                    let a = flash_attn_bhsd(&q, &k, &v, &cfg).unwrap();
+                    let ap = flash_attn_blocks(&q, &refs(&blocks), &cfg).unwrap();
+                    set_gqa(true);
+                    let b = flash_attn_bhsd(&q, &k, &v, &cfg).unwrap();
+                    let bp = flash_attn_blocks(&q, &refs(&blocks), &cfg).unwrap();
+                    let what = format!("{qd:?}/{kvd:?} {hq}/{hkv}/{d} lq {lq} {split:?}");
+                    assert_eq!(bits(&a), bits(&b), "dense {what}");
+                    assert_eq!(bits(&ap), bits(&bp), "paged {what}");
+                }
+            }
+        }
+    }
+    set_gqa(true);
+}
+
 /// The FP8 specialization of `tq_attn` gives the same bits as the generic kernel (dense and
 /// paged, with and without key splits).
 #[test]
@@ -132,6 +175,57 @@ fn tq_fp8_fast_path_is_bit_exact() {
         }
     }
     set_fp8_fast(true);
+}
+
+/// The GQA-packed `tq_attng*` kernels give the bits of `tq_attn*` (dense and paged, FP8 fast
+/// path and generic formats).
+#[test]
+fn tq_gqa_packed_is_bit_exact() {
+    let _g = LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    let Some(dev) = gpu() else { return };
+    for (hq, hkv, d, lk) in [(16, 4, 256, 1300), (16, 8, 128, 500), (32, 4, 64, 260)] {
+        for (kf, vf, rot) in [
+            (QuantFormat::Fp8, QuantFormat::Fp8, RotationKind::None),
+            (
+                QuantFormat::TurboMse { bits: 4 },
+                QuantFormat::TurboMse { bits: 3 },
+                RotationKind::Hadamard,
+            ),
+            (QuantFormat::Nvfp4, QuantFormat::Mxfp4, RotationKind::None),
+        ] {
+            let kq = TurboQuantizer::new(kf, d, rot, 5, &dev).unwrap();
+            let vq = TurboQuantizer::new(vf, d, rot, 6, &dev).unwrap();
+            let (cap, n) = (128usize, (lk as usize).div_ceil(128));
+            let last = lk - (n - 1) * cap;
+            let blocks: Vec<(Tensor, Tensor, usize)> = (0..n)
+                .map(|i| {
+                    let rows = if i + 1 == n { last } else { cap };
+                    let k = pack(&kq, &randn(&[1, hkv, cap, d], &dev));
+                    let v = pack(&vq, &randn(&[1, hkv, cap, d], &dev));
+                    (k, v, rows)
+                })
+                .collect();
+            let (kr, vr) = cat_valid(&blocks);
+            for lq in [1usize, 3] {
+                let q = randn(&[1, hq, lq, d], &dev);
+                for split in [SplitKv::Off, SplitKv::Fixed(4)] {
+                    let cfg = strict(1.0 / (d as f32).sqrt()).split_kv(split);
+                    let run = |gqa: bool| {
+                        set_gqa(gqa);
+                        (
+                            bits(&attention_packed(&q, &kr, &vr, lk, &kq, &vq, &cfg).unwrap()),
+                            bits(&attention_packed_blocks(&q, &refs(&blocks), &kq, &vq, &cfg).unwrap()),
+                        )
+                    };
+                    let (a, ap) = run(false);
+                    let (b, bp) = run(true);
+                    assert_eq!(a, b, "dense {kf} {hq}/{hkv}/{d} lq {lq} {split:?}");
+                    assert_eq!(ap, bp, "paged {kf} {hq}/{hkv}/{d} lq {lq} {split:?}");
+                }
+            }
+        }
+    }
+    set_gqa(true);
 }
 
 /// Exact F16 / BF16 K/V with F32 queries run without a conversion and match the F32 kernels on
@@ -387,7 +481,7 @@ fn time_ms(dev: &Device, iters: usize, mut f: impl FnMut()) -> f64 {
     best
 }
 
-const SPLITS: [usize; 11] = [1, 2, 3, 4, 6, 8, 12, 16, 24, 32, 48];
+const SPLITS: [usize; 12] = [1, 2, 3, 4, 6, 8, 12, 16, 24, 32, 48, 64];
 
 /// Decode attention time per split count (`SplitKv::Fixed`), and what `SplitKv::Auto` picks.
 #[test]
@@ -397,13 +491,16 @@ fn bench_split_heuristic() {
     let Some(dev) = gpu() else { return };
     let cus = accel::profile(&dev).compute_units;
     println!("compute units: {cus}");
-    print!("| kernel | q | kv | hq/hkv/d | lk | auto ms |");
+    print!("| kernel | q | kv | hq/hkv/d/lq | lk | auto ms |");
     for s in SPLITS {
         print!(" s{s} |");
     }
     println!(" best |");
-    for (hq, hkv, d) in [(16usize, 4usize, 256usize), (16, 8, 128)] {
+    for (hq, hkv, d, lq) in [(16usize, 4usize, 256usize, 1usize), (16, 8, 128, 1), (16, 4, 256, 4)] {
         for lk in [1024usize, 2048, 4096, 8192] {
+            if lq > 1 && (lk == 1024 || lk == 4096) {
+                continue;
+            }
             let k32 = randn(&[1, hkv, lk, d], &dev);
             let v32 = randn(&[1, hkv, lk, d], &dev);
             let scale = 1.0 / (d as f32).sqrt();
@@ -415,33 +512,44 @@ fn bench_split_heuristic() {
                 (DType::BF16, DType::BF16),
                 (DType::BF16, DType::F8E4M3),
             ] {
-                let q = randn(&[1, hq, 1, d], &dev).to_dtype(qd).unwrap();
+                let q = randn(&[1, hq, lq, d], &dev).to_dtype(qd).unwrap();
                 let (k, v) = (to_kv(&k32, kvd), to_kv(&v32, kvd));
-                let run = |split: SplitKv| {
-                    let cfg = strict(scale).split_kv(split);
-                    time_ms(&dev, 50, || {
-                        flash_attn_bhsd(&q, &k, &v, &cfg).unwrap();
-                    })
-                };
-                bench_row("fa_row", qd, kvd, (hq, hkv, d), lk, &run);
+                for gqa in [false, true] {
+                    set_gqa(gqa);
+                    let run = |split: SplitKv| {
+                        let cfg = strict(scale).split_kv(split);
+                        time_ms(&dev, 20, || {
+                            flash_attn_bhsd(&q, &k, &v, &cfg).unwrap();
+                        })
+                    };
+                    let name = if gqa { "fa_rowg" } else { "fa_row" };
+                    bench_row(name, qd, kvd, (hq, hkv, d, lq), lk, &run);
+                }
+                set_gqa(true);
             }
             // compressed FP8 rows
             let kq = TurboQuantizer::new(QuantFormat::Fp8, d, RotationKind::None, 1, &dev).unwrap();
             let vq = TurboQuantizer::new(QuantFormat::Fp8, d, RotationKind::None, 3, &dev).unwrap();
             let (kr, vr) = (pack(&kq, &k32), pack(&vq, &v32));
-            let q = randn(&[1, hq, 1, d], &dev);
-            for fast in [false, true] {
+            let q = randn(&[1, hq, lq, d], &dev);
+            for (fast, gqa) in [(false, false), (true, false), (true, true)] {
                 set_fp8_fast(fast);
+                set_gqa(gqa);
                 let run = |split: SplitKv| {
                     let cfg = strict(scale).split_kv(split);
-                    time_ms(&dev, 50, || {
+                    time_ms(&dev, 20, || {
                         attention_packed(&q, &kr, &vr, lk, &kq, &vq, &cfg).unwrap();
                     })
                 };
-                let name = if fast { "tq_attn_fp8" } else { "tq_attn" };
-                bench_row(name, DType::F32, DType::F8E4M3, (hq, hkv, d), lk, &run);
+                let name = match (fast, gqa) {
+                    (false, _) => "tq_attn",
+                    (true, false) => "tq_attn_fp8",
+                    (true, true) => "tq_attng_fp8",
+                };
+                bench_row(name, DType::F32, DType::F8E4M3, (hq, hkv, d, lq), lk, &run);
             }
             set_fp8_fast(true);
+            set_gqa(true);
         }
     }
 }
@@ -450,12 +558,12 @@ fn bench_row(
     name: &str,
     qd: DType,
     kvd: DType,
-    (hq, hkv, d): (usize, usize, usize),
+    (hq, hkv, d, lq): (usize, usize, usize, usize),
     lk: usize,
     run: &dyn Fn(SplitKv) -> f64,
 ) {
     let auto = run(SplitKv::Auto);
-    print!("| {name} | {qd:?} | {kvd:?} | {hq}/{hkv}/{d} | {lk} | {auto:.4} |");
+    print!("| {name} | {qd:?} | {kvd:?} | {hq}/{hkv}/{d}/{lq} | {lk} | {auto:.4} |");
     let mut best = (f64::INFINITY, 0);
     for s in SPLITS {
         let t = run(if s == 1 { SplitKv::Off } else { SplitKv::Fixed(s) });
@@ -481,10 +589,10 @@ fn bench_paged_vs_cat() {
         let q = randn(&[1, hq, 1, d], &dev);
         let cfg = strict(1.0 / 16.0);
         let dense = make_blocks(n, 1024, 1000, hkv, d, &|t: &Tensor| t.clone(), &dev);
-        let paged = time_ms(&dev, 30, || {
+        let paged = time_ms(&dev, 20, || {
             flash_attn_blocks(&q, &refs(&dense), &cfg).unwrap();
         });
-        let cat = time_ms(&dev, 30, || {
+        let cat = time_ms(&dev, 20, || {
             let (k, v) = cat_valid(&dense);
             flash_attn_bhsd(&q, &k, &v, &cfg).unwrap();
         });
@@ -493,10 +601,10 @@ fn bench_paged_vs_cat() {
             .iter()
             .map(|(k, v, r)| (pack(&kq, k), pack(&vq, v), *r))
             .collect();
-        let paged = time_ms(&dev, 30, || {
+        let paged = time_ms(&dev, 20, || {
             attention_packed_blocks(&q, &refs(&packed), &kq, &vq, &cfg).unwrap();
         });
-        let cat = time_ms(&dev, 30, || {
+        let cat = time_ms(&dev, 20, || {
             let (k, v) = cat_valid(&packed);
             let lk = k.dim(2).unwrap();
             attention_packed(&q, &k, &v, lk, &kq, &vq, &cfg).unwrap();

@@ -21,6 +21,8 @@ fn switches() {
         ("CANDLE_TURBO_QUANT_V_BITS", "3"),
         ("CANDLE_TURBO_QUANT_ROTATION", "dense"),
         ("CANDLE_TURBO_QUANT_FUSED", "off"),
+        ("CANDLE_TURBO_QUANT_FP8_FAST", "0"),
+        ("CANDLE_FLASH_ATTN_GQA", "off"),
     ] {
         std::env::set_var(k, v);
     }
@@ -37,6 +39,8 @@ fn switches() {
     assert_eq!(c.turbo_quant.value_bits, 3);
     assert_eq!(c.turbo_quant.rotation, RotationKind::Dense);
     assert!(!c.turbo_quant.fused_attention);
+    assert!(!c.turbo_quant.fp8_fast_path);
+    assert!(!c.flash_attn.gqa_decode);
     let report = accel::describe(&cpu);
     assert!(!report.flash_attn_active);
     assert_eq!(report.key_format, QuantFormat::Nvfp4);
@@ -96,6 +100,8 @@ fn switches() {
         "CANDLE_TURBO_QUANT_V_BITS",
         "CANDLE_TURBO_QUANT_ROTATION",
         "CANDLE_TURBO_QUANT_FUSED",
+        "CANDLE_TURBO_QUANT_FP8_FAST",
+        "CANDLE_FLASH_ATTN_GQA",
     ] {
         std::env::remove_var(k);
     }

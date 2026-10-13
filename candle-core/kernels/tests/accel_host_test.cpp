@@ -13,6 +13,7 @@
 #include <map>
 #include <stdexcept>
 #include <string>
+#include <type_traits>
 #include <vector>
 
 struct Arr {
@@ -163,7 +164,42 @@ template <typename TQ, typename TKV> static Arrays op_fa(const Arrays &in) {
     const ax_u32 kind = cfg[0], dmax = cfg[1], version = cfg[2], splits = cfg[3], varlen = cfg[4];
     const unsigned gx = cfg[5];
     const ax_u32 alibi_bs = cfg[6];
-    if (kind == 0) {
+    const ax_u32 G = need(in, "cfg").len<ax_u32>() > 7 ? cfg[7] : 1; // GQA pack of the row kernel
+    if (kind == 0 && G > 1) {
+        std::vector<float> po(splits > 1 ? splits * rows * D : 1), pl(splits > 1 ? splits * rows : 1);
+        const bool paged = opt(in, "pg_rows") != nullptr;
+        ax_pages pg;
+        memset(&pg, 0, sizeof(pg));
+        if (paged)
+            pg = make_pages(in, reinterpret_cast<ax_u64>(k.data()), reinterpret_cast<ax_u64>(v.data()),
+                            sizeof(TKV));
+        const TKV *kp = paged ? nullptr : k.data(), *vp = paged ? nullptr : v.data();
+        auto run = [&](auto pack) {
+            constexpr int GG = decltype(pack)::value;
+            candle_emu::launch(gx, splits, B, FA_NT, GG * (D + 2 * FA_NT) * 4, [&] {
+                if (paged)
+                    fa_rowg_core<TQ, TKV, GG, true>(q.data(), kp, vp, o.data(), po.data(), pl.data(), alibi,
+                                                    nullptr, nullptr, Lq, Lk, Hq, Hkv, D, st[0], st[1], st[2],
+                                                    st[3], st[4], st[5], st[6], st[7], st[8], fp[0], fp[1],
+                                                    ip[0], ip[1], fp[2], fp[3], splits, alibi_bs, 0, rows, &pg);
+                else
+                    fa_rowg_core<TQ, TKV, GG, false>(q.data(), kp, vp, o.data(), po.data(), pl.data(), alibi,
+                                                     nullptr, nullptr, Lq, Lk, Hq, Hkv, D, st[0], st[1], st[2],
+                                                     st[3], st[4], st[5], st[6], st[7], st[8], fp[0], fp[1],
+                                                     ip[0], ip[1], fp[2], fp[3], splits, alibi_bs, 0, rows,
+                                                     nullptr);
+            });
+        };
+        if (G == 2) run(std::integral_constant<int, 2>{});
+        else if (G == 4) run(std::integral_constant<int, 4>{});
+        else if (G == 8) run(std::integral_constant<int, 8>{});
+        else throw std::runtime_error("unknown gqa pack");
+        if (splits > 1) {
+            candle_emu::launch((unsigned)std::min<ax_u64>(rows, 7), 1, 1, FA_NT, splits * 4, [&] {
+                fa_combine_impl<TQ>(po.data(), pl.data(), o.data(), rows, D, splits);
+            });
+        }
+    } else if (kind == 0) {
         std::vector<float> po(splits > 1 ? splits * rows * D : 1), pl(splits > 1 ? splits * rows : 1);
         if (opt(in, "pg_rows")) {
             // paged row kernel: the blocks live inside k / v at the given element offsets
@@ -310,18 +346,36 @@ static Arrays op_tq_attn(const Arrays &in) {
     ax_pages pg;
     memset(&pg, 0, sizeof(pg));
     if (paged) pg = make_pages(in, reinterpret_cast<ax_u64>(kd), reinterpret_cast<ax_u64>(vd), 4);
-    candle_emu::launch(u[15], splits, B, TQ_NT, smem, [&] {
-        const ax_u32 *k = paged ? nullptr : kd, *v = paged ? nullptr : vd;
+    // GQA pack (query heads per workgroup, u[18]): the tq_attng kernels
+    const ax_u32 G = need(in, "uparams").len<ax_u32>() > 18 ? u[18] : 1;
+    const ax_u32 *k = paged ? nullptr : kd, *v = paged ? nullptr : vd;
 #define TQ_HOST_ARGS                                                                               \
     qx, k, v, tab, alibi, o.data(), po.data(), pl.data(), Lq, Lk, Hq, Hkv, D, s[0], s[1], s[2], s[3], \
         s[4], s[5], s[6], s[7], s[8], u[6], u[7], u[8], u[9], u[10], u[11], u[12], u[13], f[0], f[1],  \
         ip[0], ip[1], splits, u[16], rows
-        if (paged && fp8) tq_attnp_fp8_impl(TQ_HOST_ARGS, pg);
-        else if (paged) tq_attnp_impl(TQ_HOST_ARGS, pg);
-        else if (fp8) tq_attn_fp8_impl(TQ_HOST_ARGS);
-        else tq_attn_impl(TQ_HOST_ARGS);
+    if (G > 1) {
+        auto run = [&](auto pack) {
+            constexpr int GG = decltype(pack)::value;
+            candle_emu::launch(u[15], splits, B, TQ_NT, (2 * GG * D + 2 * GG * TQ_NT + 32) * 4, [&] {
+                if (paged && fp8) tq_attng_impl<true, true, GG>(TQ_HOST_ARGS, &pg);
+                else if (paged) tq_attng_impl<false, true, GG>(TQ_HOST_ARGS, &pg);
+                else if (fp8) tq_attng_impl<true, false, GG>(TQ_HOST_ARGS, nullptr);
+                else tq_attng_impl<false, false, GG>(TQ_HOST_ARGS, nullptr);
+            });
+        };
+        if (G == 2) run(std::integral_constant<int, 2>{});
+        else if (G == 4) run(std::integral_constant<int, 4>{});
+        else if (G == 8) run(std::integral_constant<int, 8>{});
+        else throw std::runtime_error("unknown gqa pack");
+    } else {
+        candle_emu::launch(u[15], splits, B, TQ_NT, smem, [&] {
+            if (paged && fp8) tq_attnp_fp8_impl(TQ_HOST_ARGS, pg);
+            else if (paged) tq_attnp_impl(TQ_HOST_ARGS, pg);
+            else if (fp8) tq_attn_fp8_impl(TQ_HOST_ARGS);
+            else tq_attn_impl(TQ_HOST_ARGS);
+        });
+    }
 #undef TQ_HOST_ARGS
-    });
     if (splits > 1) {
         candle_emu::launch(5, 1, 1, TQ_NT, splits * 4,
                            [&] { tq_combine_impl(po.data(), pl.data(), o.data(), rows, D, splits); });

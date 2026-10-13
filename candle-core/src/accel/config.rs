@@ -221,6 +221,10 @@ pub struct FlashAttnOptions {
     /// Hadamard incoherent processing (rotate Q and K) when `flash_attn_fp8` quantizes K.
     /// Env: `CANDLE_FLASH_ATTN_HADAMARD`.
     pub hadamard: bool,
+    /// Decoding (row) kernels run the query heads that share a kv head in one workgroup, so
+    /// K/V are read once per kv head instead of once per query head (same results bit for
+    /// bit). Env: `CANDLE_FLASH_ATTN_GQA`.
+    pub gqa_decode: bool,
     /// Backends that may use the fused kernels. Env: `CANDLE_FLASH_ATTN_BACKENDS`.
     pub backends: BackendSwitches,
     /// Log the selected kernel once per configuration. Env: `CANDLE_FLASH_ATTN_DEBUG`.
@@ -235,6 +239,7 @@ impl Default for FlashAttnOptions {
             split_kv: SplitKv::Auto,
             fp8_kv: true,
             hadamard: true,
+            gqa_decode: true,
             backends: BackendSwitches::all(),
             debug: false,
         }
@@ -373,6 +378,7 @@ impl AccelConfig {
         );
         env_bool("CANDLE_FLASH_ATTN_FP8_KV", &mut fa.fp8_kv);
         env_bool("CANDLE_FLASH_ATTN_HADAMARD", &mut fa.hadamard);
+        env_bool("CANDLE_FLASH_ATTN_GQA", &mut fa.gqa_decode);
         env_parse(
             "CANDLE_FLASH_ATTN_BACKENDS",
             &mut fa.backends,

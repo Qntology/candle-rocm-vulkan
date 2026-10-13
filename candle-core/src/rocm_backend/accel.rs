@@ -9,7 +9,7 @@ use crate::accel::attention::{
     self as att, AttnGeometry, FaExtra, FaPlan, FlashAttnParams, PageTable, PagedKv, FA_THREADS,
     MAX_GRID_X,
 };
-use crate::accel::turbo::{tq_attn_kernel, TqAttnArgs, TqRowArgs, TQ_THREADS};
+use crate::accel::turbo::{tq_attn_group, tq_attn_kernel, TqAttnArgs, TqRowArgs, TQ_THREADS};
 use crate::{bail, DType, Result};
 
 fn null() -> *const u8 {
@@ -68,7 +68,19 @@ impl RocmStorage {
         }
         let prof = self.device.accel_profile();
         let plan = att::plan(geom, p, prof.max_shared_mem, prof.compute_units);
-        let name = att::kernel_name(&plan, self.dtype, k.dtype)?;
+        // row plans may pack the query heads of a kv head (fa_rowg*, same results)
+        let (name, grid, smem, splits) = match plan {
+            FaPlan::Row { .. } => {
+                let l =
+                    att::row_launch(geom, p, prof.compute_units, self.dtype, k.dtype, false)?;
+                (l.name, l.grid, l.shared_bytes, l.splits)
+            }
+            FaPlan::Tile { .. } => {
+                let name = att::kernel_name(&plan, self.dtype, k.dtype)?;
+                let (grid, smem, splits) = att::launch_dims(geom, &plan);
+                (name, grid, smem, splits)
+            }
+        };
         let rows = geom.out_rows();
         let d = geom.d;
         let out = self.device.alloc(rows * d * self.esz())?;
@@ -76,7 +88,6 @@ impl RocmStorage {
             return Ok(Self::new(out, self.dtype, self.device.clone()));
         }
         let func = self.device.get_func(Module::FlashAttn, &name)?;
-        let (grid, smem, splits) = att::launch_dims(geom, &plan);
         let part = if splits > 1 {
             Some((
                 self.device.alloc(splits * rows * d * 4)?,
@@ -178,18 +189,15 @@ impl RocmStorage {
             )
         }
         let prof = self.device.accel_profile();
-        let plan = FaPlan::Row {
-            splits: att::split_count(geom, p.split_kv, prof.compute_units),
-        };
-        let name = att::paged_kernel_name(self.dtype, kv_dtype)?;
+        let launch = att::row_launch(geom, p, prof.compute_units, self.dtype, kv_dtype, true)?;
+        let (grid, smem, splits) = (launch.grid, launch.shared_bytes, launch.splits);
         let rows = geom.out_rows();
         let d = geom.d;
         let out = self.device.alloc(rows * d * self.esz())?;
         if rows == 0 || d == 0 {
             return Ok(Self::new(out, self.dtype, self.device.clone()));
         }
-        let func = self.device.get_func(Module::FlashAttn, &name)?;
-        let (grid, smem, splits) = att::launch_dims(geom, &plan);
+        let func = self.device.get_func(Module::FlashAttn, &launch.name)?;
         let part = if splits > 1 {
             Some((
                 self.device.alloc(splits * rows * d * 4)?,
@@ -482,8 +490,9 @@ impl RocmStorage {
         } else {
             None
         };
-        let name = tq_attn_kernel(&a.k, &a.v, table.is_some());
-        let func = self.device.get_func(Module::TurboQuant, name)?;
+        let group = tq_attn_group(a.hq, a.hkv);
+        let name = tq_attn_kernel(&a.k, &a.v, table.is_some(), group);
+        let func = self.device.get_func(Module::TurboQuant, &name)?;
         let (k_p, v_p) = match dense {
             Some((kd, vd)) => (kd.ptr_at(a.k_offset), vd.ptr_at(a.v_offset)),
             None => (null(), null()),
@@ -530,7 +539,7 @@ impl RocmStorage {
             l.words(t.to_words());
         }
         let grid = (
-            (a.lq * a.hq).clamp(1, MAX_GRID_X) as u32,
+            (a.lq * a.hq / group).clamp(1, MAX_GRID_X) as u32,
             splits as u32,
             a.b as u32,
         );
@@ -538,7 +547,7 @@ impl RocmStorage {
             func,
             grid,
             (TQ_THREADS as u32, 1, 1),
-            a.smem_bytes() as u32,
+            a.smem_bytes_for(group) as u32,
             &mut l,
         )?;
         if let Some((po, pl)) = part {
