@@ -100,8 +100,58 @@ pub fn set_native_thresholds(min_elems: Option<usize>, min_flops: Option<usize>)
     MIN_FLOPS_OVERRIDE.store(min_flops.unwrap_or(usize::MAX), Ordering::Relaxed);
 }
 
+/// How the calling thread picks between the GPU kernels and the CPU path, see
+/// [`scoped_exec_mode`].
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum ExecMode {
+    /// Default: per-op choice by device type, op size and weight reuse (fastest, but the
+    /// same row can take a different path, and give different bits, in a different batch).
+    Auto,
+    /// Every op on the CPU path (host views of the tensors). Results equal the CPU backend's.
+    Host,
+    /// Fixed choice per op kind, independent of sizes and history: dense (weight) matmuls
+    /// always run the GPU GEMM kernel (weights mirrored to VRAM on first use, no GEMV),
+    /// everything else runs on the CPU path. A GPU failure is returned as an error instead
+    /// of silently falling back to the CPU path.
+    Gpu,
+}
+
+thread_local! {
+    static EXEC_MODE: std::cell::Cell<ExecMode> = const { std::cell::Cell::new(ExecMode::Auto) };
+}
+
+/// Execution mode of the calling thread.
+pub fn exec_mode() -> ExecMode {
+    EXEC_MODE.with(|m| m.get())
+}
+
+/// Restores the previous [`ExecMode`] of the thread when dropped.
+pub struct ExecModeGuard {
+    prev: ExecMode,
+}
+
+impl Drop for ExecModeGuard {
+    fn drop(&mut self) {
+        EXEC_MODE.with(|m| m.set(self.prev));
+    }
+}
+
+/// Sets the [`ExecMode`] of the calling thread until the guard is dropped.
+///
+/// With `Host` or `Gpu`, the path of every op depends only on the op kind, never on the
+/// batch size or on how often a weight was used before: a row's result is a function of
+/// that row alone (all the kernels involved accumulate each output in a fixed order).
+/// This is what batch-invariant callers (e.g. embedding caches) need.
+pub fn scoped_exec_mode(mode: ExecMode) -> ExecModeGuard {
+    let prev = EXEC_MODE.with(|m| m.replace(mode));
+    ExecModeGuard { prev }
+}
+
 /// Whether GPU kernels are used on `dev`.
 pub fn native_enabled(dev: &VulkanDevice) -> bool {
+    if exec_mode() != ExecMode::Auto {
+        return false;
+    }
     if !dev.ctx().native_ok.load(Ordering::Relaxed) {
         return false;
     }
