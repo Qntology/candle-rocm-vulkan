@@ -683,7 +683,10 @@ impl QCudaStorage {
         if fast_kernel {
             return dequantize_f32(&self.data, self.dtype, elem_count, self.device());
         }
-        if matches!(self.dtype, GgmlDType::F32 | GgmlDType::F16 | GgmlDType::BF16) {
+        if matches!(
+            self.dtype,
+            GgmlDType::F32 | GgmlDType::F16 | GgmlDType::BF16
+        ) {
             // Float GGUF tensors: convert on the device (no dtoh / CPU / htod round trip).
             return self.dequantize_to(elem_count, crate::DType::F32);
         }
@@ -717,7 +720,10 @@ impl QCudaStorage {
     }
 
     pub fn dequantize_f16(&self, elem_count: usize) -> Result<CudaStorage> {
-        if matches!(self.dtype, GgmlDType::F32 | GgmlDType::F16 | GgmlDType::BF16) {
+        if matches!(
+            self.dtype,
+            GgmlDType::F32 | GgmlDType::F16 | GgmlDType::BF16
+        ) {
             return self.dequantize_to(elem_count, crate::DType::F16);
         }
         dequantize_f16(&self.data, self.dtype, elem_count, self.device())
@@ -759,7 +765,10 @@ impl QCudaStorage {
             return super::w8a16::dequantize(&self.device, &view, self.dtype, elem_count, dtype);
         }
         if elem_offset != 0 {
-            crate::bail!("dequantize_range_to: {:?} only supports offset 0", self.dtype)
+            crate::bail!(
+                "dequantize_range_to: {:?} only supports offset 0",
+                self.dtype
+            )
         }
         let f32s = self.dequantize(elem_count)?;
         if dtype == crate::DType::F32 {
@@ -784,13 +793,16 @@ impl QCudaStorage {
         x: &CudaStorage,
         x_l: &crate::Layout,
     ) -> Result<(CudaStorage, crate::Shape)> {
+        use super::w8a16;
         use crate::backend::{BackendDevice, BackendStorage};
         use crate::DType;
-        use super::w8a16;
         let (n, k) = self_shape.dims2()?;
         let dims = x_l.shape().dims();
         if dims.is_empty() || dims[dims.len() - 1] != k {
-            crate::bail!("fwd_exact: input {:?} incompatible with {self_shape:?}", x_l.shape())
+            crate::bail!(
+                "fwd_exact: input {:?} incompatible with {self_shape:?}",
+                x_l.shape()
+            )
         }
         let in_dtype = x.dtype();
         if !matches!(in_dtype, DType::F32 | DType::F16 | DType::BF16) {
@@ -809,7 +821,16 @@ impl QCudaStorage {
         }
         let aligned = (o1 * in_dtype.size_in_bytes()).is_multiple_of(16);
         if rows <= w8a16::MV_MAX_ROWS && aligned && w8a16::mv_supported(self.dtype) {
-            let out = w8a16::matvec(&self.device, &self.data.inner, self.dtype, n, k, x, o1, rows)?;
+            let out = w8a16::matvec(
+                &self.device,
+                &self.data.inner,
+                self.dtype,
+                n,
+                k,
+                x,
+                o1,
+                rows,
+            )?;
             return Ok((out, out_shape));
         }
         let compute = if rows <= w8a16::MV_MAX_ROWS {

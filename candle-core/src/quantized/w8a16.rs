@@ -11,7 +11,7 @@
 //! * `dequantize`: Q8_0 / Q4_0 / Q4K / Q5K / Q6K blocks or F32 / F16 / BF16 elements straight to
 //!   an f32 / f16 / bf16 buffer, one rounding and no f32 intermediate.
 //! * `gemm_tiles`: the prefill path, `x · Wᵀ` with `W` dequantized in row tiles into a transient
-//!   buffer and multiplied by cuBLAS with the same configuration as `Tensor::matmul`.
+//!   buffer and multiplied by cuBLAS (f32 accumulation, f16 / bf16 results rounded once).
 
 use super::GgmlDType;
 use crate::cuda_backend::{CudaDevice, CudaStorage, CudaStorageSlice, WrapErr};
@@ -377,19 +377,36 @@ pub fn dequant_tile_rows(k: usize, dtype: DType) -> usize {
     (dequant_tile_bytes() / (k.max(1) * dtype.size_in_bytes())).max(1)
 }
 
+/// Whether f16 / bf16 prefill GEMMs of a single tile use the exact cuBLAS call of
+/// `Tensor::matmul` (`CANDLE_W8A16_PREFILL_GEMM=matmul`, bit identical to a dense layer holding
+/// the dequantized weight) instead of the default f32-output GEMM + one rounding.
+pub fn prefill_gemm_matches_matmul() -> bool {
+    static NATIVE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *NATIVE.get_or_init(|| {
+        std::env::var("CANDLE_W8A16_PREFILL_GEMM")
+            .map(|v| v.trim().eq_ignore_ascii_case("matmul"))
+            .unwrap_or(false)
+    })
+}
+
 /// `y = x · Wᵀ` for the `rows × k` contiguous input `x` starting at element `x_off` and an
 /// `n × k` weight produced by `tile(row0, nrows)` as dense row tiles of at most `tile_rows`
 /// rows in the dtype of `x` (f32 / f16 / bf16). A tile is freed (stream ordered) as soon as its
 /// GEMM is queued, so at most one tile is alive.
 ///
-/// * One tile (`tile_rows >= n`): the cuBLAS call `Tensor::matmul` issues for
-///   `x.matmul(&w.t())` (same types, compute type and algorithm), so the result is bit
-///   identical to a dense layer holding the dequantized weight.
-/// * Several tiles, f16 / bf16: each tile GEMM writes an f32 `rows × nrows` buffer (bf16 / f16
-///   inputs, f32 compute and output) that one kernel rounds into the columns
-///   `row0..row0 + nrows` of the output. cuBLAS may pick split-k kernels that reduce partial
-///   sums in the output type for some tile shapes; the f32 output keeps a single rounding.
-/// * Several tiles, f32: each tile GEMM writes its columns of the output directly (ldc = n).
+/// * f16 / bf16 (default): each tile GEMM (f16 / bf16 inputs, f32 compute) writes an f32
+///   `rows × nrows` buffer that one kernel rounds into the columns `row0..row0 + nrows` of the
+///   output, so every output is the f32 dot product rounded once. A plain f16 / bf16 cuBLAS
+///   GEMM (what `Tensor::matmul` issues) can pick split-k kernels that reduce partial sums in
+///   the output type: on an RTX 3050 the Qwen3 `down` projection (1024 x 3072) at 256 rows
+///   and skinny shapes (256 x 1024 at 9 rows) come out with errors of 30-130 output ulps that
+///   way.
+/// * f16 / bf16 with `CANDLE_W8A16_PREFILL_GEMM=matmul` and a single tile: the exact cuBLAS call
+///   `Tensor::matmul` issues for `x.matmul(&w.t())`, i.e. bit identical to the dense
+///   dequantize-to-bf16 layer (including its split-k behaviour). Several tiles always use the
+///   f32 output.
+/// * f32: each tile GEMM writes its columns of the output directly (ldc = n), with the
+///   `Tensor::matmul` cuBLAS configuration.
 #[allow(clippy::too_many_arguments)]
 pub fn gemm_tiles(
     dev: &CudaDevice,
@@ -411,8 +428,8 @@ pub fn gemm_tiles(
     if rows > max || n > max || k > max {
         bail!("w8a16 gemm: shape rows={rows} n={n} k={k} too large")
     }
-    // f16 / bf16 with several tiles: f32 GEMM output tiles, bounded by the same byte budget.
-    let staged = tile_rows < n && dtype != DType::F32;
+    // f16 / bf16: f32 GEMM output tiles, bounded by the same byte budget.
+    let staged = dtype != DType::F32 && (tile_rows < n || !prefill_gemm_matches_matmul());
     let tile_rows = if staged {
         tile_rows.min((dequant_tile_bytes() / (rows * 4)).max(1))
     } else {
@@ -421,7 +438,11 @@ pub fn gemm_tiles(
     let cvt = if staged {
         let (osfx, octype) = elem_ctype(dtype)?;
         let name = format!("w8a16_cvt2d_f32_{osfx}");
-        Some(func(dev, &name, format!("W8A16_CVT2D_KERNEL({name}, {octype})"))?)
+        Some(func(
+            dev,
+            &name,
+            format!("W8A16_CVT2D_KERNEL({name}, {octype})"),
+        )?)
     } else {
         None
     };
@@ -436,10 +457,17 @@ pub fn gemm_tiles(
                 let tn = tile_rows.min(n - n0);
                 let w = tile(n0, tn)?;
                 let CudaStorageSlice::$variant(wv) = &w.slice else {
-                    bail!("w8a16 gemm: weight tile is {:?}, expected {dtype:?}", w.dtype())
+                    bail!(
+                        "w8a16 gemm: weight tile is {:?}, expected {dtype:?}",
+                        w.dtype()
+                    )
                 };
                 if wv.len() < tn * k {
-                    bail!("w8a16 gemm: weight tile has {} values, expected {}", wv.len(), tn * k)
+                    bail!(
+                        "w8a16 gemm: weight tile has {} values, expected {}",
+                        wv.len(),
+                        tn * k
+                    )
                 }
                 if let Some(cvt) = &cvt {
                     // SAFETY: fully written by the GEMM below.

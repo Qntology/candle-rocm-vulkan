@@ -1597,7 +1597,13 @@ fn w8_weight_bytes(dtype: GgmlDType, n: usize, k: usize, seed: u64) -> Vec<u8> {
     }
 }
 
-fn w8_qtensor(bytes: &[u8], dtype: GgmlDType, n: usize, k: usize, dev: &Device) -> Result<quantized::QTensor> {
+fn w8_qtensor(
+    bytes: &[u8],
+    dtype: GgmlDType,
+    n: usize,
+    k: usize,
+    dev: &Device,
+) -> Result<quantized::QTensor> {
     let storage = quantized::QStorage::from_data(Cow::Borrowed(bytes), dev, dtype)?;
     quantized::QTensor::new(storage, (n, k))
 }
@@ -1658,9 +1664,21 @@ struct W8Err {
     rounding: f64,
 }
 
-fn w8_err(y: &Tensor, reference: &[f64], rows: usize, cols: &[usize], dtype: DType) -> Result<W8Err> {
-    let y = y.to_dtype(DType::F32)?.reshape((rows, ()))?.to_vec2::<f32>()?;
-    let max_ref = reference.iter().fold(0f64, |m, v| m.max(v.abs())).max(1e-30);
+fn w8_err(
+    y: &Tensor,
+    reference: &[f64],
+    rows: usize,
+    cols: &[usize],
+    dtype: DType,
+) -> Result<W8Err> {
+    let y = y
+        .to_dtype(DType::F32)?
+        .reshape((rows, ()))?
+        .to_vec2::<f32>()?;
+    let max_ref = reference
+        .iter()
+        .fold(0f64, |m, v| m.max(v.abs()))
+        .max(1e-30);
     let (mut max_abs, mut rounding) = (0f64, 0f64);
     for r in 0..rows {
         for (ci, &j) in cols.iter().enumerate() {
@@ -1678,7 +1696,10 @@ fn w8_err(y: &Tensor, reference: &[f64], rows: usize, cols: &[usize], dtype: DTy
 
 fn w8_round_to(x: &[f32], dtype: DType) -> Vec<f32> {
     match dtype {
-        DType::BF16 => x.iter().map(|&v| half::bf16::from_f32(v).to_f32()).collect(),
+        DType::BF16 => x
+            .iter()
+            .map(|&v| half::bf16::from_f32(v).to_f32())
+            .collect(),
         DType::F16 => x.iter().map(|&v| half::f16::from_f32(v).to_f32()).collect(),
         _ => x.to_vec(),
     }
@@ -1688,8 +1709,16 @@ fn w8_bits(t: &Tensor) -> Result<Vec<u32>> {
     let t = t.flatten_all()?;
     Ok(match t.dtype() {
         DType::F32 => t.to_vec1::<f32>()?.iter().map(|v| v.to_bits()).collect(),
-        DType::F16 => t.to_vec1::<half::f16>()?.iter().map(|v| v.to_bits() as u32).collect(),
-        DType::BF16 => t.to_vec1::<half::bf16>()?.iter().map(|v| v.to_bits() as u32).collect(),
+        DType::F16 => t
+            .to_vec1::<half::f16>()?
+            .iter()
+            .map(|v| v.to_bits() as u32)
+            .collect(),
+        DType::BF16 => t
+            .to_vec1::<half::bf16>()?
+            .iter()
+            .map(|v| v.to_bits() as u32)
+            .collect(),
         d => bail!("w8_bits: unexpected {d:?}"),
     })
 }
@@ -1720,7 +1749,10 @@ fn w8_check_forward_exact(
 ) -> Result<()> {
     let bytes = w8_weight_bytes(wtype, n, k, 0x5EED ^ (n * 31 + k) as u64);
     let q_cpu = w8_qtensor(&bytes, wtype, n, k, &Device::Cpu)?;
-    let w_ref = q_cpu.dequantize(&Device::Cpu)?.flatten_all()?.to_vec1::<f32>()?;
+    let w_ref = q_cpu
+        .dequantize(&Device::Cpu)?
+        .flatten_all()?
+        .to_vec1::<f32>()?;
     let q_dev = std::sync::Arc::new(w8_qtensor(&bytes, wtype, n, k, dev)?);
     let exact_mv = dev.is_cuda()
         && matches!(
@@ -1739,7 +1771,11 @@ fn w8_check_forward_exact(
             assert_eq!(y.dtype(), dtype);
             let e = w8_err(&y, &reference, m, &cols, dtype)?;
             let path = if m <= 8 {
-                if exact_mv { "mv" } else { "f32-dense" }
+                if exact_mv {
+                    "mv"
+                } else {
+                    "f32-dense"
+                }
             } else {
                 "dequant+gemm"
             };
@@ -1788,10 +1824,15 @@ fn w8_check_forward_exact(
                     a.len()
                 ));
                 let single_tile = n * k * dtype.size_in_bytes() <= 32 << 20;
-                if single_tile && dev.is_cuda() {
+                let matmul_mode = std::env::var("CANDLE_W8A16_PREFILL_GEMM")
+                    .is_ok_and(|v| v.eq_ignore_ascii_case("matmul"));
+                if single_tile && matmul_mode {
+                    // Opt-in mode: the exact `Tensor::matmul` cuBLAS call.
                     assert_eq!(same, a.len(), "{line}");
                 } else {
-                    assert!(e.rel <= ed.rel * 1.5 + 1e-6, "{line}");
+                    // Default: f32 accumulation rounded once, never worse than the dense layer.
+                    assert!(er.rounding <= 1.05, "{line}");
+                    assert!(e.rel <= ed.rel * 1.05 + 1e-6, "{line}");
                 }
             }
             if compare_qmatmul {
@@ -1808,6 +1849,7 @@ fn w8_check_forward_exact(
 }
 
 /// Qwen3-0.6B projection shapes (n = out, k = in).
+#[cfg(feature = "cuda")]
 const W8_QWEN3_SHAPES: [(&str, usize, usize); 5] = [
     ("q_proj", 2048, 1024),
     ("k/v_proj", 1024, 1024),
@@ -1815,12 +1857,18 @@ const W8_QWEN3_SHAPES: [(&str, usize, usize); 5] = [
     ("gate/up", 3072, 1024),
     ("down", 1024, 3072),
 ];
+#[cfg(feature = "cuda")]
 const W8_MS: [usize; 7] = [1, 2, 4, 8, 9, 64, 256];
 
 #[test]
 fn w8a16_forward_exact_cpu() -> Result<()> {
     let dev = &Device::Cpu;
-    for wtype in [GgmlDType::Q8_0, GgmlDType::Q4K, GgmlDType::Q6K, GgmlDType::F16] {
+    for wtype in [
+        GgmlDType::Q8_0,
+        GgmlDType::Q4K,
+        GgmlDType::Q6K,
+        GgmlDType::F16,
+    ] {
         w8_check_forward_exact(dev, "cpu", wtype, 96, 512, &[1, 3, 9], 96, 96, false)?;
     }
     Ok(())
@@ -1874,7 +1922,10 @@ fn w8a16_dequantize_to_cuda() -> Result<()> {
             assert!(got.device().is_cuda());
             let (a, b) = (w8_bits(&got)?, w8_bits(&want)?);
             let diff = a.iter().zip(&b).filter(|(a, b)| a != b).count();
-            println!("[W8A16-DQ] {wtype:?} -> {dtype:?}: {diff}/{} values differ from the CPU", a.len());
+            println!(
+                "[W8A16-DQ] {wtype:?} -> {dtype:?}: {diff}/{} values differ from the CPU",
+                a.len()
+            );
             if direct {
                 assert_eq!(diff, 0, "{wtype:?} -> {dtype:?} is not bit exact");
                 // Row ranges (block aligned offsets) of the direct kernels.
@@ -1918,21 +1969,61 @@ fn w8a16_forward_exact_lm_head_cuda() -> Result<()> {
     // prefill weight no longer fits one 32 MiB dequantization tile.
     let dev = &Device::new_cuda(0)?;
     let n = 151936 / 4;
-    w8_check_forward_exact(dev, "lm_head/4", GgmlDType::Q8_0, n, 1024, &W8_MS, 384, 48, true)
+    w8_check_forward_exact(
+        dev,
+        "lm_head/4",
+        GgmlDType::Q8_0,
+        n,
+        1024,
+        &W8_MS,
+        384,
+        48,
+        true,
+    )
 }
 
 #[cfg(feature = "cuda")]
 #[test]
 fn w8a16_forward_exact_kquants_cuda() -> Result<()> {
     let dev = &Device::new_cuda(0)?;
-    for wtype in [GgmlDType::Q4_0, GgmlDType::Q4K, GgmlDType::Q5K, GgmlDType::Q6K] {
+    for wtype in [
+        GgmlDType::Q4_0,
+        GgmlDType::Q4K,
+        GgmlDType::Q5K,
+        GgmlDType::Q6K,
+    ] {
         for (n, k) in [(1024, 1024), (1024, 3072), (640, 2048)] {
-            w8_check_forward_exact(dev, "kq", wtype, n, k, &[1, 3, 8, 9, 64], 1 << 20, 48, false)?;
+            w8_check_forward_exact(
+                dev,
+                "kq",
+                wtype,
+                n,
+                k,
+                &[1, 3, 8, 9, 64],
+                1 << 20,
+                48,
+                false,
+            )?;
         }
     }
     // Weight types without a mat-vec kernel: f32 dequantization + f32 GEMM for <= 8 rows.
-    for wtype in [GgmlDType::Q5_0, GgmlDType::Q3K, GgmlDType::F16, GgmlDType::BF16] {
-        w8_check_forward_exact(dev, "other", wtype, 256, 1024, &[1, 8, 9], 1 << 20, 64, false)?;
+    for wtype in [
+        GgmlDType::Q5_0,
+        GgmlDType::Q3K,
+        GgmlDType::F16,
+        GgmlDType::BF16,
+    ] {
+        w8_check_forward_exact(
+            dev,
+            "other",
+            wtype,
+            256,
+            1024,
+            &[1, 8, 9],
+            1 << 20,
+            64,
+            false,
+        )?;
     }
     Ok(())
 }
@@ -1959,7 +2050,13 @@ fn w8a16_forward_exact_layouts_cuda() -> Result<()> {
             let d = (got - &want)?.abs()?.max_all()?.to_scalar::<f32>()?;
             let s = want.abs()?.max_all()?.to_scalar::<f32>()?;
             let rows = flat.dim(0)?;
-            let tol = if dtype == DType::F32 { 1e-5 } else if rows <= 8 { 4e-3 } else { 3e-2 };
+            let tol = if dtype == DType::F32 {
+                1e-5
+            } else if rows <= 8 {
+                4e-3
+            } else {
+                3e-2
+            };
             assert!(d / s <= tol, "{what} {dtype:?}: rel {}", d / s);
         }
         Ok(())
@@ -1972,14 +2069,19 @@ fn w8a16_forward_exact_layouts_cuda() -> Result<()> {
     let flat = x32.flatten_all()?;
     check(&flat.narrow(0, 1, 2 * k)?.reshape((2, k))?, "misaligned")?;
     // Non-contiguous: every other row.
-    check(&x32.reshape((6, 2, k))?.narrow(1, 0, 1)?.squeeze(1)?, "strided rows")?;
+    check(
+        &x32.reshape((6, 2, k))?.narrow(1, 0, 1)?.squeeze(1)?,
+        "strided rows",
+    )?;
     // Transposed storage.
     check(&x32.narrow(0, 0, 4)?.t()?.contiguous()?.t()?, "transposed")?;
     // Zero rows.
     let y = q.forward_exact(&Tensor::zeros((0, k), DType::BF16, dev)?)?;
     assert_eq!(y.dims(), [0, n]);
     // Wrong inner dimension.
-    assert!(q.forward_exact(&Tensor::zeros((2, k + 32), DType::F32, dev)?).is_err());
+    assert!(q
+        .forward_exact(&Tensor::zeros((2, k + 32), DType::F32, dev)?)
+        .is_err());
 
     // QMatMul::forward_exact on the three variants.
     let mm = quantized::QMatMul::from_arc(q.clone())?;
@@ -1997,7 +2099,11 @@ fn w8a16_forward_exact_layouts_cuda() -> Result<()> {
 /// the timed calls are queued, so host-side overhead (this is a debug build) is excluded and the
 /// result is the back-to-back device time per call (kernels + launch gaps).
 #[cfg(feature = "cuda")]
-fn w8_gpu_time_us(dev: &Device, iters: usize, mut f: impl FnMut() -> Result<Tensor>) -> Result<(f64, bool)> {
+fn w8_gpu_time_us(
+    dev: &Device,
+    iters: usize,
+    mut f: impl FnMut() -> Result<Tensor>,
+) -> Result<(f64, bool)> {
     use candle_core::cuda_backend::cudarc::driver::sys::CUevent_flags;
     let cuda = dev.as_cuda_device()?;
     let stream = cuda.cuda_stream();
@@ -2007,17 +2113,23 @@ fn w8_gpu_time_us(dev: &Device, iters: usize, mut f: impl FnMut() -> Result<Tens
     dev.synchronize()?;
     let filler = Tensor::ones((2048, 2048), DType::F32, dev)?;
     let t_fill = std::time::Instant::now();
-    let f0 = stream.record_event(Some(CUevent_flags::CU_EVENT_DEFAULT)).map_err(candle_core::Error::wrap)?;
+    let f0 = stream
+        .record_event(Some(CUevent_flags::CU_EVENT_DEFAULT))
+        .map_err(candle_core::Error::wrap)?;
     for _ in 0..10 {
         let _ = filler.matmul(&filler)?;
     }
-    let start = stream.record_event(Some(CUevent_flags::CU_EVENT_DEFAULT)).map_err(candle_core::Error::wrap)?;
+    let start = stream
+        .record_event(Some(CUevent_flags::CU_EVENT_DEFAULT))
+        .map_err(candle_core::Error::wrap)?;
     let t0 = std::time::Instant::now();
     for _ in 0..iters {
         f()?;
     }
     let host = t0.elapsed().as_secs_f64() + (t0 - t_fill).as_secs_f64();
-    let end = stream.record_event(Some(CUevent_flags::CU_EVENT_DEFAULT)).map_err(candle_core::Error::wrap)?;
+    let end = stream
+        .record_event(Some(CUevent_flags::CU_EVENT_DEFAULT))
+        .map_err(candle_core::Error::wrap)?;
     let ms = start.elapsed_ms(&end).map_err(candle_core::Error::wrap)?;
     let fill_ms = f0.elapsed_ms(&start).map_err(candle_core::Error::wrap)?;
     // Valid when the host finished queueing before the GPU drained the filler.
