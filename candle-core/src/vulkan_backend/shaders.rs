@@ -196,9 +196,10 @@ fn glsl_to_spirv(source: &str) -> Result<Vec<u32>> {
 
     let options = Options::from(naga::ShaderStage::Compute);
     let mut frontend = Frontend::default();
-    let module = frontend
+    let mut module = frontend
         .parse(&options, source)
         .map_err(|e| Error::Msg(format!("vulkan shader parse failed: {e:?}")))?;
+    workgroup_barriers(&mut module);
     let mut validator = Validator::new(ValidationFlags::all(), Capabilities::all());
     let info = validator
         .validate(&module)
@@ -214,6 +215,50 @@ fn glsl_to_spirv(source: &str) -> Result<Vec<u32>> {
         .write(&module, &info, Some(&pipeline_options), &None, &mut words)
         .map_err(|e| Error::Msg(format!("vulkan spv write failed: {e:?}")))?;
     Ok(words)
+}
+
+/// naga 27's GLSL front end lowers `barrier()` to `ControlBarrier(Barrier::all())`, and the SPIR-V
+/// back end picks a *subgroup* execution scope whenever `SUB_GROUP` is among the flags. GLSL's
+/// `barrier()` is a workgroup execution barrier (plus shared / buffer memory ordering), and the
+/// shaders here rely on that across subgroups (shared-memory tiles and reductions). Drivers that
+/// honour the scope literally (MoltenVK maps it to `simdgroup_barrier`) then race. Drop `SUB_GROUP`
+/// so every barrier is emitted as OpControlBarrier(Workgroup, Device, AcquireRelease | Uniform |
+/// Workgroup | Image).
+fn workgroup_barriers(module: &mut naga::Module) {
+    fn fix(block: &mut naga::Block) {
+        for st in block.iter_mut() {
+            match st {
+                naga::Statement::ControlBarrier(flags) | naga::Statement::MemoryBarrier(flags) => {
+                    if flags.contains(naga::Barrier::WORK_GROUP) {
+                        flags.remove(naga::Barrier::SUB_GROUP);
+                    }
+                }
+                naga::Statement::Block(b) => fix(b),
+                naga::Statement::If { accept, reject, .. } => {
+                    fix(accept);
+                    fix(reject);
+                }
+                naga::Statement::Switch { cases, .. } => {
+                    for c in cases.iter_mut() {
+                        fix(&mut c.body);
+                    }
+                }
+                naga::Statement::Loop {
+                    body, continuing, ..
+                } => {
+                    fix(body);
+                    fix(continuing);
+                }
+                _ => {}
+            }
+        }
+    }
+    for (_, f) in module.functions.iter_mut() {
+        fix(&mut f.body);
+    }
+    for ep in module.entry_points.iter_mut() {
+        fix(&mut ep.function.body);
+    }
 }
 
 // ---------------------------------------------------------------------------
