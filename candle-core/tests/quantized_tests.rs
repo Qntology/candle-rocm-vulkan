@@ -1766,6 +1766,18 @@ fn w8_check_forward_exact(
                 }
                 let dense = q_dev.dequantize_to(dtype, dev)?;
                 let y_dense = x.matmul(&dense.t()?)?;
+                // Against weights rounded to the activation dtype the GEMM must only add the
+                // output rounding (f32 accumulation), for both paths.
+                let w_rounded = w8_round_to(&w_ref, dtype);
+                let ref_rounded = w8_reference(&xr, &w_rounded, m, k, &cols);
+                let er = w8_err(&y, &ref_rounded, m, &cols, dtype)?;
+                let erd = w8_err(&y_dense, &ref_rounded, m, &cols, dtype)?;
+                line.push_str(&format!(
+                    " rounding_vs_rounded_w={:.2} (dense {:.2})",
+                    er.rounding, erd.rounding
+                ));
+                // Never worse than the dense layer, and a single rounding when tiled.
+                assert!(er.rounding <= erd.rounding.max(1.0) + 0.05, "{line}");
                 let (a, b) = (w8_bits(&y)?, w8_bits(&y_dense)?);
                 let same = a.iter().zip(&b).filter(|(a, b)| a == b).count();
                 let ed = w8_err(&y_dense, &reference, m, &cols, dtype)?;
@@ -2043,6 +2055,10 @@ fn w8a16_bench_cuda() -> Result<()> {
         .ok()
         .map(|s| s.split(',').filter_map(|v| v.parse().ok()).collect())
         .unwrap_or_else(|| vec![1]);
+    // Back-to-back cost of a trivial kernel: the per-call floor included in every number below.
+    let tiny = Tensor::zeros(8, DType::F32, dev)?;
+    let (floor, _) = w8_gpu_time_us(dev, 100, || tiny.affine(1.0, 0.0))?;
+    println!("[W8A16-BENCH] floor (one trivial kernel per call) {floor:.1} us");
     for (label, n, k) in shapes {
         let bytes = w8_weight_bytes(GgmlDType::Q8_0, n, k, 3);
         let q = std::sync::Arc::new(w8_qtensor(&bytes, GgmlDType::Q8_0, n, k, dev)?);

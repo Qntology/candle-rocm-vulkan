@@ -24,33 +24,46 @@ const SOURCE: &str = include_str!("w8a16.cu");
 pub const MV_MAX_ROWS: usize = 8;
 
 /// Launch shape of the mat-vec kernel: `warps_per_row` warps split the k range of one weight
-/// row, a thread block covers `rows_per_block` weight rows.
+/// row, a thread block covers `rows_per_block` weight rows, every lane unrolls its task loop
+/// `unroll` times.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct MvConfig {
     pub warps_per_row: usize,
     pub rows_per_block: usize,
+    pub unroll: usize,
 }
 
-/// `CANDLE_W8A16_MV=<warps_per_row>x<rows_per_block>` overrides the tuned launch shape
-/// (benchmarking aid; invalid values are ignored).
+/// `CANDLE_W8A16_MV=<warps_per_row>x<rows_per_block>[x<unroll>]` overrides the tuned launch
+/// shape (benchmarking aid; invalid values are ignored).
 fn env_mv_config() -> Option<MvConfig> {
     static CFG: std::sync::OnceLock<Option<MvConfig>> = std::sync::OnceLock::new();
     *CFG.get_or_init(|| {
         let s = std::env::var("CANDLE_W8A16_MV").ok()?;
-        let (w, r) = s.split_once('x')?;
-        let (w, r) = (
-            w.trim().parse::<usize>().ok()?,
-            r.trim().parse::<usize>().ok()?,
-        );
-        let ok = matches!(w, 1 | 2 | 4 | 8) && matches!(r, 1 | 2 | 4 | 8) && w * r <= 16;
+        let v: Vec<usize> = s
+            .split('x')
+            .map(|p| p.trim().parse::<usize>().ok())
+            .collect::<Option<_>>()?;
+        let (w, r, u) = match v[..] {
+            [w, r] => (w, r, 2),
+            [w, r, u] => (w, r, u),
+            _ => return None,
+        };
+        let pow2 = |v: usize| matches!(v, 1 | 2 | 4 | 8);
+        let ok = pow2(w) && pow2(r) && pow2(u) && w * r <= 16;
         ok.then_some(MvConfig {
             warps_per_row: w,
             rows_per_block: r,
+            unroll: u,
         })
     })
 }
 
-/// Tuned launch shape (RTX 3050 / sm_86, see `w8a16_bench` in `tests/quantized_tests.rs`).
+/// Tuned launch shape (RTX 3050 Laptop / sm_86, `w8a16_bench_cuda` in
+/// `tests/quantized_tests.rs`). One decode row of the Qwen3-0.6B tied lm_head (151936 x 1024
+/// Q8_0, 165 MB) takes ~893 us, i.e. ~185 GB/s, the memory bandwidth of the part; the layer
+/// shapes (1-3 MB) are bound by the per-launch cost. Shapes from 1x4 to 2x4 (warps per row x
+/// rows per block) and unroll 1-4 measure within noise; 4 or more warps per row lose up to 2x
+/// on rows of at most 3072 weights, so long rows only get more warps from 4 x 128 lane tasks.
 pub fn mv_config(wtype: GgmlDType, k: usize, _n: usize) -> MvConfig {
     if let Some(c) = env_mv_config() {
         return c;
@@ -70,6 +83,7 @@ pub fn mv_config(wtype: GgmlDType, k: usize, _n: usize) -> MvConfig {
     MvConfig {
         warps_per_row,
         rows_per_block: 4 / warps_per_row.min(4),
+        unroll: 2,
     }
 }
 
@@ -193,10 +207,10 @@ pub fn matvec(
     }
     let row_bytes = (k / d.qk * wtype.type_size()) as i64;
     let cfg = mv_config(wtype, k, n);
-    let (wpr, rpb) = (cfg.warps_per_row, cfg.rows_per_block);
-    let name = format!("w8a16_mv_{}_{xs}_m{rows}_w{wpr}_r{rpb}", d.sfx);
+    let (wpr, rpb, unr) = (cfg.warps_per_row, cfg.rows_per_block, cfg.unroll);
+    let name = format!("w8a16_mv_{}_{xs}_m{rows}_w{wpr}_r{rpb}_u{unr}", d.sfx);
     let inst = format!(
-        "W8A16_MV_KERNEL({name}, {}, {xc}, {rows}, {wpr}, {rpb})",
+        "W8A16_MV_KERNEL({name}, {}, {xc}, {rows}, {wpr}, {rpb}, {unr})",
         d.ty
     );
     let f = func(dev, &name, inst)?;
@@ -343,28 +357,39 @@ pub fn dequantize(
     alloc_out!(cvt)
 }
 
-/// Rows of an `(n, k)` weight dequantized at once by the GEMM path of `forward_exact`:
-/// `CANDLE_W8A16_DEQUANT_TILE_MB` (default 32) MiB of `dtype` values, at least one row.
-pub fn dequant_tile_rows(k: usize, dtype: DType) -> usize {
+/// Byte budget of one transient dequantization tile (and of one f32 GEMM tile):
+/// `CANDLE_W8A16_DEQUANT_TILE_MB` (default 32) MiB.
+fn dequant_tile_bytes() -> usize {
     static TILE_BYTES: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-    let bytes = *TILE_BYTES.get_or_init(|| {
+    *TILE_BYTES.get_or_init(|| {
         std::env::var("CANDLE_W8A16_DEQUANT_TILE_MB")
             .ok()
             .and_then(|s| s.trim().parse::<usize>().ok())
             .filter(|&mb| mb > 0)
             .unwrap_or(32)
             << 20
-    });
-    (bytes / (k.max(1) * dtype.size_in_bytes())).max(1)
+    })
+}
+
+/// Rows of an `(n, k)` weight dequantized at once by the GEMM path of `forward_exact`
+/// (`CANDLE_W8A16_DEQUANT_TILE_MB`, default 32 MiB, of `dtype` values), at least one row.
+pub fn dequant_tile_rows(k: usize, dtype: DType) -> usize {
+    (dequant_tile_bytes() / (k.max(1) * dtype.size_in_bytes())).max(1)
 }
 
 /// `y = x · Wᵀ` for the `rows × k` contiguous input `x` starting at element `x_off` and an
 /// `n × k` weight produced by `tile(row0, nrows)` as dense row tiles of at most `tile_rows`
-/// rows in the dtype of `x` (f32 / f16 / bf16). Every tile is multiplied with the cuBLAS call
-/// `Tensor::matmul` issues for `x.matmul(&w.t())` (same data types, compute type and
-/// algorithm; for a single tile the call is identical), its `rows × nrows` result written
-/// straight into the columns `row0..row0 + nrows` of the `rows × n` output. A tile is freed
-/// (stream ordered) as soon as its GEMM is queued, so at most one tile is alive.
+/// rows in the dtype of `x` (f32 / f16 / bf16). A tile is freed (stream ordered) as soon as its
+/// GEMM is queued, so at most one tile is alive.
+///
+/// * One tile (`tile_rows >= n`): the cuBLAS call `Tensor::matmul` issues for
+///   `x.matmul(&w.t())` (same types, compute type and algorithm), so the result is bit
+///   identical to a dense layer holding the dequantized weight.
+/// * Several tiles, f16 / bf16: each tile GEMM writes an f32 `rows × nrows` buffer (bf16 / f16
+///   inputs, f32 compute and output) that one kernel rounds into the columns
+///   `row0..row0 + nrows` of the output. cuBLAS may pick split-k kernels that reduce partial
+///   sums in the output type for some tile shapes; the f32 output keeps a single rounding.
+/// * Several tiles, f32: each tile GEMM writes its columns of the output directly (ldc = n).
 #[allow(clippy::too_many_arguments)]
 pub fn gemm_tiles(
     dev: &CudaDevice,
@@ -386,11 +411,25 @@ pub fn gemm_tiles(
     if rows > max || n > max || k > max {
         bail!("w8a16 gemm: shape rows={rows} n={n} k={k} too large")
     }
+    // f16 / bf16 with several tiles: f32 GEMM output tiles, bounded by the same byte budget.
+    let staged = tile_rows < n && dtype != DType::F32;
+    let tile_rows = if staged {
+        tile_rows.min((dequant_tile_bytes() / (rows * 4)).max(1))
+    } else {
+        tile_rows
+    };
+    let cvt = if staged {
+        let (osfx, octype) = elem_ctype(dtype)?;
+        let name = format!("w8a16_cvt2d_f32_{osfx}");
+        Some(func(dev, &name, format!("W8A16_CVT2D_KERNEL({name}, {octype})"))?)
+    } else {
+        None
+    };
     let stream = dev.cuda_stream();
     macro_rules! run {
         ($s:expr, $t:ty, $variant:ident) => {{
             let xv = $s.slice(x_off..x_off + rows * k);
-            // SAFETY: every output column is written by exactly one tile GEMM below.
+            // SAFETY: every output column is written by exactly one tile below.
             let mut out = unsafe { dev.alloc::<$t>(rows * n)? };
             let mut n0 = 0;
             while n0 < n {
@@ -402,14 +441,36 @@ pub fn gemm_tiles(
                 if wv.len() < tn * k {
                     bail!("w8a16 gemm: weight tile has {} values, expected {}", wv.len(), tn * k)
                 }
-                {
+                if let Some(cvt) = &cvt {
+                    // SAFETY: fully written by the GEMM below.
+                    let mut acc = unsafe { dev.alloc::<f32>(rows * tn)? };
+                    {
+                        let (a, _ga) = wv.device_ptr(&stream);
+                        let (b, _gb) = xv.device_ptr(&stream);
+                        let (c, _gc) = acc.device_ptr_mut(&stream);
+                        // SAFETY: a = tn × k tile, b = rows × k input, c = rows × tn f32 buffer.
+                        unsafe { gemm_ex(dev, dtype, true, tn, rows, k, a, b, c, tn) }?;
+                    }
+                    let mut dst = out.slice_mut(n0..);
+                    let (rows_i, tn_i, ld) = (rows as i32, tn as i32, n as i64);
+                    let lc = LaunchConfig {
+                        grid_dim: (grid_1d(rows * tn, 256), 1, 1),
+                        block_dim: (256, 1, 1),
+                        shared_mem_bytes: 0,
+                    };
+                    let mut b = stream.launch_builder(cvt);
+                    b.arg(&acc).arg(&mut dst).arg(&rows_i).arg(&tn_i).arg(&ld);
+                    // SAFETY: the arguments match W8A16_CVT2D_KERNEL; `dst` holds rows rows of
+                    // n values from column n0 (the last row ends at column n0 + tn <= n).
+                    unsafe { b.launch(lc) }.w()?;
+                } else {
                     let (a, _ga) = wv.device_ptr(&stream);
                     let (b, _gb) = xv.device_ptr(&stream);
                     let (c, _gc) = out.device_ptr_mut(&stream);
                     let c = c + (n0 * std::mem::size_of::<$t>()) as u64;
                     // SAFETY: a = tn × k weight tile, b = rows × k input, c = column n0 of the
                     // rows × n output (ldc = n); all three live until the call is queued.
-                    unsafe { gemm_ex(dev, dtype, tn, rows, k, a, b, c, n) }?;
+                    unsafe { gemm_ex(dev, dtype, false, tn, rows, k, a, b, c, n) }?;
                 }
                 drop(w);
                 n0 += tn;
@@ -426,16 +487,21 @@ pub fn gemm_tiles(
 }
 
 /// Column-major `C[tn × rows] = A[k × tn]ᵀ · B[k × rows]` (i.e. row-major
-/// `y[rows × tn] = x[rows × k] · w[tn × k]ᵀ`) with leading dimension `ldc`, issued exactly like
-/// `cuda_backend::gemm_strided_batched_{f32,f16,bf16}` (batch 1, `CUBLAS_GEMM_DEFAULT_TENSOR_OP`,
-/// f32 compute unless the matching `gemm_reduced_precision_*` flag is set).
+/// `y[rows × tn] = x[rows × k] · w[tn × k]ᵀ`) with leading dimension `ldc`.
+///
+/// With `c_f32 == false`, A, B and C have type `dtype` and the call is issued exactly like
+/// `cuda_backend::gemm_strided_batched_{f32,f16,bf16}` for a 2D `Tensor::matmul` (batch 1,
+/// same strides, `CUBLAS_GEMM_DEFAULT_TENSOR_OP`, f32 compute unless the matching
+/// `gemm_reduced_precision_*` flag is set). With `c_f32 == true`, C is f32 and the compute type
+/// is always f32.
 ///
 /// # Safety
-/// `a`, `b` and `c` must be device pointers of `dtype` values covering the described matrices.
+/// `a`, `b` and `c` must be device pointers covering the described matrices.
 #[allow(clippy::too_many_arguments)]
 unsafe fn gemm_ex(
     dev: &CudaDevice,
     dtype: DType,
+    c_f32: bool,
     tn: usize,
     rows: usize,
     k: usize,
@@ -455,17 +521,18 @@ unsafe fn gemm_ex(
         &one_f32 as *const f32 as *const c_void,
         &zero_f32 as *const f32 as *const c_void,
     );
+    let c32 = sys::cublasComputeType_t::CUBLAS_COMPUTE_32F;
     let (data_type, compute, (alpha, beta)) = match dtype {
         DType::F32 => (
             sys::cudaDataType_t::CUDA_R_32F,
-            if gemm_reduced_precision_f32() {
+            if gemm_reduced_precision_f32() && !c_f32 {
                 sys::cublasComputeType_t::CUBLAS_COMPUTE_32F_FAST_TF32
             } else {
-                sys::cublasComputeType_t::CUBLAS_COMPUTE_32F
+                c32
             },
             f32s,
         ),
-        DType::F16 if gemm_reduced_precision_f16() => (
+        DType::F16 if gemm_reduced_precision_f16() && !c_f32 => (
             sys::cudaDataType_t::CUDA_R_16F,
             sys::cublasComputeType_t::CUBLAS_COMPUTE_16F,
             (
@@ -473,21 +540,22 @@ unsafe fn gemm_ex(
                 &zero_f16 as *const half::f16 as *const c_void,
             ),
         ),
-        DType::F16 => (
-            sys::cudaDataType_t::CUDA_R_16F,
-            sys::cublasComputeType_t::CUBLAS_COMPUTE_32F,
-            f32s,
-        ),
+        DType::F16 => (sys::cudaDataType_t::CUDA_R_16F, c32, f32s),
         DType::BF16 => (
             sys::cudaDataType_t::CUDA_R_16BF,
-            if gemm_reduced_precision_bf16() {
+            if gemm_reduced_precision_bf16() && !c_f32 {
                 sys::cublasComputeType_t::CUBLAS_COMPUTE_32F_FAST_16BF
             } else {
-                sys::cublasComputeType_t::CUBLAS_COMPUTE_32F
+                c32
             },
             f32s,
         ),
         d => bail!("w8a16 gemm: unsupported dtype {d:?}"),
+    };
+    let c_type = if c_f32 {
+        sys::cudaDataType_t::CUDA_R_32F
+    } else {
+        data_type
     };
     let (tn_i, rows_i, k_i) = (tn as i32, rows as i32, k as i32);
     cudarc::cublas::result::gemm_strided_batched_ex(
@@ -508,7 +576,7 @@ unsafe fn gemm_ex(
         (rows * k) as i64,
         beta,
         c as *mut _,
-        data_type,
+        c_type,
         ldc as i32,
         (rows * tn) as i64,
         1,
@@ -525,7 +593,12 @@ mod tests {
     #[test]
     fn instantiations_parse() {
         // Every instantiation macro is spelled as the Rust side emits it.
-        for m in ["W8A16_MV_KERNEL(", "W8A16_DQ_KERNEL(", "W8A16_CVT_KERNEL("] {
+        for m in [
+            "W8A16_MV_KERNEL(",
+            "W8A16_DQ_KERNEL(",
+            "W8A16_CVT_KERNEL(",
+            "W8A16_CVT2D_KERNEL(",
+        ] {
             assert!(SOURCE.contains(&format!("#define {m}")), "{m}");
         }
         for t in [

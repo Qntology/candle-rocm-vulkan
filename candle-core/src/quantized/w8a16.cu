@@ -307,10 +307,11 @@ struct DecQ6K {
 //
 // Block = (32, WPR, RPB) threads: RPB weight rows per block, WPR warps share the k range of a
 // row (reduced through shared memory), each lane walks the row's lane tasks with a stride of
-// 32 * WPR. `x` holds M contiguous rows of k values, `y` M contiguous rows of n values.
+// 32 * WPR (UNR tasks unrolled). `x` holds M contiguous rows of k values, `y` M contiguous
+// rows of n values.
 // ---------------------------------------------------------------------------
 
-template <typename D, typename XT, int M, int WPR, int RPB>
+template <typename D, typename XT, int M, int WPR, int RPB, int UNR>
 W_DEV void w8a16_mv(const w_u8 *__restrict__ wq, const XT *__restrict__ x, XT *__restrict__ y,
                     const int k, const int n, const w_i64 row_bytes) {
     const int lane = threadIdx.x, wy = threadIdx.y, rz = threadIdx.z;
@@ -321,7 +322,7 @@ W_DEV void w8a16_mv(const w_u8 *__restrict__ wq, const XT *__restrict__ x, XT *_
     if (row < n) {
         const w_u8 *wr = wq + (w_i64)row * row_bytes;
         const int ntasks = (k / D::QK) * D::TASKS;
-#pragma unroll 2
+#pragma unroll UNR
         for (int tk = wy * 32 + lane; tk < ntasks; tk += 32 * WPR) {
             const int b = tk / D::TASKS, t = tk % D::TASKS;
             float w[8 * D::RUNS];
@@ -366,11 +367,11 @@ W_DEV void w8a16_mv(const w_u8 *__restrict__ wq, const XT *__restrict__ x, XT *_
     }
 }
 
-#define W8A16_MV_KERNEL(name, D, XT, M, WPR, RPB)                                                  \
+#define W8A16_MV_KERNEL(name, D, XT, M, WPR, RPB, UNR)                                             \
     extern "C" __global__ void __launch_bounds__(32 * (WPR) * (RPB))                               \
         name(const w_u8 *__restrict__ wq, const XT *__restrict__ x, XT *__restrict__ y, int k,      \
              int n, w_i64 row_bytes) {                                                             \
-        w8a16_mv<D, XT, M, WPR, RPB>(wq, x, y, k, n, row_bytes);                                   \
+        w8a16_mv<D, XT, M, WPR, RPB, UNR>(wq, x, y, k, n, row_bytes);                              \
     }
 
 // ---------------------------------------------------------------------------
@@ -412,4 +413,26 @@ W_DEV void w8a16_cvt(const IT *__restrict__ x, OT *__restrict__ y, const w_i64 n
 #define W8A16_CVT_KERNEL(name, IT, OT)                                                              \
     extern "C" __global__ void name(const IT *__restrict__ x, OT *__restrict__ y, w_i64 n) {       \
         w8a16_cvt<IT, OT>(x, y, n);                                                                \
+    }
+
+// ---------------------------------------------------------------------------
+// f32 GEMM tile (rows x cols, contiguous) rounded once into columns of a wider output whose
+// rows are `ldy` values apart (the multi-tile prefill path).
+// ---------------------------------------------------------------------------
+
+template <typename OT>
+W_DEV void w8a16_cvt2d(const float *__restrict__ x, OT *__restrict__ y, const int rows,
+                       const int cols, const w_i64 ldy) {
+    const w_i64 total = (w_i64)rows * cols;
+    for (w_i64 i = (w_i64)blockIdx.x * blockDim.x + threadIdx.x; i < total;
+         i += (w_i64)gridDim.x * blockDim.x) {
+        const w_i64 r = i / cols, c = i - r * cols;
+        y[r * ldy + c] = WIo<OT>::from_f(x[i]);
+    }
+}
+
+#define W8A16_CVT2D_KERNEL(name, OT)                                                                \
+    extern "C" __global__ void name(const float *__restrict__ x, OT *__restrict__ y, int rows,     \
+                                    int cols, w_i64 ldy) {                                         \
+        w8a16_cvt2d<OT>(x, y, rows, cols, ldy);                                                    \
     }

@@ -776,8 +776,8 @@ impl QCudaStorage {
     /// * At most [`super::w8a16::MV_MAX_ROWS`] rows, a weight type with a mat-vec kernel and a
     ///   16 byte aligned `x`: one exact mat-vec launch (f32 weights and accumulation).
     /// * Otherwise the weight is dequantized on the device to the compute dtype (the dtype of
-    ///   `x`, or f32 for at most `MV_MAX_ROWS` rows) in row tiles and multiplied with the same
-    ///   cuBLAS GEMM as `Tensor::matmul`, writing each tile straight into the output.
+    ///   `x`, or f32 for at most `MV_MAX_ROWS` rows) in row tiles and multiplied by cuBLAS, see
+    ///   [`super::w8a16::gemm_tiles`].
     pub fn fwd_exact(
         &self,
         self_shape: &crate::Shape,

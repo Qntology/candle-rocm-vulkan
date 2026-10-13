@@ -924,12 +924,16 @@ impl QTensor {
     ///   inside the kernel, reads `xs` in its own dtype, accumulates in f32 and rounds once to
     ///   the output dtype.
     /// * CUDA otherwise (prefill): the weight is dequantized on the device to the activation
-    ///   dtype in row tiles of at most `CANDLE_W8A16_DEQUANT_TILE_MB` (default 32) MiB and
-    ///   multiplied by the same cuBLAS GEMM as `Tensor::matmul`, writing straight into the
-    ///   output. With a single tile (every weight up to the tile size) the result is bit
-    ///   identical to `xs.matmul(&self.dequantize_to(xs.dtype(), ..)?.t()?)` on a contiguous
-    ///   `xs`. Other weight types at most `EXACT_MV_MAX_ROWS` rows use f32 dequantization and an
-    ///   f32 GEMM.
+    ///   dtype in row tiles of at most `CANDLE_W8A16_DEQUANT_TILE_MB` (default 32) MiB (a
+    ///   transient buffer) and multiplied by cuBLAS. With a single tile (every weight up to the
+    ///   tile size, e.g. all Qwen3-0.6B projections) this is the exact cuBLAS call of
+    ///   `Tensor::matmul`, so the result is bit identical to
+    ///   `xs.matmul(&self.dequantize_to(xs.dtype(), ..)?.t()?)` on a contiguous `xs`. With
+    ///   several tiles (e.g. a large lm_head) every f16 / bf16 tile GEMM accumulates into an
+    ///   f32 buffer that is rounded once into the output, so tiling never adds a rounding step
+    ///   (cuBLAS may otherwise pick split-k kernels that reduce partial sums in bf16). Weight
+    ///   types without a mat-vec kernel use f32 dequantization and an f32 GEMM for at most
+    ///   `EXACT_MV_MAX_ROWS` rows.
     /// * ROCm: the backend's quantized matmul, which is already exact (f32 mat-vec `qmv_*` for
     ///   at most 8 rows, otherwise f32 dequantization tiles + an f32 rocBLAS GEMM).
     /// * CPU / Metal / Vulkan: dequantize + dense matmul, in f32 for at most
