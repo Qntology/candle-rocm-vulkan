@@ -165,6 +165,19 @@ fn env_flag(name: &str, default: bool) -> bool {
     }
 }
 
+/// Release threshold of the stream-ordered pool: `CANDLE_ROCM_POOL_KEEP_MB` (or the shared
+/// `CANDLE_GPU_POOL_KEEP_MB`), default 256 MiB, `max` never releases on synchronization.
+fn pool_keep_bytes() -> u64 {
+    const DEFAULT_MB: u64 = 256;
+    let v = std::env::var("CANDLE_ROCM_POOL_KEEP_MB")
+        .or_else(|_| std::env::var("CANDLE_GPU_POOL_KEEP_MB"));
+    match v {
+        Ok(v) if v.trim().eq_ignore_ascii_case("max") => u64::MAX,
+        Ok(v) => v.trim().parse::<u64>().unwrap_or(DEFAULT_MB).saturating_mul(1 << 20),
+        Err(_) => DEFAULT_MB << 20,
+    }
+}
+
 fn warn_once(flag: &'static std::sync::atomic::AtomicBool, msg: impl FnOnce() -> String) {
     if !flag.swap(true, Ordering::Relaxed) {
         eprintln!("candle-rocm: {}", msg());
@@ -229,9 +242,18 @@ impl RocmDevice {
         };
         let stream_ordered = env_flag("CANDLE_ROCM_ASYNC_ALLOC", true)
             && hip_runtime::memory::stream_ordered_alloc_supported();
-        let trim_on_sync = env_flag("CANDLE_ROCM_TRIM_ON_SYNC", true);
-        if stream_ordered && env_flag("CANDLE_ROCM_POOL_RELEASE_ZERO", true) {
-            let _ = hip_runtime::memory::set_pool_release_threshold(ordinal as i32, 0);
+        // Trimming at every synchronize (and a release threshold of 0) re-maps the pool memory
+        // over and over: VRAM monitors show a sawtooth and allocations pay the latency. The pool
+        // keeps `pool_keep_bytes()` instead; `Device::trim_memory_pool` releases explicitly.
+        // `CANDLE_ROCM_TRIM_ON_SYNC=1` / `CANDLE_ROCM_POOL_RELEASE_ZERO=1` restore the old policy.
+        let trim_on_sync = env_flag("CANDLE_ROCM_TRIM_ON_SYNC", false);
+        if stream_ordered {
+            let keep = if env_flag("CANDLE_ROCM_POOL_RELEASE_ZERO", false) {
+                0
+            } else {
+                pool_keep_bytes()
+            };
+            let _ = hip_runtime::memory::set_pool_release_threshold(ordinal as i32, keep);
         }
         let modules = Module::ALL.iter().map(|_| OnceLock::new()).collect();
         Ok(Self {
@@ -343,6 +365,53 @@ impl RocmDevice {
             self.set_current()?;
             hip_runtime::memory::trim_default_pool(self.inner.ordinal as i32).w()?;
         }
+        Ok(())
+    }
+
+    /// Waits for all the work queued on the device (`hipDeviceSynchronize`), whatever the thread.
+    pub fn synchronize_all(&self) -> Result<()> {
+        self.set_current()?;
+        self.inner.hip.synchronize().w()
+    }
+
+    /// Makes this device current on the calling thread (`hipSetDevice`).
+    pub fn bind_to_thread(&self) -> Result<()> {
+        self.set_current()
+    }
+
+    /// Bytes reserved by the stream-ordered pool that no allocation uses (0 without the pool).
+    pub fn pool_idle_bytes(&self) -> Result<usize> {
+        if !self.inner.stream_ordered {
+            return Ok(0);
+        }
+        self.set_current()?;
+        let (reserved, used) =
+            hip_runtime::memory::default_pool_usage(self.inner.ordinal as i32).w()?;
+        Ok(reserved.saturating_sub(used).min(usize::MAX as u64) as usize)
+    }
+
+    /// Waits for the device, then returns the pool memory above `keep_bytes` to the driver
+    /// (`hipMemPoolTrimTo`).
+    pub fn trim_memory_pool_to(&self, keep_bytes: usize) -> Result<()> {
+        self.synchronize_all()?;
+        if self.inner.stream_ordered {
+            hip_runtime::memory::trim_default_pool_to(self.inner.ordinal as i32, keep_bytes).w()?;
+        }
+        Ok(())
+    }
+
+    /// Sets the reserved memory the pool keeps when it releases memory at a synchronization
+    /// point (`hipMemPoolAttrReleaseThreshold`).
+    pub fn set_memory_pool_release_threshold(&self, bytes: u64) -> Result<()> {
+        if self.inner.stream_ordered {
+            self.set_current()?;
+            hip_runtime::memory::set_pool_release_threshold(self.inner.ordinal as i32, bytes).w()?;
+        }
+        Ok(())
+    }
+
+    /// The ROCm backend keeps no per-device quantized matmul scratch: nothing to free.
+    pub fn release_workspaces(&self) -> Result<()> {
         Ok(())
     }
 

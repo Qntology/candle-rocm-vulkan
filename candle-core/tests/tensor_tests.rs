@@ -2068,8 +2068,10 @@ fn allocates_twice_when_transferring_to_same_device() -> Result<()> {
     use candle_core::Storage;
     use rand::seq::SliceRandom;
 
+    // `Device::new_cuda` returns one shared device per ordinal (a transfer between two of its
+    // handles is a no-op); an independent device of the same GPU still gets its own copy.
     let first = Device::new_cuda(0)?;
-    let second = Device::new_cuda(0)?;
+    let second = Device::new_cuda_with_stream(0)?;
 
     let mut data: Vec<u32> = (0..262144).collect();
     let mut rng = rand::rng();
