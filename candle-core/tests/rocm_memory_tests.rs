@@ -165,13 +165,20 @@ impl std::fmt::Display for PoolUsage {
 }
 
 /// Reserved / used bytes of the default pool, `None` when the backend does not allocate from it.
+/// Freed buffers kept by the backend's buffer cache (`hipmem::cached_bytes`) are still allocated
+/// from the pool's point of view but free for candle, so they count as idle here, the same way
+/// `Device::pool_idle_bytes` reports them.
 fn pool_usage(r: &RocmDevice) -> Result<Option<PoolUsage>> {
     if !r.uses_stream_ordered_alloc() {
         return Ok(None);
     }
     r.set_current()?;
     let (reserved, used) = hipmem::default_pool_usage(r.ordinal() as i32).w()?;
-    Ok(Some(PoolUsage { reserved, used }))
+    let cached = hipmem::cached_bytes(r.ordinal() as i32) as u64;
+    Ok(Some(PoolUsage {
+        reserved,
+        used: used.saturating_sub(cached),
+    }))
 }
 
 /// `(free, total)` of `Device::mem_info`, checked for consistency.
@@ -954,5 +961,75 @@ fn drop_while_another_device_is_current() -> Result<()> {
             after.used
         );
     }
+    Ok(())
+}
+
+/// Buffer cache of the stream-ordered allocator (`CANDLE_ROCM_ALLOC_CACHE_MB`, default 256 MiB):
+/// a freed buffer is kept, the next allocation of its size class takes it back, `pool_idle_bytes`
+/// counts it as idle, and `trim_memory_pool(0)` returns it to the pool.
+#[test]
+fn buffer_cache_reuses_freed_buffers_and_trim_releases_them() -> Result<()> {
+    let _g = serial();
+    let dev = device()?;
+    let r = rocm(&dev)?;
+    if !r.uses_stream_ordered_alloc() {
+        println!("[rocm-mem] [cache] branch: NO stream-ordered pool, the buffer cache is not used");
+        return Ok(());
+    }
+    let ord = r.ordinal() as i32;
+    if std::env::var_os("CANDLE_ROCM_ALLOC_CACHE_MB").is_none() {
+        assert_eq!(hipmem::cache_limit(), 256 * MIB, "default CANDLE_ROCM_ALLOC_CACHE_MB is not 256");
+    }
+    if hipmem::cache_limit() == 0 {
+        println!("[rocm-mem] [cache] CANDLE_ROCM_ALLOC_CACHE_MB=0: cache off");
+        return Ok(());
+    }
+    dev.trim_memory_pool(0)?;
+    assert_eq!(hipmem::cached_bytes(ord), 0, "trim_memory_pool(0) left buffers in the cache");
+
+    let bytes = 8 * MIB;
+    let t = Tensor::zeros(bytes / 4, DType::F32, &dev)?;
+    dev.synchronize()?;
+    drop(t);
+    let cached = hipmem::cached_bytes(ord);
+    assert_eq!(cached, bytes, "the freed 8 MiB buffer is not in the cache");
+    let idle = dev.pool_idle_bytes()?;
+    assert!(idle >= bytes, "pool_idle_bytes {idle} does not count the cached buffer");
+
+    // Same size class: taken back from the cache, no new pool allocation.
+    let pool_before = hipmem::default_pool_usage(ord).w()?;
+    let t = Tensor::ones(bytes / 4, DType::F32, &dev)?;
+    assert_eq!(hipmem::cached_bytes(ord), 0, "the allocation did not reuse the cached buffer");
+    let pool_after = hipmem::default_pool_usage(ord).w()?;
+    assert_eq!(pool_after.1, pool_before.1, "the pool handed out new memory although a cached buffer fit");
+    let v: Vec<f32> = t.narrow(0, 0, 4)?.to_vec1()?;
+    assert_eq!(v, vec![1.0; 4], "reused buffer holds stale data after Tensor::ones");
+    drop(t);
+
+    // Above the limit: freed as before instead of cached.
+    let big = hipmem::cache_limit() + MIB;
+    let t = Tensor::zeros(big / 4, DType::F32, &dev)?;
+    dev.synchronize()?;
+    let held = hipmem::cached_bytes(ord);
+    drop(t);
+    assert_eq!(hipmem::cached_bytes(ord), held, "a buffer above the cache limit was cached");
+
+    // Decode-like loop: same shapes every step, no growth of the cache beyond one step's buffers.
+    let x = Tensor::ones((32, 128), DType::F32, &dev)?;
+    for _ in 0..200 {
+        let y = (x.exp()? + 1.0)?;
+        let _z = y.sum_keepdim(1)?;
+    }
+    dev.synchronize()?;
+    let after_loop = hipmem::cached_bytes(ord);
+    println!(
+        "[rocm-mem] [cache] limit {:.0} MiB, cached after 200 decode-like steps {:.3} MiB",
+        mib(hipmem::cache_limit() as u64),
+        mib(after_loop as u64)
+    );
+    assert!(after_loop <= bytes + MIB, "the cache grew over a loop of identical steps");
+
+    dev.trim_memory_pool(0)?;
+    assert_eq!(hipmem::cached_bytes(ord), 0, "trim_memory_pool(0) did not release the cache");
     Ok(())
 }

@@ -178,6 +178,17 @@ fn pool_keep_bytes() -> u64 {
     }
 }
 
+/// Most bytes of freed buffers kept for reuse per device (`hip_runtime::memory` buffer cache):
+/// `CANDLE_ROCM_ALLOC_CACHE_MB`, default 256 MiB, 0 turns the cache off.
+fn alloc_cache_bytes() -> usize {
+    const DEFAULT_MB: usize = 256;
+    std::env::var("CANDLE_ROCM_ALLOC_CACHE_MB")
+        .ok()
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .unwrap_or(DEFAULT_MB)
+        .saturating_mul(1 << 20)
+}
+
 fn warn_once(flag: &'static std::sync::atomic::AtomicBool, msg: impl FnOnce() -> String) {
     if !flag.swap(true, Ordering::Relaxed) {
         eprintln!("candle-rocm: {}", msg());
@@ -254,6 +265,9 @@ impl RocmDevice {
                 pool_keep_bytes()
             };
             let _ = hip_runtime::memory::set_pool_release_threshold(ordinal as i32, keep);
+            // hipMallocAsync / hipFreeAsync cost ~45 µs per pair on Windows HIP; freed buffers are
+            // reused instead (see hip_runtime::memory). Trims release the cache first.
+            hip_runtime::memory::set_cache_limit(alloc_cache_bytes());
         }
         let modules = Module::ALL.iter().map(|_| OnceLock::new()).collect();
         Ok(Self {
@@ -363,9 +377,22 @@ impl RocmDevice {
     pub fn trim_memory_pool(&self) -> Result<()> {
         if self.inner.stream_ordered {
             self.set_current()?;
+            self.release_buffer_cache()?;
             hip_runtime::memory::trim_default_pool(self.inner.ordinal as i32).w()?;
         }
         Ok(())
+    }
+
+    /// Returns the freed buffers kept for reuse to the stream-ordered pool, and waits for those
+    /// `hipFreeAsync` calls when there were any: the pool only trims memory whose free completed.
+    fn release_buffer_cache(&self) -> Result<()> {
+        let ordinal = self.inner.ordinal as i32;
+        if hip_runtime::memory::cached_bytes(ordinal) == 0 {
+            return Ok(());
+        }
+        self.set_current()?;
+        hip_runtime::memory::release_cached(ordinal).w()?;
+        self.inner.hip.synchronize().w()
     }
 
     /// Waits for all the work queued on the device (`hipDeviceSynchronize`), whatever the thread.
@@ -379,7 +406,8 @@ impl RocmDevice {
         self.set_current()
     }
 
-    /// Bytes reserved by the stream-ordered pool that no allocation uses (0 without the pool).
+    /// Bytes reserved by the stream-ordered pool that no live tensor uses (0 without the pool):
+    /// the pool's idle memory plus the freed buffers kept for reuse.
     pub fn pool_idle_bytes(&self) -> Result<usize> {
         if !self.inner.stream_ordered {
             return Ok(0);
@@ -387,7 +415,11 @@ impl RocmDevice {
         self.set_current()?;
         let (reserved, used) =
             hip_runtime::memory::default_pool_usage(self.inner.ordinal as i32).w()?;
-        Ok(reserved.saturating_sub(used).min(usize::MAX as u64) as usize)
+        let cached = hip_runtime::memory::cached_bytes(self.inner.ordinal as i32) as u64;
+        Ok(reserved
+            .saturating_sub(used)
+            .saturating_add(cached)
+            .min(usize::MAX as u64) as usize)
     }
 
     /// Waits for the device, then returns the pool memory above `keep_bytes` to the driver
@@ -395,6 +427,7 @@ impl RocmDevice {
     pub fn trim_memory_pool_to(&self, keep_bytes: usize) -> Result<()> {
         self.synchronize_all()?;
         if self.inner.stream_ordered {
+            self.release_buffer_cache()?;
             hip_runtime::memory::trim_default_pool_to(self.inner.ordinal as i32, keep_bytes).w()?;
         }
         Ok(())
