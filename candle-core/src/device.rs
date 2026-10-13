@@ -775,7 +775,18 @@ impl Device {
             Self::Cuda(d) => Ok(Some(d.mem_info()?)),
             Self::Rocm(d) => Ok(Some(d.mem_info()?)),
             Self::Vulkan(d) => Ok(Some(d.mem_info()?)),
-            Self::Cpu | Self::Metal(_) | Self::OpenCl(_) => Ok(None),
+            // Unified memory: the GPU budget is the device's recommended working set; what this
+            // process has allocated on the device (buffers, heaps) counts as used.
+            #[cfg(feature = "metal")]
+            Self::Metal(d) => {
+                let dev = d.metal_device();
+                let total = dev.recommended_max_working_set_size();
+                let used = dev.current_allocated_size();
+                Ok(Some((total.saturating_sub(used), total)))
+            }
+            #[cfg(not(feature = "metal"))]
+            Self::Metal(_) => Ok(None),
+            Self::Cpu | Self::OpenCl(_) => Ok(None),
         }
     }
 
