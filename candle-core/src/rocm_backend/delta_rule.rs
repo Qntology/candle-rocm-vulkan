@@ -45,7 +45,7 @@ impl RocmStorage {
     ) -> Result<(Self, Self, Self)> {
         let dtype = self.dtype;
         let sfx = sfx(dtype)?;
-        let Some(tile) = gd::scan_tile(p.dk) else {
+        let Some(tile) = gd::scan_tile(p.dk, p.dv) else {
             bail!("gated delta rule: head_k_dim {} is not supported by the fused kernel", p.dk)
         };
         let c = p.conv_dim();
@@ -87,7 +87,7 @@ impl RocmStorage {
             dev.launch(
                 func,
                 tile.grid(p.b, p.hv, p.dv),
-                (tile.nt as u32, 1, 1),
+                (tile.threads() as u32, 1, 1),
                 tile.smem_bytes() as u32,
                 &mut la,
             )?;

@@ -12,75 +12,113 @@ pub const GNORM_THREADS: usize = 128;
 /// Largest key head dimension of the fused scan (`dk` is padded to 64, 128 or 256).
 pub const GDN_MAX_HEAD_K_DIM: usize = 256;
 
-/// Tile of one `gdn_scan` instantiation.
+/// Conv widths up to this keep the taps in registers; wider ones read them from global
+/// memory (same results, slower).
+pub const GDN_REG_CONV_MAX: usize = 4;
+
+/// Tile of one `gdn_scan` instantiation (see `kernels/delta_rule_impl.h`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct ScanTile {
     /// Key head dim the kernel is built for (`dk <= dk_cap`).
     pub dk_cap: usize,
-    /// Value columns per workgroup.
-    pub tv: usize,
-    /// Lanes per workgroup.
-    pub nt: usize,
-    /// Tokens staged per chunk.
+    /// Value columns per warp.
+    pub cw: usize,
+    /// Value columns per lane.
+    pub cpl: usize,
+    /// Warps (32 lanes) per workgroup.
+    pub nw: usize,
+    /// Tokens per chunk.
     pub tc: usize,
 }
 
-/// Instantiated tiles as (tv, nt, tc), for each `dk_cap` (the ROCm build compiles all of them,
-/// CUDA compiles the one used on demand). The first entry is the default.
-pub const SCAN_TILES: &[(usize, usize, usize)] = &[(32, 128, 8), (16, 128, 8), (64, 256, 8), (32, 256, 8)];
+/// Instantiated tiles as (dk_cap, cw, cpl, nw, tc). The ROCm build compiles all of them, CUDA
+/// compiles the one used on demand. Tuned on an RTX 3050 (sm_86) for the Qwen3.5 geometry
+/// (Dk = Dv = 128): two value columns per lane halve the shared memory traffic of the scan,
+/// whole-head tiles (TV = 128) compute the q / k conv of a key head once per value head.
+pub const SCAN_TILES: &[(usize, usize, usize, usize, usize)] = &[
+    (64, 16, 2, 8, 8),
+    (64, 16, 2, 4, 8),
+    (128, 16, 2, 8, 8),
+    (128, 16, 2, 4, 8),
+    (256, 8, 1, 8, 8),
+    (256, 8, 1, 4, 8),
+];
 
 /// Key head dims the scan is instantiated for.
 pub const SCAN_DK_CAPS: &[usize] = &[64, 128, 256];
 
 impl ScanTile {
-    pub fn row_groups(&self) -> usize {
-        self.nt / self.tv
+    /// Value columns per workgroup.
+    pub fn tv(&self) -> usize {
+        self.cw * self.nw
+    }
+
+    /// Lanes per workgroup.
+    pub fn threads(&self) -> usize {
+        32 * self.nw
+    }
+
+    /// Lanes sharing a row group (the column stride of a lane).
+    pub fn lanes_per_row_group(&self) -> usize {
+        self.cw / self.cpl.max(1)
     }
 
     /// State rows per lane.
     pub fn rows_per_lane(&self) -> usize {
-        self.dk_cap / self.row_groups()
+        self.dk_cap * self.lanes_per_row_group() / 32
+    }
+
+    /// State registers per lane.
+    pub fn state_regs(&self) -> usize {
+        self.rows_per_lane() * self.cpl
     }
 
     /// Mirrors `GDN_SCAN_SMEM_FLOATS`.
     pub fn smem_floats(&self) -> usize {
-        2 * self.tc * self.dk_cap + self.tc * self.tv + 4 * self.nt + 5 * self.tc
+        2 * self.tc * (2 * self.dk_cap + self.tv() + 8) + self.threads()
     }
 
     pub fn smem_bytes(&self) -> usize {
         4 * self.smem_floats()
     }
 
-    /// Workgroups per multiprocessor the CUDA register allocation targets.
+    /// Workgroups per multiprocessor the CUDA register allocation targets: the state slice
+    /// plus about 48 registers must fit.
     pub fn min_blocks(&self) -> usize {
-        // 64 registers per lane at 8 x 128 lanes; larger state slices get fewer workgroups.
-        let regs = self.rows_per_lane() + 32;
-        (65536 / (regs.next_power_of_two().max(64) * self.nt)).clamp(1, 16)
+        let regs = (self.state_regs() + 48).next_power_of_two().max(64);
+        (65536 / (regs * self.threads())).clamp(1, 16)
     }
 
     pub fn is_valid(&self) -> bool {
-        let ng = self.nt / self.tv.max(1);
-        self.tv > 0
-            && self.nt % self.tv == 0
-            && ng > 0
-            && self.dk_cap % ng == 0
-            && (self.dk_cap / ng) % 4 == 0
+        let lc = self.lanes_per_row_group();
+        self.cpl > 0
+            && self.cw % self.cpl == 0
+            && lc > 0
+            && 32 % lc == 0
+            && self.dk_cap % 32 == 0
+            && self.rows_per_lane() % 4 == 0
+            && self.rows_per_lane() > 0
+            && self.nw > 0
             && self.tc > 0
-            && self.nt % self.tc == 0
-            && self.dk_cap % (self.nt / self.tc) == 0
+            && self.tc <= self.threads()
     }
 
     /// Grid of a launch over `b` batches, `hv` value heads of `dv` columns.
     pub fn grid(&self, b: usize, hv: usize, dv: usize) -> (u32, u32, u32) {
-        (dv.div_ceil(self.tv) as u32, hv as u32, b as u32)
+        (dv.div_ceil(self.tv()) as u32, hv as u32, b as u32)
     }
 
-    /// Kernel symbol, e.g. `gdn_scan_bf16_d128_v32_n128_c8`.
+    /// Kernel symbol, e.g. `gdn_scan_bf16_d128_c16x2_w8_t8`.
     pub fn kernel_name(&self, sfx: &str) -> String {
         format!(
-            "gdn_scan_{sfx}_d{}_v{}_n{}_c{}",
-            self.dk_cap, self.tv, self.nt, self.tc
+            "gdn_scan_{sfx}_d{}_c{}x{}_w{}_t{}",
+            self.dk_cap, self.cw, self.cpl, self.nw, self.tc
         )
+    }
+
+    /// Tuning name, e.g. `c16x2w8t8` (see [`scan_tile`]).
+    pub fn short_name(&self) -> String {
+        format!("c{}x{}w{}t{}", self.cw, self.cpl, self.nw, self.tc)
     }
 }
 
@@ -89,29 +127,40 @@ pub fn dk_cap(dk: usize) -> Option<usize> {
     SCAN_DK_CAPS.iter().copied().find(|&c| dk <= c)
 }
 
-/// Tile used for key head dim `dk`: `CANDLE_GDN_TILE=v{tv}n{nt}c{tc}` selects one of
-/// [`SCAN_TILES`] (for tuning), else the first.
-pub fn scan_tile(dk: usize) -> Option<ScanTile> {
-    let cap = dk_cap(dk)?;
-    let (tv, nt, tc) = std::env::var("CANDLE_GDN_TILE")
-        .ok()
-        .and_then(|s| parse_tile(&s))
-        .filter(|t| SCAN_TILES.contains(t))
-        .unwrap_or(SCAN_TILES[0]);
-    let t = ScanTile {
-        dk_cap: cap,
-        tv,
-        nt,
-        tc,
-    };
-    t.is_valid().then_some(t)
+fn tiles_for(cap: usize) -> impl Iterator<Item = ScanTile> {
+    SCAN_TILES
+        .iter()
+        .filter(move |t| t.0 == cap)
+        .map(|&(dk_cap, cw, cpl, nw, tc)| ScanTile {
+            dk_cap,
+            cw,
+            cpl,
+            nw,
+            tc,
+        })
 }
 
-fn parse_tile(s: &str) -> Option<(usize, usize, usize)> {
-    let s = s.trim().strip_prefix('v')?;
-    let (tv, rest) = s.split_once('n')?;
-    let (nt, tc) = rest.split_once('c')?;
-    Some((tv.parse().ok()?, nt.parse().ok()?, tc.parse().ok()?))
+/// Tile for key head dim `dk` and value head dim `dv`: `CANDLE_GDN_TILE=c{cw}x{cpl}w{nw}t{tc}`
+/// selects one of the instantiated tiles of this `dk` (for tuning); otherwise the 8-warp
+/// tile, or the 4-warp one when it already covers `dv` (fewer idle lanes for small heads).
+pub fn scan_tile(dk: usize, dv: usize) -> Option<ScanTile> {
+    let cap = dk_cap(dk)?;
+    if let Ok(s) = std::env::var("CANDLE_GDN_TILE") {
+        if let Some(t) = tiles_for(cap).find(|t| t.short_name() == s.trim()) {
+            return Some(t);
+        }
+    }
+    let mut tiles: Vec<ScanTile> = tiles_for(cap).collect();
+    tiles.sort_by_key(|t| std::cmp::Reverse(t.nw));
+    let big = *tiles.first()?;
+    Some(
+        tiles
+            .iter()
+            .copied()
+            .filter(|t| t.tv() >= dv && t.tv() < big.tv())
+            .last()
+            .unwrap_or(big),
+    )
 }
 
 /// Kernel arguments of `gdn_scan` that are not buffers (element offsets of the buffers are
@@ -177,22 +226,23 @@ fn parse_scan_name(name: &str) -> Option<(&'static str, ScanTile)> {
     let mut it = rest.split('_');
     let ty = ctype(it.next()?)?;
     let dk_cap = it.next()?.strip_prefix('d')?.parse().ok()?;
-    let tv = it.next()?.strip_prefix('v')?.parse().ok()?;
-    let nt = it.next()?.strip_prefix('n')?.parse().ok()?;
-    let tc = it.next()?.strip_prefix('c')?.parse().ok()?;
+    let (cw, cpl) = it.next()?.strip_prefix('c')?.split_once('x')?;
+    let nw = it.next()?.strip_prefix('w')?.parse().ok()?;
+    let tc = it.next()?.strip_prefix('t')?.parse().ok()?;
     if it.next().is_some() {
         return None;
     }
     let t = ScanTile {
         dk_cap,
-        tv,
-        nt,
+        cw: cw.parse().ok()?,
+        cpl: cpl.parse().ok()?,
+        nw,
         tc,
     };
     t.is_valid().then_some((ty, t))
 }
 
-/// The instantiation line of a Gated DeltaNet kernel name (`gdn_scan_f32_d128_v32_n128_c8`,
+/// The instantiation line of a Gated DeltaNet kernel name (`gdn_scan_f32_d128_c16x2_w8_t8`,
 /// `gdn_gnorm_bf16`).
 pub fn gdn_instantiation(name: &str) -> Option<String> {
     if let Some(sfx) = name.strip_prefix("gdn_gnorm_") {
@@ -200,10 +250,11 @@ pub fn gdn_instantiation(name: &str) -> Option<String> {
     }
     let (ty, t) = parse_scan_name(name)?;
     Some(format!(
-        "GDN_SCAN_KERNEL({name}, {ty}, {}, {}, {}, {}, {})",
+        "GDN_SCAN_KERNEL({name}, {ty}, {}, {}, {}, {}, {}, {GDN_REG_CONV_MAX}, {})",
         t.dk_cap,
-        t.tv,
-        t.nt,
+        t.cw,
+        t.cpl,
+        t.nw,
         t.tc,
         t.min_blocks()
     ))
@@ -224,13 +275,7 @@ pub fn hip_instantiations() -> Vec<String> {
     let mut v = vec![];
     for sfx in ["f32", "f16", "bf16"] {
         for &cap in SCAN_DK_CAPS {
-            for &(tv, nt, tc) in SCAN_TILES {
-                let t = ScanTile {
-                    dk_cap: cap,
-                    tv,
-                    nt,
-                    tc,
-                };
+            for t in tiles_for(cap) {
                 if t.is_valid() {
                     v.push(gdn_instantiation(&t.kernel_name(sfx)).unwrap());
                 }
@@ -249,37 +294,49 @@ mod tests {
     fn names_and_tiles() {
         let t = ScanTile {
             dk_cap: 128,
-            tv: 32,
-            nt: 128,
+            cw: 16,
+            cpl: 2,
+            nw: 8,
             tc: 8,
         };
         assert!(t.is_valid());
+        assert_eq!(t.tv(), 128);
         assert_eq!(t.rows_per_lane(), 32);
-        assert_eq!(t.kernel_name("bf16"), "gdn_scan_bf16_d128_v32_n128_c8");
+        assert_eq!(t.state_regs(), 64);
+        assert_eq!(t.min_blocks(), 2);
+        assert_eq!(t.kernel_name("bf16"), "gdn_scan_bf16_d128_c16x2_w8_t8");
         assert_eq!(
-            gdn_instantiation("gdn_scan_bf16_d128_v32_n128_c8").unwrap(),
-            "GDN_SCAN_KERNEL(gdn_scan_bf16_d128_v32_n128_c8, ax_bf16, 128, 32, 128, 8, 8)"
+            gdn_instantiation("gdn_scan_bf16_d128_c16x2_w8_t8").unwrap(),
+            "GDN_SCAN_KERNEL(gdn_scan_bf16_d128_c16x2_w8_t8, ax_bf16, 128, 16, 2, 8, 8, 4, 2)"
         );
         assert_eq!(
             gdn_instantiation("gdn_gnorm_f16").unwrap(),
             "GDN_GNORM_KERNEL(gdn_gnorm_f16, ax_f16)"
         );
-        assert!(gdn_instantiation("gdn_scan_f32_d100_v32_n128_c8").is_none());
+        assert!(gdn_instantiation("gdn_scan_f32_d100_c16x2_w8_t8").is_none());
+        assert!(gdn_instantiation("gdn_scan_f32_d128_c16x3_w8_t8").is_none());
         assert_eq!(dk_cap(96), Some(128));
         assert_eq!(dk_cap(300), None);
-        assert_eq!(parse_tile("v64n256c8"), Some((64, 256, 8)));
-        for &cap in SCAN_DK_CAPS {
-            for &(tv, nt, tc) in SCAN_TILES {
-                let t = ScanTile {
-                    dk_cap: cap,
-                    tv,
-                    nt,
-                    tc,
-                };
-                assert!(t.is_valid(), "{t:?}");
-            }
+        for &(dk_cap, cw, cpl, nw, tc) in SCAN_TILES {
+            let t = ScanTile {
+                dk_cap,
+                cw,
+                cpl,
+                nw,
+                tc,
+            };
+            assert!(t.is_valid(), "{t:?}");
+            // two workgroups of the default tiles fit the 100 KiB of an sm_86 multiprocessor
+            assert!(t.smem_bytes() <= 48 * 1024, "{t:?}");
+            assert!(SCAN_DK_CAPS.contains(&dk_cap));
         }
-        let src = gdn_cuda_source("gdn_scan_f32_d64_v32_n128_c8").unwrap();
+        for &cap in SCAN_DK_CAPS {
+            assert!(scan_tile(cap, cap).is_some());
+        }
+        assert_eq!(scan_tile(128, 128).unwrap().nw, 8);
+        assert_eq!(scan_tile(128, 64).unwrap().nw, 4);
+        assert_eq!(scan_tile(96, 200).unwrap().nw, 8);
+        let src = gdn_cuda_source("gdn_scan_f32_d64_c16x2_w8_t8").unwrap();
         assert!(!src.contains("#include \""));
     }
 

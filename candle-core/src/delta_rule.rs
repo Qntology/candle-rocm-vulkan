@@ -250,8 +250,8 @@ pub fn fused_gated_delta_rule(
     }
     if t == 0 {
         let conv_state = match conv_state {
-            Some(cs) => cs.to_dtype(dtype)?.contiguous()?,
-            None => Tensor::zeros((bsz, c, k - 1), dtype, &dev)?,
+            Some(cs) if cs.elem_count() > 0 => cs.to_dtype(dtype)?.contiguous()?,
+            _ => Tensor::zeros((bsz, c, k - 1), dtype, &dev)?,
         };
         let recurrent_state = match recurrent_state {
             Some(s) => s.to_dtype(DType::F32)?.contiguous()?,
@@ -358,8 +358,10 @@ fn gpu_gated_delta_rule(inp: &GdnInputs, cfg: &GdnConfig) -> Result<GdnOutput> {
     let (b, bv) = rows_view(&gate(inp.b)?)?;
     let cw = f32_contiguous(inp.conv_weight)?;
     let cb = inp.conv_bias.map(f32_contiguous).transpose()?;
+    // (an empty conv state, conv width 1, is passed as null)
     let cs = inp
         .conv_state
+        .filter(|s| s.elem_count() > 0)
         .map(|s| s.to_dtype(dtype)?.contiguous())
         .transpose()?;
     let na = f32_contiguous(&inp.neg_a.flatten_all()?)?;
@@ -613,7 +615,7 @@ mod cpu {
                 }
             }
         }
-        let scale = (dk as f32).sqrt();
+        let scale = (1.0 / (dk as f64).sqrt()) as f32;
         let eps = cfg.l2norm_eps;
         let heads: Vec<(Vec<f32>, Vec<f32>)> = (0..bsz * hv)
             .into_par_iter()
@@ -648,7 +650,7 @@ mod cpu {
                             u.iter_mut().for_each(|e| *e *= inv);
                         }
                     }
-                    q.iter_mut().for_each(|e| *e /= scale);
+                    q.iter_mut().for_each(|e| *e *= scale);
                     let ab = (bi * t + tt) * hv + h;
                     let g = na[h] * softplus(av[ab] + dtb[h]);
                     let eg = g.exp();

@@ -140,7 +140,7 @@ impl CudaStorage {
         use crate::backend::BackendStorage;
         let dtype = self.dtype();
         let sfx = sfx(dtype)?;
-        let Some(tile) = gd::scan_tile(p.dk) else {
+        let Some(tile) = gd::scan_tile(p.dk, p.dv) else {
             bail!("gated delta rule: head_k_dim {} is not supported by the fused kernel", p.dk)
         };
         let dev = &self.device;
@@ -204,7 +204,7 @@ impl CudaStorage {
             }
             let cfg = LaunchConfig {
                 grid_dim: tile.grid(p.b, p.hv, p.dv),
-                block_dim: (tile.nt as u32, 1, 1),
+                block_dim: (tile.threads() as u32, 1, 1),
                 shared_mem_bytes: smem as u32,
             };
             // SAFETY: arguments match GDN_SCAN_PARAMS.

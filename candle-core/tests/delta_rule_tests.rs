@@ -2,8 +2,9 @@
 //! against a naive f64 reference, decode chaining, strided inputs, the gated RMS norm, and
 //! (with `CANDLE_GDN_FIXTURES=<dir>`) the transformers fixtures of `gen_gdn_ref.py`.
 //!
-//! The CUDA / ROCm checks run when a GPU device can be created. `bench_gdn_qwen35_4b` (ignored)
-//! times the kernel for the Qwen3.5-4B geometry: `--ignored --nocapture`.
+//! The CUDA / ROCm checks run when a GPU device can be created; `host_emulated_kernels` runs the
+//! kernel source on the host emulator when a C++20 compiler is available. `bench_gdn_qwen35`
+//! (ignored) times the kernel for the Qwen3.5-4B / 2B geometries: `--ignored --nocapture`.
 
 use candle_core::delta_rule::{
     fused_gated_delta_rule, fused_gated_rms_norm, fused_gdn_supported, GdnConfig, GdnHeadOrder,
@@ -251,6 +252,9 @@ fn run(cs: &Case, d: &Data, dev: &Device, dtype: DType) -> Result<GdnOutput> {
 }
 
 fn host(t: &Tensor) -> Result<Vec<f32>> {
+    if t.elem_count() == 0 {
+        return Ok(vec![]);
+    }
     t.to_dtype(DType::F32)?.flatten_all()?.to_vec1::<f32>()
 }
 
@@ -311,6 +315,12 @@ fn cases() -> Vec<Case> {
     let mut c = Case::new(2, 19, 2, 4, 64, 32, 4);
     c.order = GdnHeadOrder::Tiled;
     v.push(c);
+    // conv width 5 (taps read from global memory on the GPU), dv = 200 (two value tiles)
+    let mut c = Case::new(1, 10, 1, 2, 64, 200, 5);
+    c.bias = true;
+    v.push(c);
+    // conv width 1 (empty conv state), three batches, dv = 64 (4-warp tile)
+    v.push(Case::new(3, 9, 2, 2, 128, 64, 1));
     v
 }
 
@@ -622,11 +632,257 @@ fn transformers_fixtures() -> Result<()> {
     Ok(())
 }
 
-/// Per-layer latency of the fused kernel for the Qwen3.5-4B linear-attention geometry
-/// (Hk 16, Hv 32, Dk = Dv = 128, K 4).
+// ---------------------------------------------------------------------------
+// Host emulation of the GPU kernels (kernels/tests/delta_rule_host_test.cpp): covers the
+// kernel logic (the same source hipcc compiles for ROCm) without a GPU. Needs a C++20
+// compiler: `CXX` (g++ / clang++ style, or MSVC `cl` from a developer prompt), else `c++`;
+// skipped when none works.
+// ---------------------------------------------------------------------------
+
+fn host_harness() -> Option<&'static std::path::Path> {
+    use std::path::PathBuf;
+    use std::process::Command;
+    static BIN: std::sync::OnceLock<Option<PathBuf>> = std::sync::OnceLock::new();
+    BIN.get_or_init(|| {
+        let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR"));
+        let src = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("kernels")
+            .join("tests")
+            .join("delta_rule_host_test.cpp");
+        let cxx = std::env::var("CXX").unwrap_or_else(|_| "c++".into());
+        let msvc = {
+            let stem = std::path::Path::new(&cxx)
+                .file_stem()
+                .map(|s| s.to_string_lossy().to_lowercase())
+                .unwrap_or_default();
+            stem == "cl" || stem == "clang-cl"
+        };
+        let bin = dir.join(if cfg!(windows) {
+            "delta_rule_host_test.exe"
+        } else {
+            "delta_rule_host_test"
+        });
+        let mut cmd = Command::new(&cxx);
+        if msvc {
+            cmd.args(["/nologo", "/std:c++20", "/O2", "/EHsc"])
+                .arg(format!("/Fe:{}", bin.display()))
+                .arg(format!("/Fo:{}\\", dir.display()))
+                .arg(&src);
+        } else {
+            cmd.args(["-std=c++20", "-O2", "-pthread", "-o"])
+                .arg(&bin)
+                .arg(&src);
+        }
+        match cmd.output() {
+            Ok(o) if o.status.success() => Some(bin),
+            Ok(o) => {
+                eprintln!(
+                    "skipping delta rule host kernel tests: {cxx} failed\n{}{}",
+                    String::from_utf8_lossy(&o.stdout),
+                    String::from_utf8_lossy(&o.stderr)
+                );
+                None
+            }
+            Err(e) => {
+                eprintln!("skipping delta rule host kernel tests: no C++ compiler ({cxx}: {e})");
+                None
+            }
+        }
+    })
+    .as_deref()
+}
+
+#[derive(Default)]
+struct HostArrays(std::collections::BTreeMap<String, (u8, Vec<u8>)>);
+
+impl HostArrays {
+    fn f32(&mut self, name: &str, v: &[f32]) -> &mut Self {
+        let b = v.iter().flat_map(|x| x.to_le_bytes()).collect();
+        self.0.insert(name.into(), (0, b));
+        self
+    }
+    fn u32(&mut self, name: &str, v: &[u32]) -> &mut Self {
+        let b = v.iter().flat_map(|x| x.to_le_bytes()).collect();
+        self.0.insert(name.into(), (1, b));
+        self
+    }
+    fn str(&mut self, name: &str, s: &str) -> &mut Self {
+        self.0.insert(name.into(), (4, s.as_bytes().to_vec()));
+        self
+    }
+    fn get_f32(&self, name: &str) -> Vec<f32> {
+        self.0[name]
+            .1
+            .chunks_exact(4)
+            .map(|c| f32::from_le_bytes(c.try_into().unwrap()))
+            .collect()
+    }
+}
+
+fn host_run(bin: &std::path::Path, input: &HostArrays) -> HostArrays {
+    static COUNTER: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    let n = COUNTER.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    let dir = std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR"));
+    let pid = std::process::id();
+    let inp = dir.join(format!("gdn_in_{pid}_{n}.bin"));
+    let outp = dir.join(format!("gdn_out_{pid}_{n}.bin"));
+    let mut bytes = Vec::new();
+    for (name, (kind, data)) in input.0.iter() {
+        bytes.extend((name.len() as u32).to_le_bytes());
+        bytes.extend(name.as_bytes());
+        bytes.push(*kind);
+        bytes.extend((data.len() as u64).to_le_bytes());
+        bytes.extend(data);
+    }
+    std::fs::write(&inp, bytes).unwrap();
+    let st = std::process::Command::new(bin)
+        .arg(&inp)
+        .arg(&outp)
+        .status()
+        .unwrap();
+    assert!(st.success(), "delta rule host harness failed");
+    let data = std::fs::read(&outp).unwrap();
+    let _ = std::fs::remove_file(&inp);
+    let _ = std::fs::remove_file(&outp);
+    let mut out = HostArrays::default();
+    let mut p = 0;
+    while p < data.len() {
+        let nl = u32::from_le_bytes(data[p..p + 4].try_into().unwrap()) as usize;
+        p += 4;
+        let name = String::from_utf8(data[p..p + nl].to_vec()).unwrap();
+        p += nl;
+        let kind = data[p];
+        p += 1;
+        let nb = u64::from_le_bytes(data[p..p + 8].try_into().unwrap()) as usize;
+        p += 8;
+        out.0.insert(name, (kind, data[p..p + nb].to_vec()));
+        p += nb;
+    }
+    out
+}
+
+/// The kernels on the host emulator match the CPU implementation (f32 and bf16 activations,
+/// grouped / tiled heads, every key head dim tile, conv widths 3 / 4 / 5, partial tiles).
+#[test]
+fn host_emulated_kernels() -> Result<()> {
+    let Some(bin) = host_harness() else {
+        return Ok(());
+    };
+    // (case, harness tile: 0 d64 / 1 d128 / 2 d256)
+    let mut cases = vec![];
+    let mut c = Case::new(2, 11, 1, 2, 64, 48, 4);
+    c.bias = true;
+    cases.push((c, 0u32));
+    let mut c = Case::new(1, 9, 2, 4, 96, 80, 3);
+    c.order = GdnHeadOrder::Tiled;
+    c.state = false;
+    cases.push((c, 1));
+    let mut c = Case::new(1, 5, 1, 1, 256, 40, 5);
+    c.l2 = false;
+    c.x_scale = 0.2;
+    cases.push((c, 2));
+    for (i, (cs, tile)) in cases.iter().enumerate() {
+        let d = gen(cs, 300 + i as u64);
+        for (dtype, code) in [(DType::F32, 0u32), (DType::BF16, 2)] {
+            let cpu = run(cs, &d, &Device::Cpu, dtype)?;
+            let flags = cs.l2 as u32 | ((cs.order == GdnHeadOrder::Tiled) as u32) << 1;
+            let mut inp = HostArrays::default();
+            inp.str("op", "scan")
+                .u32(
+                    "dims",
+                    &[
+                        cs.b as u32,
+                        cs.t as u32,
+                        cs.hk as u32,
+                        cs.hv as u32,
+                        cs.dk as u32,
+                        cs.dv as u32,
+                        cs.k as u32,
+                        flags,
+                        code,
+                        *tile,
+                    ],
+                )
+                .f32("fparams", &[1e-6, 1.0 / (cs.dk as f32).sqrt()])
+                .f32("x", &d.mixed)
+                .f32("cw", &d.conv_w)
+                .f32("a", &d.a)
+                .f32("b", &d.b)
+                .f32("neg_a", &d.neg_a)
+                .f32("dt_bias", &d.dt_bias);
+            if let Some(v) = &d.conv_b {
+                inp.f32("cb", v);
+            }
+            if let Some(v) = &d.conv_state {
+                inp.f32("cs_in", v);
+            }
+            if let Some(v) = &d.state {
+                inp.f32("s_in", v);
+            }
+            let o = host_run(bin, &inp);
+            let eo = rel32(&o.get_f32("out"), &host(&cpu.out)?);
+            let es = rel32(&o.get_f32("s_out"), &host(&cpu.recurrent_state)?);
+            println!("host emu {dtype:?} case {i} {cs:?}: out {eo:.2e} state {es:.2e}");
+            let tol_out = if dtype == DType::F32 { 2e-6 } else { 1e-2 };
+            assert!(eo <= tol_out, "host emu case {i} {dtype:?}: out {eo:.3e}");
+            assert!(es <= 2e-6, "host emu case {i} {dtype:?}: state {es:.3e}");
+            assert_eq!(o.get_f32("cs_out"), host(&cpu.conv_state)?, "host emu case {i} conv state");
+        }
+    }
+    let mut r = Rng(9);
+    for (rows, dd) in [(9usize, 40usize), (6, 300)] {
+        let x = r.normals(rows * dd, 1.0);
+        let z = r.normals(rows * dd, 1.5);
+        let w = r.normals(dd, 1.0);
+        for (dtype, code) in [(DType::F32, 0u32), (DType::F16, 1)] {
+            let xt = tensor(&x, &[rows, dd], dtype, &Device::Cpu)?;
+            let zt = tensor(&z, &[rows, dd], dtype, &Device::Cpu)?;
+            let want = gnorm_reference(&host(&xt)?, &host(&zt)?, &w, dd, 1e-6);
+            let mut inp = HostArrays::default();
+            inp.str("op", "gnorm")
+                .u32("dims", &[rows as u32, dd as u32, code])
+                .f32("fparams", &[1e-6])
+                .f32("x", &x)
+                .f32("z", &z)
+                .f32("w", &w);
+            let o = host_run(bin, &inp);
+            let e = rel(&o.get_f32("y"), &want);
+            println!("host emu gnorm {dtype:?} [{rows}, {dd}]: {e:.2e}");
+            assert!(e <= if dtype == DType::F32 { 2e-6 } else { 1e-3 });
+        }
+    }
+    Ok(())
+}
+
+/// Median wall time per call (us) of `f` over `reps` timed batches of `iters` calls after a
+/// warm-up of at least 300 ms (the GPU clocks ramp up).
+fn time_us(dev: &Device, iters: usize, reps: usize, f: &dyn Fn() -> Result<()>) -> Result<f64> {
+    let start = std::time::Instant::now();
+    while start.elapsed().as_millis() < 300 {
+        for _ in 0..iters.min(10) {
+            f()?;
+        }
+        dev.synchronize()?;
+    }
+    let mut v = vec![];
+    for _ in 0..reps {
+        let t = std::time::Instant::now();
+        for _ in 0..iters {
+            f()?;
+        }
+        dev.synchronize()?;
+        v.push(t.elapsed().as_secs_f64() * 1e6 / iters as f64);
+    }
+    v.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    Ok(v[v.len() / 2])
+}
+
+/// Per-layer latency of the fused kernel for the Qwen3.5-4B (Hk 16, Hv 32) and 2B (Hk = Hv =
+/// 16) linear-attention geometries (Dk = Dv = 128, K 4): `--ignored --nocapture`.
+/// `CANDLE_GDN_BENCH_TILES=c16x2w8t8,c16x2w4t8` compares instantiated tiles.
 #[test]
 #[ignore]
-fn bench_gdn_qwen35_4b() -> Result<()> {
+fn bench_gdn_qwen35() -> Result<()> {
     let Some(dev) = gpu() else {
         eprintln!("no GPU, skipping");
         return Ok(());
@@ -641,67 +897,57 @@ fn bench_gdn_qwen35_4b() -> Result<()> {
         } else {
             std::env::set_var("CANDLE_GDN_TILE", &tile);
         }
-        for dtype in [DType::F32, DType::BF16] {
-            for (t, iters) in [(1usize, 200usize), (902, 10), (2048, 5)] {
-                let mut cs = Case::new(1, t, 16, 32, 128, 128, 4);
-                cs.state = true;
-                let d = gen(&cs, 1);
-                let c = cs.c();
-                let mixed = tensor(&d.mixed, &[1, t, c], dtype, &dev)?;
-                let w = tensor(&d.conv_w, &[c, 4], DType::F32, &dev)?;
-                let cst = tensor(d.conv_state.as_ref().unwrap(), &[1, c, 3], dtype, &dev)?;
-                let a = tensor(&d.a, &[1, t, 32], dtype, &dev)?;
-                let b = tensor(&d.b, &[1, t, 32], dtype, &dev)?;
-                let na = tensor(&d.neg_a, &[32], DType::F32, &dev)?;
-                let dtb = tensor(&d.dt_bias, &[32], DType::F32, &dev)?;
-                let st = tensor(d.state.as_ref().unwrap(), &[1, 32, 128, 128], DType::F32, &dev)?;
-                let cfg = cs.cfg();
-                let step = || {
-                    fused_gated_delta_rule(
-                        &mixed,
-                        &w,
-                        None,
-                        Some(&cst),
-                        &a,
-                        &b,
-                        &na,
-                        &dtb,
-                        Some(&st),
-                        &cfg,
-                    )
-                };
-                for _ in 0..3 {
-                    step()?;
+        let tname = if tile.is_empty() { "default" } else { &tile };
+        for (model, hk, hv) in [("4B", 16usize, 32usize), ("2B", 16, 16)] {
+            for dtype in [DType::F32, DType::BF16] {
+                for (t, iters) in [(1usize, 200usize), (902, 10), (2048, 5)] {
+                    let mut cs = Case::new(1, t, hk, hv, 128, 128, 4);
+                    cs.state = true;
+                    let d = gen(&cs, 1);
+                    let c = cs.c();
+                    let mixed = tensor(&d.mixed, &[1, t, c], dtype, &dev)?;
+                    let w = tensor(&d.conv_w, &[c, 4], DType::F32, &dev)?;
+                    let cst = tensor(d.conv_state.as_ref().unwrap(), &[1, c, 3], dtype, &dev)?;
+                    let a = tensor(&d.a, &[1, t, hv], dtype, &dev)?;
+                    let b = tensor(&d.b, &[1, t, hv], dtype, &dev)?;
+                    let na = tensor(&d.neg_a, &[hv], DType::F32, &dev)?;
+                    let dtb = tensor(&d.dt_bias, &[hv], DType::F32, &dev)?;
+                    let st = tensor(d.state.as_ref().unwrap(), &[1, hv, 128, 128], DType::F32, &dev)?;
+                    let cfg = cs.cfg();
+                    let us = time_us(&dev, iters, 5, &|| {
+                        fused_gated_delta_rule(
+                            &mixed,
+                            &w,
+                            None,
+                            Some(&cst),
+                            &a,
+                            &b,
+                            &na,
+                            &dtb,
+                            Some(&st),
+                            &cfg,
+                        )
+                        .map(|_| ())
+                    })?;
+                    println!(
+                        "gdn {model} tile {tname:>10} {dtype:?} T={t:>5}: {us:9.1} us / layer ({:.3} us / token)",
+                        us / t as f64
+                    );
                 }
-                dev.synchronize()?;
-                let start = std::time::Instant::now();
-                for _ in 0..iters {
-                    step()?;
-                }
-                dev.synchronize()?;
-                let us = start.elapsed().as_secs_f64() * 1e6 / iters as f64;
-                println!(
-                    "tile {:>10} {dtype:?} T={t:>5}: {us:9.1} us / layer ({:.3} us / token)",
-                    if tile.is_empty() { "default" } else { &tile },
-                    us / t as f64
-                );
             }
         }
-        // gated norm on the prefill output size
-        let x = Tensor::randn(0f32, 1f32, (2048 * 32, 128), &dev)?;
-        let z = Tensor::randn(0f32, 1f32, (2048 * 32, 128), &dev)?;
+    }
+    // gated norm on the prefill output size of the 4B (T = 2048, 32 heads of 128)
+    for dtype in [DType::F32, DType::BF16] {
+        let x = Tensor::randn(0f32, 1f32, (2048 * 32, 128), &dev)?.to_dtype(dtype)?;
+        let z = Tensor::randn(0f32, 1f32, (2048 * 32, 128), &dev)?.to_dtype(dtype)?;
         let w = Tensor::ones(128, DType::F32, &dev)?;
-        fused_gated_rms_norm(&x, &z, &w, 1e-6)?;
-        dev.synchronize()?;
-        let start = std::time::Instant::now();
-        for _ in 0..10 {
-            fused_gated_rms_norm(&x, &z, &w, 1e-6)?;
-        }
-        dev.synchronize()?;
-        println!(
-            "gated rms norm f32 [65536, 128]: {:.1} us",
-            start.elapsed().as_secs_f64() * 1e5
-        );
+        let us = time_us(&dev, 10, 5, &|| fused_gated_rms_norm(&x, &z, &w, 1e-6).map(|_| ()))?;
+        println!("gated rms norm {dtype:?} [65536, 128]: {us:.1} us");
+        let x1 = x.narrow(0, 0, 32)?;
+        let z1 = z.narrow(0, 0, 32)?;
+        let us = time_us(&dev, 200, 5, &|| fused_gated_rms_norm(&x1, &z1, &w, 1e-6).map(|_| ()))?;
+        println!("gated rms norm {dtype:?} [32, 128] (decode): {us:.1} us");
     }
     Ok(())
 }
