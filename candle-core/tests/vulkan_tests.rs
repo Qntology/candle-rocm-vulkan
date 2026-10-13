@@ -785,15 +785,35 @@ fn quantized_dequantize_and_matmul() -> Result<()> {
 
             let mm_cpu = QMatMul::from_qtensor(QTensor::quantize(&w, dtype)?)?;
             let mm_gpu = QMatMul::from_qtensor(QTensor::quantize_onto(&w, dtype, dev)?)?;
+            // Q8_0 weights resident on the GPU (GpuQ8: unified-memory devices such as MoltenVK from
+            // the first use, discrete ones once mirrored) multiply the f32 activations exactly,
+            // x · dequant(W)ᵀ. The host path, like the CPU backend, first quantizes the activations
+            // to Q8_0 (llama.cpp vec_dot), which is 0.2-0.6 away at k = 512. Both are correct; the
+            // Vulkan result has to match one of them.
+            let q8 = dtype == GgmlDType::Q8_0;
+            let max_diff = |a: &Tensor, b: &Tensor| -> Result<f32> {
+                (a.to_device(&Device::Cpu)?.to_dtype(DType::F32)? - b.to_dtype(DType::F32)?)?
+                    .abs()?
+                    .max_all()?
+                    .to_scalar::<f32>()
+            };
+            let exact_ref = |x: &Tensor| -> Result<Tensor> {
+                x.to_dtype(DType::F32)?.broadcast_matmul(&deq_cpu.t()?)
+            };
+            let diff_q = |r_gpu: &Tensor, x: &Tensor, r_ref: &Tensor| -> Result<f32> {
+                let d = max_diff(r_gpu, r_ref)?;
+                if q8 {
+                    Ok(d.min(max_diff(r_gpu, &exact_ref(x)?)?))
+                } else {
+                    Ok(d)
+                }
+            };
             for rows in [1usize, 3, 8, 9, 33] {
                 let x = randn(&[1, rows, k], DType::F32)?;
                 let r_cpu = mm_cpu.forward(&x)?;
                 let r_gpu = mm_gpu.forward(&x.to_device(dev)?)?;
                 assert!(r_gpu.device().is_vulkan());
-                let diff = (r_gpu.to_device(&Device::Cpu)? - &r_cpu)?
-                    .abs()?
-                    .max_all()?
-                    .to_scalar::<f32>()?;
+                let diff = diff_q(&r_gpu, &x, &r_cpu)?;
                 assert!(diff < 1e-3, "{dtype:?} qmatmul rows {rows}: diff {diff}");
                 if matches!(mm_cpu, QMatMul::QTensor(_)) {
                     let r_mixed = mm_cpu.forward(&x.to_device(dev)?)?;
@@ -810,10 +830,7 @@ fn quantized_dequantize_and_matmul() -> Result<()> {
                 let xs = randn(&[rows, 2 * k], DType::F32)?.narrow(1, 3, k)?;
                 let r_s = mm_gpu.forward(&xs.to_device(dev)?)?;
                 let r_s_ref = mm_cpu.forward(&xs.contiguous()?)?;
-                let diff = (r_s.to_device(&Device::Cpu)? - &r_s_ref)?
-                    .abs()?
-                    .max_all()?
-                    .to_scalar::<f32>()?;
+                let diff = diff_q(&r_s, &xs.contiguous()?, &r_s_ref)?;
                 assert!(
                     diff < 1e-3,
                     "{dtype:?} strided input rows {rows}: diff {diff}"
@@ -823,9 +840,15 @@ fn quantized_dequantize_and_matmul() -> Result<()> {
                 let x16 = randn(&[2, k], DType::F16)?;
                 let r16 = mm_gpu.forward(&x16.to_device(dev)?)?;
                 assert_eq!(r16.dtype(), DType::F16);
-                let r16_ref = mm_cpu
+                let mut r16_ref = mm_cpu
                     .forward(&x16.to_dtype(DType::F32)?)?
                     .to_dtype(DType::F16)?;
+                if q8 {
+                    let exact = exact_ref(&x16)?.to_dtype(DType::F16)?;
+                    if max_diff(&r16, &exact)? < max_diff(&r16, &r16_ref)? {
+                        r16_ref = exact;
+                    }
+                }
                 assert_close(&r16, &r16_ref, "qmatmul f16 input")?;
                 let ids = Tensor::new(&[[3u32, 0], [39, 7]], &Device::Cpu)?;
                 let e_gpu = q_gpu.embedding(&ids.to_device(dev)?)?;
