@@ -449,8 +449,11 @@ void main() {
             ss += v * v;
             am = max(am, abs(v));
         }
-        ss = block_sum(ss);
-        am = block_max(am);
+        // only the codebook modes use the norm and only NVFP4 / FP8 the row maximum (mode is
+        // uniform); the MX modes still need the barrier before reading y[] across lanes
+        if (mode <= 1u) { ss = block_sum(ss); }
+        else if (mode == 3u || mode == 5u) { am = block_max(am); }
+        else { barrier(); }
         float rsc0 = 1.0;
         if (mode <= 1u) {
             float norm = sqrt(ss);

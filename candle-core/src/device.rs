@@ -237,6 +237,9 @@ impl<S: WithDType> NdArray for Vec<Vec<Vec<Vec<S>>>> {
 }
 
 impl Device {
+    /// The CUDA device of `ordinal`. Every call returns a handle to the same process-wide device
+    /// (one context, stream, set of loaded kernels and scratch buffers per GPU), so tensors of
+    /// two handles never need a copy; use [`Self::new_cuda_with_stream`] for an independent one.
     pub fn new_cuda(ordinal: usize) -> Result<Self> {
         Ok(Self::Cuda(crate::CudaDevice::new(ordinal)?))
     }
@@ -712,6 +715,8 @@ impl Device {
         }
     }
 
+    /// Waits for the work queued on the device's stream (on CUDA: the work of every thread, the
+    /// shared device having one stream).
     pub fn synchronize(&self) -> Result<()> {
         match self {
             Self::Cpu => Ok(()),
@@ -720,6 +725,113 @@ impl Device {
             Self::Rocm(d) => d.synchronize(),
             Self::OpenCl(d) => d.synchronize(),
             Self::Vulkan(d) => d.synchronize(),
+        }
+    }
+
+    // ---------------------------------------------------------------------------------------
+    // Device memory management. Backends without the notion return Ok / None / 0.
+    // ---------------------------------------------------------------------------------------
+
+    /// Waits for all the work queued on the device, from any thread and on any stream.
+    ///
+    /// CUDA: binds the context with a raw `cuCtxSetCurrent`, clears a stale deferred error and
+    /// runs `cuCtxSynchronize`; ROCm: `hipDeviceSynchronize`; Vulkan: waits for the queue to idle.
+    pub fn synchronize_all(&self) -> Result<()> {
+        match self {
+            Self::Cpu => Ok(()),
+            Self::Cuda(d) => d.synchronize_all(),
+            Self::Metal(d) => d.synchronize(),
+            Self::Rocm(d) => d.synchronize_all(),
+            Self::OpenCl(d) => d.synchronize(),
+            Self::Vulkan(d) => d.synchronize(),
+        }
+    }
+
+    /// Makes the device current on the calling thread (CUDA: raw `cuCtxSetCurrent`, which does
+    /// not trip over cudarc's deferred errors; ROCm: `hipSetDevice`). No-op elsewhere.
+    pub fn bind_to_thread(&self) -> Result<()> {
+        match self {
+            Self::Cuda(d) => d.bind_to_thread(),
+            Self::Rocm(d) => d.bind_to_thread(),
+            Self::Cpu | Self::Metal(_) | Self::OpenCl(_) | Self::Vulkan(_) => Ok(()),
+        }
+    }
+
+    /// Takes the error that the backend recorded where it could not return it (CUDA: cudarc's
+    /// deferred error state, filled by `Drop` impls). `None` when there is none, and on the other
+    /// backends.
+    pub fn take_deferred_error(&self) -> Option<String> {
+        match self {
+            Self::Cuda(d) => d.take_deferred_error(),
+            Self::Cpu | Self::Metal(_) | Self::Rocm(_) | Self::OpenCl(_) | Self::Vulkan(_) => None,
+        }
+    }
+
+    /// `(free, total)` device memory in bytes as reported by the driver, `None` on the CPU (and
+    /// backends without a query). Memory reserved by a stream-ordered pool counts as used, see
+    /// [`Self::effective_free_memory`].
+    pub fn mem_info(&self) -> Result<Option<(usize, usize)>> {
+        match self {
+            Self::Cuda(d) => Ok(Some(d.mem_info()?)),
+            Self::Rocm(d) => Ok(Some(d.mem_info()?)),
+            Self::Vulkan(d) => Ok(Some(d.mem_info()?)),
+            Self::Cpu | Self::Metal(_) | Self::OpenCl(_) => Ok(None),
+        }
+    }
+
+    /// Bytes reserved by the device's memory pool that no allocation uses (the pool reuses them
+    /// without asking the driver). 0 when the backend has no such pool.
+    pub fn pool_idle_bytes(&self) -> Result<usize> {
+        match self {
+            Self::Cuda(d) => d.pool_idle_bytes(),
+            Self::Rocm(d) => d.pool_idle_bytes(),
+            Self::Vulkan(d) => Ok(d.pooled_bytes()),
+            Self::Cpu | Self::Metal(_) | Self::OpenCl(_) => Ok(0),
+        }
+    }
+
+    /// Memory the process can allocate without waiting: free memory plus
+    /// [`Self::pool_idle_bytes`]. `None` when [`Self::mem_info`] is `None`.
+    pub fn effective_free_memory(&self) -> Result<Option<usize>> {
+        match self.mem_info()? {
+            None => Ok(None),
+            Some((free, _)) => Ok(Some(free.saturating_add(self.pool_idle_bytes()?))),
+        }
+    }
+
+    /// Waits for the device ([`Self::synchronize_all`]) and returns the pool memory above
+    /// `keep_bytes` to the driver (CUDA `cuMemPoolTrimTo`, ROCm `hipMemPoolTrimTo`). Vulkan
+    /// releases all its reusable buffers and scratch (`keep_bytes` is ignored).
+    pub fn trim_memory_pool(&self, keep_bytes: usize) -> Result<()> {
+        match self {
+            Self::Cuda(d) => d.trim_memory_pool(keep_bytes),
+            Self::Rocm(d) => d.trim_memory_pool_to(keep_bytes),
+            Self::Vulkan(d) => {
+                d.synchronize()?;
+                d.trim_memory_pool()
+            }
+            Self::Cpu | Self::Metal(_) | Self::OpenCl(_) => Ok(()),
+        }
+    }
+
+    /// Sets how much reserved memory the stream-ordered pool keeps when it releases memory at a
+    /// synchronization point (`u64::MAX`: never release implicitly). CUDA and ROCm only.
+    pub fn set_memory_pool_release_threshold(&self, bytes: u64) -> Result<()> {
+        match self {
+            Self::Cuda(d) => d.set_memory_pool_release_threshold(bytes),
+            Self::Rocm(d) => d.set_memory_pool_release_threshold(bytes),
+            Self::Cpu | Self::Metal(_) | Self::OpenCl(_) | Self::Vulkan(_) => Ok(()),
+        }
+    }
+
+    /// Frees the scratch buffers the device keeps for quantized matmuls (they are reallocated on
+    /// demand).
+    pub fn release_workspaces(&self) -> Result<()> {
+        match self {
+            Self::Cuda(d) => d.release_workspaces(),
+            Self::Rocm(d) => d.release_workspaces(),
+            Self::Vulkan(d) => d.release_workspaces(),
+            Self::Cpu | Self::Metal(_) | Self::OpenCl(_) => Ok(()),
         }
     }
 }

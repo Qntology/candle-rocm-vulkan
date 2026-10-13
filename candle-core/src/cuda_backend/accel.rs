@@ -6,11 +6,12 @@
 
 use super::{CudaDevice, CudaStorage, CudaStorageSlice, WrapErr};
 use crate::accel::attention::{
-    self as att, AttnGeometry, FaExtra, FlashAttnParams, FA_THREADS, MAX_GRID_X,
+    self as att, AttnGeometry, FaExtra, FaPlan, FlashAttnParams, PageTable, PagedKv, FA_THREADS,
+    MAX_GRID_X,
 };
 use crate::accel::profile::AccelProfile;
 use crate::accel::sources;
-use crate::accel::turbo::{TqAttnArgs, TqRowArgs, TQ_THREADS};
+use crate::accel::turbo::{tq_attn_group, tq_attn_kernel, TqAttnArgs, TqRowArgs, TQ_THREADS};
 use crate::{bail, DType, Result};
 use cudarc::driver::{DevicePtr, DevicePtrMut, LaunchConfig, PushKernelArg, SyncOnDrop};
 use std::collections::HashMap;
@@ -180,6 +181,74 @@ fn grid_elems(n: usize) -> u32 {
     n.div_ceil(TQ_THREADS).clamp(1, 1 << 20) as u32
 }
 
+// SAFETY: plain repr(C) data with the layout of `struct ax_pages` (kernels/accel_common.h).
+unsafe impl cudarc::driver::DeviceRepr for PageTable {}
+
+/// Partial outputs and log-sum-exps of a split-KV launch.
+type Parts = Option<(CudaStorageSlice, CudaStorageSlice)>;
+
+fn alloc_parts(dev: &CudaDevice, splits: usize, rows: usize, d: usize) -> Result<Parts> {
+    Ok(if splits > 1 {
+        Some((
+            alloc(dev, DType::F32, splits * rows * d)?,
+            alloc(dev, DType::F32, splits * rows)?,
+        ))
+    } else {
+        None
+    })
+}
+
+/// Merges the key splits in `part` into `out` with the combine kernel `name`.
+fn launch_combine(
+    dev: &CudaDevice,
+    name: &str,
+    part: &mut Parts,
+    out: &mut CudaStorageSlice,
+    rows: usize,
+    d: usize,
+    splits: usize,
+) -> Result<()> {
+    let Some((po, pl)) = part.as_mut() else {
+        return Ok(());
+    };
+    let stream = dev.cuda_stream();
+    let comb = dev.accel_func(name)?;
+    let (po_p, _ga) = dptr_mut(po, &stream);
+    let (pl_p, _gb) = dptr_mut(pl, &stream);
+    let (o_p, _go) = dptr_mut(out, &stream);
+    let ptrs: [u64; 3] = [po_p, pl_p, o_p];
+    let rows64 = rows as u64;
+    let dd: [u32; 2] = [d as u32, splits as u32];
+    let mut b = comb.builder();
+    for x in ptrs.iter() {
+        b.arg(x);
+    }
+    b.arg(&rows64);
+    for x in dd.iter() {
+        b.arg(x);
+    }
+    // SAFETY: arguments match fa_combine / tq_combine; shared memory: one weight per split.
+    unsafe { b.launch(cfg((grid_rows(rows), 1, 1), splits * 4)) }.w()?;
+    Ok(())
+}
+
+/// Device pointers of the blocks of a paged call, with the guards that order the accesses.
+fn page_table<'a>(
+    blocks: &[PagedKv<'a, CudaStorage>],
+    stream: &'a cudarc::driver::CudaStream,
+) -> Result<(PageTable, Vec<SyncOnDrop<'a>>)> {
+    let mut table = PageTable::default();
+    let mut guards = Vec::with_capacity(2 * blocks.len());
+    for bl in blocks {
+        let (kp, gk) = dptr(bl.k, bl.k_offset, stream);
+        let (vp, gv) = dptr(bl.v, bl.v_offset, stream);
+        guards.push(gk);
+        guards.push(gv);
+        table.push(kp, vp, bl.rows, bl.k_cap, bl.v_cap)?;
+    }
+    Ok((table, guards))
+}
+
 impl CudaStorage {
     /// Fused attention of `self` (queries) over `k` / `v`, see `RocmStorage::flash_attn`.
     pub fn flash_attn(
@@ -201,25 +270,35 @@ impl CudaStorage {
         let dev = &self.device;
         let prof = dev.accel_profile();
         let plan = att::plan(geom, p, prof.max_shared_mem, prof.compute_units);
-        let name = att::kernel_name(&plan, self.dtype(), k.dtype())?;
+        // row plans may pack the query heads of a kv head (fa_rowg*, same results)
+        let (name, grid, smem, splits) = match plan {
+            FaPlan::Row { .. } => {
+                let l = att::row_launch(
+                    geom,
+                    p,
+                    prof.compute_units,
+                    self.dtype(),
+                    k.dtype(),
+                    false,
+                )?;
+                (l.name, l.grid, l.shared_bytes, l.splits)
+            }
+            FaPlan::Tile { .. } => {
+                let name = att::kernel_name(&plan, self.dtype(), k.dtype())?;
+                let (grid, smem, splits) = att::launch_dims(geom, &plan);
+                (name, grid, smem, splits)
+            }
+        };
         let rows = geom.out_rows();
         let d = geom.d;
         let mut out = alloc(dev, self.dtype(), rows * d)?;
         if rows > 0 && d > 0 {
             let func = dev.accel_func(&name)?;
-            let (grid, smem, splits) = att::launch_dims(geom, &plan);
             if smem > 48 * 1024 {
                 func.set_max_dynamic_shared_memory(smem)?;
             }
             let stream = dev.cuda_stream();
-            let mut part = if splits > 1 {
-                Some((
-                    alloc(dev, DType::F32, splits * rows * d)?,
-                    alloc(dev, DType::F32, splits * rows)?,
-                ))
-            } else {
-                None
-            };
+            let mut part = alloc_parts(dev, splits, rows, d)?;
             {
                 let (q_p, _gq) = dptr(self, geom.q_offset, &stream);
                 let (k_p, _gk) = dptr(k, geom.k_offset, &stream);
@@ -296,26 +375,129 @@ impl CudaStorage {
                 // SAFETY: arguments match the kernel signature (FA_PARAMS).
                 unsafe { b.launch(cfg(grid, smem)) }.w()?;
             }
-            if let Some((po, pl)) = part.as_mut() {
-                let sfx = half_sfx(self.dtype(), "flash-attn")?;
-                let comb = dev.accel_func(&format!("fa_combine_{sfx}"))?;
-                let (po_p, _ga) = dptr_mut(po, &stream);
-                let (pl_p, _gb) = dptr_mut(pl, &stream);
+            let sfx = half_sfx(self.dtype(), "flash-attn")?;
+            let comb = format!("fa_combine_{sfx}");
+            launch_combine(dev, &comb, &mut part, &mut out, rows, d, splits)?;
+        }
+        Ok(CudaStorage {
+            slice: out,
+            device: dev.clone(),
+        })
+    }
+
+    /// Decoding attention of `self` (queries, geometry from `AttnGeometry::paged`) over the K/V
+    /// blocks of a paged cache, without concatenating them (row kernel `fa_rowp_*`). The keys
+    /// are the blocks' rows in order; the output is contiguous in the query dtype.
+    pub fn flash_attn_paged(
+        &self,
+        blocks: &[PagedKv<'_, Self>],
+        geom: &AttnGeometry,
+        p: &FlashAttnParams,
+        extra: &FaExtra<'_, Self>,
+    ) -> Result<Self> {
+        use crate::backend::BackendStorage;
+        let Some(first) = blocks.first() else {
+            bail!("paged flash-attn: no blocks")
+        };
+        let kv_dtype = first.k.dtype();
+        if blocks
+            .iter()
+            .any(|b| b.k.dtype() != kv_dtype || b.v.dtype() != kv_dtype)
+        {
+            bail!("paged flash-attn: every block needs the same k / v dtype")
+        }
+        if geom.varlen || extra.cu_seqlens.is_some() {
+            bail!("paged flash-attn: varlen batches are not supported")
+        }
+        let dev = &self.device;
+        let prof = dev.accel_profile();
+        let launch = att::row_launch(geom, p, prof.compute_units, self.dtype(), kv_dtype, true)?;
+        let (grid, smem, splits) = (launch.grid, launch.shared_bytes, launch.splits);
+        let rows = geom.out_rows();
+        let d = geom.d;
+        let mut out = alloc(dev, self.dtype(), rows * d)?;
+        if rows > 0 && d > 0 {
+            let func = dev.accel_func(&launch.name)?;
+            let stream = dev.cuda_stream();
+            let mut part = alloc_parts(dev, splits, rows, d)?;
+            {
+                let (table, _gt) = page_table(blocks, &stream)?;
+                if table.total_rows() != geom.lk {
+                    bail!(
+                        "paged flash-attn: blocks hold {} keys, geometry {}",
+                        table.total_rows(),
+                        geom.lk
+                    )
+                }
+                let (q_p, _gq) = dptr(self, geom.q_offset, &stream);
                 let (o_p, _go) = dptr_mut(&mut out, &stream);
-                let ptrs: [u64; 3] = [po_p, pl_p, o_p];
+                let (po_p, pl_p, _gp) = match part.as_mut() {
+                    Some((po, pl)) => {
+                        let (a, ga) = dptr_mut(po, &stream);
+                        let (b, gb) = dptr_mut(pl, &stream);
+                        (a, b, Some((ga, gb)))
+                    }
+                    None => (0, 0, None),
+                };
+                let (al_p, alibi_bs, _ga) = match extra.alibi {
+                    Some((s, off, bs)) => {
+                        let (p, g) = dptr(s, off, &stream);
+                        (p, bs as u32, Some(g))
+                    }
+                    None => (0, 0, None),
+                };
+                let ptrs: [u64; 9] = [q_p, 0, 0, o_p, po_p, pl_p, al_p, 0, 0];
+                let dims: [u32; 5] = [
+                    geom.lq as u32,
+                    geom.lk as u32,
+                    geom.hq as u32,
+                    geom.hkv as u32,
+                    d as u32,
+                ];
+                let mut strides = [0u64; 9];
+                for (i, s) in [geom.q_strides, geom.k_strides, geom.v_strides]
+                    .iter()
+                    .enumerate()
+                {
+                    for j in 0..3 {
+                        strides[i * 3 + j] = s[j] as u64;
+                    }
+                }
+                let scale_cap: [f32; 2] = [p.softmax_scale, p.softcap];
+                let windows: [i32; 2] = [p.window_left, p.window_right];
+                let descale: [f32; 2] = [p.k_descale, p.v_descale];
+                let tail: [u32; 3] = [splits as u32, alibi_bs, 0];
                 let rows64 = rows as u64;
-                let dd: [u32; 2] = [d as u32, splits as u32];
-                let mut b = comb.builder();
+                let mut b = func.builder();
                 for x in ptrs.iter() {
                     b.arg(x);
                 }
-                b.arg(&rows64);
-                for x in dd.iter() {
+                for x in dims.iter() {
                     b.arg(x);
                 }
-                // SAFETY: arguments match fa_combine.
-                unsafe { b.launch(cfg((grid_rows(rows), 1, 1), 0)) }.w()?;
+                for x in strides.iter() {
+                    b.arg(x);
+                }
+                for x in scale_cap.iter() {
+                    b.arg(x);
+                }
+                for x in windows.iter() {
+                    b.arg(x);
+                }
+                for x in descale.iter() {
+                    b.arg(x);
+                }
+                for x in tail.iter() {
+                    b.arg(x);
+                }
+                b.arg(&rows64);
+                b.arg(&table);
+                // SAFETY: arguments match FA_ROWP_KERNEL (FA_PARAMS + the block table).
+                unsafe { b.launch(cfg(grid, smem)) }.w()?;
             }
+            let sfx = half_sfx(self.dtype(), "flash-attn")?;
+            let comb = format!("fa_combine_{sfx}");
+            launch_combine(dev, &comb, &mut part, &mut out, rows, d, splits)?;
         }
         Ok(CudaStorage {
             slice: out,
@@ -511,6 +693,35 @@ impl CudaStorage {
         alibi: Option<(&Self, usize)>,
         a: &TqAttnArgs,
     ) -> Result<Self> {
+        self.tq_attention_impl(Some((kd, vd)), &[], tab, tab_off, alibi, a)
+    }
+
+    /// See `RocmStorage::tq_attention_paged`.
+    pub fn tq_attention_paged(
+        &self,
+        blocks: &[PagedKv<'_, Self>],
+        tab: &Self,
+        tab_off: usize,
+        alibi: Option<(&Self, usize)>,
+        a: &TqAttnArgs,
+    ) -> Result<Self> {
+        if blocks.is_empty() {
+            bail!("paged turbo-quant attention: no blocks")
+        }
+        self.tq_attention_impl(None, blocks, tab, tab_off, alibi, a)
+    }
+
+    /// `tq_attn*` over dense rows (`dense = Some((kd, vd))`) or the paged `blocks`.
+    #[allow(clippy::too_many_arguments)]
+    fn tq_attention_impl(
+        &self,
+        dense: Option<(&Self, &Self)>,
+        blocks: &[PagedKv<'_, Self>],
+        tab: &Self,
+        tab_off: usize,
+        alibi: Option<(&Self, usize)>,
+        a: &TqAttnArgs,
+    ) -> Result<Self> {
         use crate::backend::BackendStorage;
         if self.dtype() != DType::F32 {
             bail!(
@@ -525,19 +736,33 @@ impl CudaStorage {
         if rows > 0 && d > 0 {
             let splits = a.splits.max(1);
             let stream = dev.cuda_stream();
-            let mut part = if splits > 1 {
-                Some((
-                    alloc(dev, DType::F32, splits * rows * d)?,
-                    alloc(dev, DType::F32, splits * rows)?,
-                ))
-            } else {
-                None
-            };
+            let mut part = alloc_parts(dev, splits, rows, d)?;
             {
-                let func = dev.accel_func("tq_attn")?;
+                let group = tq_attn_group(a.hq, a.hkv);
+                let func = dev.accel_func(&tq_attn_kernel(&a.k, &a.v, dense.is_none(), group))?;
+                let (table, _gt) = match dense {
+                    Some(_) => (None, Vec::new()),
+                    None => {
+                        let (t, g) = page_table(blocks, &stream)?;
+                        if t.total_rows() != a.lk {
+                            bail!(
+                                "paged turbo-quant attention: blocks hold {} keys, args {}",
+                                t.total_rows(),
+                                a.lk
+                            )
+                        }
+                        (Some(t), g)
+                    }
+                };
                 let (q_p, _g1) = dptr(self, a.q_offset, &stream);
-                let (k_p, _g2) = dptr(kd, a.k_offset, &stream);
-                let (v_p, _g3) = dptr(vd, a.v_offset, &stream);
+                let (k_p, v_p, _g23) = match dense {
+                    Some((kd, vd)) => {
+                        let (k_p, gk) = dptr(kd, a.k_offset, &stream);
+                        let (v_p, gv) = dptr(vd, a.v_offset, &stream);
+                        (k_p, v_p, Some((gk, gv)))
+                    }
+                    None => (0, 0, None),
+                };
                 let (t_p, _g4) = dptr(tab, tab_off, &stream);
                 let (al_p, _g5) = match alibi {
                     Some((s, o)) => {
@@ -611,33 +836,19 @@ impl CudaStorage {
                     b.arg(x);
                 }
                 b.arg(&rows64);
+                if let Some(t) = table.as_ref() {
+                    b.arg(t);
+                }
                 let grid = (
-                    (a.lq * a.hq).clamp(1, MAX_GRID_X) as u32,
+                    (a.lq * a.hq / group).clamp(1, MAX_GRID_X) as u32,
                     splits as u32,
                     a.b as u32,
                 );
-                // SAFETY: arguments match tq_attn.
-                unsafe { b.launch(cfg(grid, a.smem_bytes())) }.w()?;
+                // SAFETY: arguments match tq_attn* (TQ_ATTN_PARAMS), followed by the block table
+                // for the paged tq_attnp* kernels.
+                unsafe { b.launch(cfg(grid, a.smem_bytes_for(group))) }.w()?;
             }
-            if let Some((po, pl)) = part.as_mut() {
-                let comb = dev.accel_func("tq_combine")?;
-                let (po_p, _ga) = dptr_mut(po, &stream);
-                let (pl_p, _gb) = dptr_mut(pl, &stream);
-                let (o_p, _go) = dptr_mut(&mut out, &stream);
-                let ptrs: [u64; 3] = [po_p, pl_p, o_p];
-                let rows64 = rows as u64;
-                let dd: [u32; 2] = [d as u32, splits as u32];
-                let mut b = comb.builder();
-                for x in ptrs.iter() {
-                    b.arg(x);
-                }
-                b.arg(&rows64);
-                for x in dd.iter() {
-                    b.arg(x);
-                }
-                // SAFETY: arguments match tq_combine.
-                unsafe { b.launch(cfg((grid_rows(rows), 1, 1), 0)) }.w()?;
-            }
+            launch_combine(dev, "tq_combine", &mut part, &mut out, rows, d, splits)?;
         }
         Ok(CudaStorage {
             slice: out,

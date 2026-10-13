@@ -6,10 +6,9 @@ use std::sync::{Mutex, OnceLock};
 
 use super::cuda::{QCudaStorage, MATRIX_ROW_PADDING};
 use super::GgmlDType;
-use crate::cuda_backend::DeviceId;
 use crate::{backend::BackendStorage, CudaDevice, CudaStorage, DType, Result, Shape};
 
-use cudarc::driver::{CudaSlice, DevicePtr};
+use cudarc::driver::DevicePtr;
 
 const QK8_1: usize = 32;
 const BLOCK_Q8_1_MMQ_SIZE: usize = 4 * QK8_1 + 4 * 4; // 128 qs + 16 scale bytes = 144
@@ -128,50 +127,13 @@ fn mmq_launcher(dtype: GgmlDType) -> Option<MmqLauncher> {
     Some(f)
 }
 
+// Workspaces: owned by the device (`CudaDevice::workspaces`, freed by
+// `CudaDevice::release_workspaces`), reallocated when a call needs more.
 // ---------------------------------------------------------------------------
-// Per-device workspaces (grows-only, reused across calls).
-// ---------------------------------------------------------------------------
 
-struct WorkspaceSlot {
-    slice: CudaSlice<u8>,
-    cap: usize,
-}
-
-type WsMap = Mutex<HashMap<DeviceId, &'static Mutex<WorkspaceSlot>>>;
-
-static MMQ_WORKSPACE: OnceLock<WsMap> = OnceLock::new();
-static FIXUP_WORKSPACE: OnceLock<WsMap> = OnceLock::new();
-
-fn workspace_ensure(
-    ws: &'static OnceLock<WsMap>,
-    dev: &CudaDevice,
-    bytes: usize,
-) -> Result<(u64, std::sync::MutexGuard<'static, WorkspaceSlot>)> {
-    let map = ws.get_or_init(|| Mutex::new(HashMap::new()));
-    let device_key = dev.id();
-    let device_mtx: &'static Mutex<WorkspaceSlot> = {
-        let mut guard = map.lock().unwrap();
-        match guard.get(&device_key).copied() {
-            Some(mtx) => mtx,
-            None => {
-                let slice = unsafe { dev.alloc::<u8>(bytes.max(1))? };
-                let leaked = Box::leak(Box::new(Mutex::new(WorkspaceSlot {
-                    slice,
-                    cap: bytes.max(1),
-                })));
-                guard.insert(device_key, leaked);
-                leaked
-            }
-        }
-    };
-    let mut slot = device_mtx.lock().unwrap();
-    if slot.cap < bytes {
-        slot.slice = unsafe { dev.alloc::<u8>(bytes)? };
-        slot.cap = bytes;
-    }
-    let ptr = slot.slice.device_ptr(slot.slice.stream()).0;
-    Ok((ptr, slot))
-}
+/// Workspace names in `CudaDevice::workspaces`.
+const MMQ_WORKSPACE: &str = "mmq_q8_1";
+const FIXUP_WORKSPACE: &str = "mmq_fixup";
 
 // ---------------------------------------------------------------------------
 // Per-device info cache (compute capability, SM count, etc.)
@@ -185,12 +147,13 @@ struct DeviceInfo {
     warp_size: i32,
 }
 
-static DEVICE_INFO: OnceLock<Mutex<HashMap<DeviceId, DeviceInfo>>> = OnceLock::new();
+/// Keyed by GPU ordinal: the attributes do not depend on the device handle.
+static DEVICE_INFO: OnceLock<Mutex<HashMap<usize, DeviceInfo>>> = OnceLock::new();
 
 fn get_device_info(dev: &CudaDevice) -> DeviceInfo {
     use cudarc::driver::{result, sys};
     let map = DEVICE_INFO.get_or_init(|| Mutex::new(HashMap::new()));
-    let key = dev.id();
+    let key = dev.ordinal();
     let mut guard = map.lock().unwrap();
     if let Some(info) = guard.get(&key) {
         return *info;
@@ -326,20 +289,24 @@ pub fn try_fwd(
     let workspace_extra = 128 * BLOCK_Q8_1_MMQ_SIZE;
     let workspace_bytes = workspace_main + workspace_extra;
 
-    let (scratch_ptr, _workspace_guard) = workspace_ensure(&MMQ_WORKSPACE, dev, workspace_bytes)?;
+    let di = get_device_info(dev);
+    // The workspaces stay locked until the kernels are queued; the device stream orders their
+    // execution before any later reuse or free.
+    let mut workspaces = dev.workspaces();
+    let scratch_ptr = workspaces.ensure(dev, MMQ_WORKSPACE, workspace_bytes)?;
     let scratch_ptr = scratch_ptr as *mut std::ffi::c_void;
 
-    // Stream-k fixup workspace
+    // Stream-k fixup workspace: the stream-k grid has `nsm` blocks (the value passed to the
+    // launcher below), each writing one mmq_x * mmq_y f32 tile (mmq_x, mmq_y <= 128).
     const MMQ_X_MAX: usize = 128;
     const MMQ_Y_MAX: usize = 128;
-    const MAX_SMS: usize = 256;
-    let fixup_bytes = MAX_SMS * MMQ_X_MAX * MMQ_Y_MAX * std::mem::size_of::<f32>();
-    let (fixup_ptr, _fixup_guard) = workspace_ensure(&FIXUP_WORKSPACE, dev, fixup_bytes)?;
+    let nsm = di.nsm.max(1) as usize;
+    let fixup_bytes = nsm * MMQ_X_MAX * MMQ_Y_MAX * std::mem::size_of::<f32>();
+    let fixup_ptr = workspaces.ensure(dev, FIXUP_WORKSPACE, fixup_bytes)?;
     let fixup_ptr = fixup_ptr as *mut std::ffi::c_void;
 
     let weight_ptr = qstorage.device_ptr()? as *const std::ffi::c_void;
     let stride_row_x = (k / qk) as i64;
-    let di = get_device_info(dev);
 
     let out = unsafe { dev.alloc::<f32>(nrows * b_size)? };
     let stride_col_dst = nrows as i64;
@@ -376,12 +343,14 @@ pub fn try_fwd(
             stride_row_x,
             stride_col_dst,
             di.cc,
-            di.nsm,
+            nsm as i32,
             di.smpbo,
             di.warp_size,
             stream_ptr,
         );
     }
+    drop(workspaces);
+    dev.check_ffi_launch("fast_mmq")?;
 
     let mut out_shape = rhs_l.shape().dims().to_vec();
     out_shape.pop();

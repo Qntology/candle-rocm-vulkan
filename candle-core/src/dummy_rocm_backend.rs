@@ -45,6 +45,30 @@ impl RocmDevice {
     pub fn release_cached_resources(&self) -> Result<()> {
         Err(Error::NotCompiledWithRocmSupport)
     }
+
+    pub fn synchronize_all(&self) -> Result<()> {
+        Err(Error::NotCompiledWithRocmSupport)
+    }
+
+    pub fn bind_to_thread(&self) -> Result<()> {
+        Err(Error::NotCompiledWithRocmSupport)
+    }
+
+    pub fn pool_idle_bytes(&self) -> Result<usize> {
+        Err(Error::NotCompiledWithRocmSupport)
+    }
+
+    pub fn trim_memory_pool_to(&self, _keep_bytes: usize) -> Result<()> {
+        Err(Error::NotCompiledWithRocmSupport)
+    }
+
+    pub fn set_memory_pool_release_threshold(&self, _bytes: u64) -> Result<()> {
+        Err(Error::NotCompiledWithRocmSupport)
+    }
+
+    pub fn release_workspaces(&self) -> Result<()> {
+        Err(Error::NotCompiledWithRocmSupport)
+    }
 }
 
 /// Number of ROCm devices, always 0 when the `rocm` feature is disabled.

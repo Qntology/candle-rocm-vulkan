@@ -113,15 +113,27 @@ impl<T: Copy> DeviceBuffer<T> {
     }
 }
 
+/// Number of `hipFree` / `hipFreeAsync` calls that failed in [`DeviceBuffer`]'s `Drop` (the memory
+/// of those buffers is leaked). Exposed for diagnostics, see [`free_failures`].
+static FREE_FAILURES: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// Number of device buffer frees that failed so far in this process.
+pub fn free_failures() -> usize {
+    FREE_FAILURES.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 impl<T> Drop for DeviceBuffer<T> {
     fn drop(&mut self) {
         if !self.ptr.is_null() {
-            unsafe {
+            let code = unsafe {
                 if self.stream_ordered {
-                    hip_runtime::hipFreeAsync(self.ptr, std::ptr::null_mut());
+                    hip_runtime::hipFreeAsync(self.ptr, std::ptr::null_mut())
                 } else {
-                    hip_runtime::hipFree(self.ptr);
+                    hip_runtime::hipFree(self.ptr)
                 }
+            };
+            if code != hip_runtime::HIP_SUCCESS {
+                FREE_FAILURES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             }
         }
     }
@@ -141,9 +153,39 @@ pub fn stream_ordered_alloc_supported() -> bool {
 
 /// Releases the unused memory cached by the default memory pool of `device` back to the system.
 pub fn trim_default_pool(device: i32) -> Result<()> {
+    trim_default_pool_to(device, 0)
+}
+
+/// Releases the unused memory cached by the default memory pool of `device` back to the system,
+/// keeping at least `keep_bytes` reserved.
+pub fn trim_default_pool_to(device: i32, keep_bytes: usize) -> Result<()> {
     let mut pool: hip_runtime::hipMemPool_t = std::ptr::null_mut();
     check_hip(unsafe { hip_runtime::hipDeviceGetDefaultMemPool(&mut pool, device) })?;
-    check_hip(unsafe { hip_runtime::hipMemPoolTrimTo(pool, 0) })
+    check_hip(unsafe { hip_runtime::hipMemPoolTrimTo(pool, keep_bytes) })
+}
+
+/// `(reserved, used)` bytes of the default memory pool of `device`: memory the pool holds from
+/// the system, and the part of it handed out to live allocations.
+pub fn default_pool_usage(device: i32) -> Result<(u64, u64)> {
+    let mut pool: hip_runtime::hipMemPool_t = std::ptr::null_mut();
+    check_hip(unsafe { hip_runtime::hipDeviceGetDefaultMemPool(&mut pool, device) })?;
+    let mut reserved = 0u64;
+    let mut used = 0u64;
+    check_hip(unsafe {
+        hip_runtime::hipMemPoolGetAttribute(
+            pool,
+            hip_runtime::HIP_MEMPOOL_ATTR_RESERVED_MEM_CURRENT,
+            &mut reserved as *mut u64 as *mut c_void,
+        )
+    })?;
+    check_hip(unsafe {
+        hip_runtime::hipMemPoolGetAttribute(
+            pool,
+            hip_runtime::HIP_MEMPOOL_ATTR_USED_MEM_CURRENT,
+            &mut used as *mut u64 as *mut c_void,
+        )
+    })?;
+    Ok((reserved, used))
 }
 
 pub fn set_pool_release_threshold(device: i32, bytes: u64) -> Result<()> {

@@ -12,6 +12,7 @@ const KERNELS: &[&str] = &[
     "nn",
     "quantized",
     "gemm",
+    "delta_rule",
 ];
 
 /// Kernels behind Cargo features: (file stem, `CARGO_FEATURE_*` variable). A disabled one is
@@ -22,7 +23,13 @@ const OPTIONAL_KERNELS: &[(&str, &str)] = &[
 ];
 
 /// Headers shared by the kernels.
-const HEADERS: &[&str] = &["common.h", "accel_common.h", "flash_attn_impl.h", "turbo_quant_impl.h"];
+const HEADERS: &[&str] = &[
+    "common.h",
+    "accel_common.h",
+    "flash_attn_impl.h",
+    "turbo_quant_impl.h",
+    "delta_rule_impl.h",
+];
 
 /// Targets used when no GPU is detected, per ROCm track (see `hip-sys/build.rs`).
 /// `legacy` (ROCm / HIP SDK 6.x - 7.2) keeps the RDNA2 / RDNA3 set used so far.

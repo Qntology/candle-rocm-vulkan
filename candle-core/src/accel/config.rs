@@ -221,6 +221,10 @@ pub struct FlashAttnOptions {
     /// Hadamard incoherent processing (rotate Q and K) when `flash_attn_fp8` quantizes K.
     /// Env: `CANDLE_FLASH_ATTN_HADAMARD`.
     pub hadamard: bool,
+    /// Decoding (row) kernels run the query heads that share a kv head in one workgroup, so
+    /// K/V are read once per kv head instead of once per query head (same results bit for
+    /// bit). Env: `CANDLE_FLASH_ATTN_GQA`.
+    pub gqa_decode: bool,
     /// Backends that may use the fused kernels. Env: `CANDLE_FLASH_ATTN_BACKENDS`.
     pub backends: BackendSwitches,
     /// Log the selected kernel once per configuration. Env: `CANDLE_FLASH_ATTN_DEBUG`.
@@ -235,6 +239,7 @@ impl Default for FlashAttnOptions {
             split_kv: SplitKv::Auto,
             fp8_kv: true,
             hadamard: true,
+            gqa_decode: true,
             backends: BackendSwitches::all(),
             debug: false,
         }
@@ -266,6 +271,10 @@ pub struct TurboQuantOptions {
     /// Attention directly on the compressed cache. Off: dequantize, then flash-attn.
     /// Env: `CANDLE_TURBO_QUANT_FUSED`.
     pub fused_attention: bool,
+    /// Specialized attention kernel for per-vector FP8 keys and values (same results bit for
+    /// bit as the generic kernel, a fraction of its instructions per element). Off: the generic
+    /// kernel. Env: `CANDLE_TURBO_QUANT_FP8_FAST`.
+    pub fp8_fast_path: bool,
     /// Seed of the rotation and QJL matrices. Env: `CANDLE_TURBO_QUANT_SEED`.
     pub seed: u64,
     /// Backends that may use the GPU kernels. Env: `CANDLE_TURBO_QUANT_BACKENDS`.
@@ -285,6 +294,7 @@ impl Default for TurboQuantOptions {
             rotation: RotationKind::Auto,
             qjl: false,
             fused_attention: true,
+            fp8_fast_path: true,
             seed: 42,
             backends: BackendSwitches::all(),
             debug: false,
@@ -368,6 +378,7 @@ impl AccelConfig {
         );
         env_bool("CANDLE_FLASH_ATTN_FP8_KV", &mut fa.fp8_kv);
         env_bool("CANDLE_FLASH_ATTN_HADAMARD", &mut fa.hadamard);
+        env_bool("CANDLE_FLASH_ATTN_GQA", &mut fa.gqa_decode);
         env_parse(
             "CANDLE_FLASH_ATTN_BACKENDS",
             &mut fa.backends,
@@ -414,6 +425,7 @@ impl AccelConfig {
         );
         env_bool("CANDLE_TURBO_QUANT_QJL", &mut tq.qjl);
         env_bool("CANDLE_TURBO_QUANT_FUSED", &mut tq.fused_attention);
+        env_bool("CANDLE_TURBO_QUANT_FP8_FAST", &mut tq.fp8_fast_path);
         env_parse("CANDLE_TURBO_QUANT_SEED", &mut tq.seed, |s| {
             s.trim().parse::<u64>().map_err(|e| e.to_string())
         });

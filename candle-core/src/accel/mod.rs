@@ -10,6 +10,7 @@
 
 pub mod attention;
 pub mod config;
+pub mod delta;
 pub mod formats;
 pub mod profile;
 pub mod sources;

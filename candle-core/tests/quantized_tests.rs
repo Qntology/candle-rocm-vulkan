@@ -1527,3 +1527,735 @@ test_device!(
     from_data_dequant_matches_canonical_when_caller_passes_cow_owned_cuda,
     from_data_dequant_matches_canonical_when_caller_passes_cow_owned_metal
 );
+
+// ---------------------------------------------------------------------------
+// Exact weight-only quantized matmul (`QTensor::forward_exact`) and `QTensor::dequantize_to`.
+// ---------------------------------------------------------------------------
+
+/// Small deterministic generator (splitmix64) so the W8A16 tests do not depend on `rand`.
+struct W8Rng(u64);
+
+impl W8Rng {
+    fn next_u64(&mut self) -> u64 {
+        self.0 = self.0.wrapping_add(0x9E37_79B9_7F4A_7C15);
+        let mut z = self.0;
+        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+        z ^ (z >> 31)
+    }
+
+    /// Uniform in [0, 1).
+    fn uniform(&mut self) -> f32 {
+        (self.next_u64() >> 40) as f32 / (1u64 << 24) as f32
+    }
+
+    /// Standard normal (Box-Muller).
+    fn normal(&mut self) -> f32 {
+        let u1 = self.uniform().max(1e-7);
+        let u2 = self.uniform();
+        (-2.0 * u1.ln()).sqrt() * (2.0 * std::f32::consts::PI * u2).cos()
+    }
+}
+
+/// Raw GGML bytes of a random `(n, k)` weight: random quants with small positive f16 scales
+/// (plus random sub-block scales for the k-quants), or N(0, 0.05) values for the float types.
+fn w8_weight_bytes(dtype: GgmlDType, n: usize, k: usize, seed: u64) -> Vec<u8> {
+    let mut rng = W8Rng(seed);
+    let elems = n * k;
+    let f16_scale = |rng: &mut W8Rng| half::f16::from_f32(2e-4 + 1.5e-3 * rng.uniform()).to_bits();
+    match dtype {
+        GgmlDType::F32 => (0..elems)
+            .flat_map(|_| (0.05 * rng.normal()).to_le_bytes())
+            .collect(),
+        GgmlDType::F16 => (0..elems)
+            .flat_map(|_| half::f16::from_f32(0.05 * rng.normal()).to_le_bytes())
+            .collect(),
+        GgmlDType::BF16 => (0..elems)
+            .flat_map(|_| half::bf16::from_f32(0.05 * rng.normal()).to_le_bytes())
+            .collect(),
+        _ => {
+            let bs = dtype.block_size();
+            let ts = dtype.type_size();
+            let mut bytes: Vec<u8> = (0..elems / bs * ts).map(|_| rng.next_u64() as u8).collect();
+            // Byte offsets of the f16 scale fields inside a block.
+            let scales: &[usize] = match dtype {
+                GgmlDType::Q4_0 | GgmlDType::Q5_0 | GgmlDType::Q8_0 => &[0],
+                GgmlDType::Q4_1 | GgmlDType::Q5_1 => &[0, 2],
+                GgmlDType::Q2K => &[80, 82],
+                GgmlDType::Q3K => &[108],
+                GgmlDType::Q4K | GgmlDType::Q5K => &[0, 2],
+                GgmlDType::Q6K => &[208],
+                d => panic!("w8_weight_bytes: unsupported {d:?}"),
+            };
+            for blk in bytes.chunks_exact_mut(ts) {
+                for &o in scales {
+                    blk[o..o + 2].copy_from_slice(&f16_scale(&mut rng).to_le_bytes());
+                }
+            }
+            bytes
+        }
+    }
+}
+
+fn w8_qtensor(
+    bytes: &[u8],
+    dtype: GgmlDType,
+    n: usize,
+    k: usize,
+    dev: &Device,
+) -> Result<quantized::QTensor> {
+    let storage = quantized::QStorage::from_data(Cow::Borrowed(bytes), dev, dtype)?;
+    quantized::QTensor::new(storage, (n, k))
+}
+
+/// Activations with Qwen3-like "massive" channels: N(0, 1) plus a handful of channels around
+/// +-(100..2000), the case where Q8_1 activation quantization loses accuracy.
+fn w8_input(rows: usize, k: usize, seed: u64) -> Vec<f32> {
+    let mut rng = W8Rng(seed);
+    let massive = [k / 7, k / 3 + 1, k / 2 + 5, k - 3];
+    (0..rows * k)
+        .map(|i| {
+            let c = i % k;
+            let v = rng.normal();
+            if massive.contains(&c) {
+                v.signum() * (100.0 + 1900.0 * rng.uniform())
+            } else {
+                v
+            }
+        })
+        .collect()
+}
+
+/// `x` (rows × k, already rounded to the input dtype) times the dequantized weight `w` (n × k)
+/// in f64, for the output columns `cols`; returns rows × cols.len() values.
+fn w8_reference(x: &[f32], w: &[f32], rows: usize, k: usize, cols: &[usize]) -> Vec<f64> {
+    let mut out = Vec::with_capacity(rows * cols.len());
+    for r in 0..rows {
+        let xr = &x[r * k..(r + 1) * k];
+        for &j in cols {
+            let wr = &w[j * k..(j + 1) * k];
+            out.push(xr.iter().zip(wr).map(|(&a, &b)| a as f64 * b as f64).sum());
+        }
+    }
+    out
+}
+
+/// Spacing of `dtype` values around `v` (the larger neighbour gap).
+fn w8_ulp(dtype: DType, v: f64) -> f64 {
+    let v = v as f32;
+    match dtype {
+        DType::BF16 => {
+            let b = half::bf16::from_f32(v.abs());
+            (half::bf16::from_bits(b.to_bits() + 1).to_f32() - b.to_f32()) as f64
+        }
+        DType::F16 => {
+            let b = half::f16::from_f32(v.abs());
+            (half::f16::from_bits(b.to_bits() + 1).to_f32() - b.to_f32()) as f64
+        }
+        _ => (f32::from_bits(v.abs().to_bits() + 1) - v.abs()) as f64,
+    }
+}
+
+/// Error statistics of `y` (rows × n, any float dtype) against the f64 reference on `cols`.
+struct W8Err {
+    /// max |y - ref| / max |ref|
+    rel: f64,
+    /// max |y - ref| / (0.5 ulp_dtype(ref) + 1e-5 max |ref|): <= 1 means "output rounding only".
+    rounding: f64,
+}
+
+fn w8_err(
+    y: &Tensor,
+    reference: &[f64],
+    rows: usize,
+    cols: &[usize],
+    dtype: DType,
+) -> Result<W8Err> {
+    let y = y
+        .to_dtype(DType::F32)?
+        .reshape((rows, ()))?
+        .to_vec2::<f32>()?;
+    let max_ref = reference
+        .iter()
+        .fold(0f64, |m, v| m.max(v.abs()))
+        .max(1e-30);
+    let (mut max_abs, mut rounding) = (0f64, 0f64);
+    for r in 0..rows {
+        for (ci, &j) in cols.iter().enumerate() {
+            let rf = reference[r * cols.len() + ci];
+            let d = (y[r][j] as f64 - rf).abs();
+            max_abs = max_abs.max(d);
+            rounding = rounding.max(d / (0.5 * w8_ulp(dtype, rf) + 1e-5 * max_ref));
+        }
+    }
+    Ok(W8Err {
+        rel: max_abs / max_ref,
+        rounding,
+    })
+}
+
+fn w8_round_to(x: &[f32], dtype: DType) -> Vec<f32> {
+    match dtype {
+        DType::BF16 => x
+            .iter()
+            .map(|&v| half::bf16::from_f32(v).to_f32())
+            .collect(),
+        DType::F16 => x.iter().map(|&v| half::f16::from_f32(v).to_f32()).collect(),
+        _ => x.to_vec(),
+    }
+}
+
+fn w8_bits(t: &Tensor) -> Result<Vec<u32>> {
+    let t = t.flatten_all()?;
+    Ok(match t.dtype() {
+        DType::F32 => t.to_vec1::<f32>()?.iter().map(|v| v.to_bits()).collect(),
+        DType::F16 => t
+            .to_vec1::<half::f16>()?
+            .iter()
+            .map(|v| v.to_bits() as u32)
+            .collect(),
+        DType::BF16 => t
+            .to_vec1::<half::bf16>()?
+            .iter()
+            .map(|v| v.to_bits() as u32)
+            .collect(),
+        d => bail!("w8_bits: unexpected {d:?}"),
+    })
+}
+
+/// Columns used for the f64 reference: all of them up to `max`, otherwise an even spread that
+/// includes the first and last column.
+fn w8_cols(n: usize, max: usize) -> Vec<usize> {
+    if n <= max {
+        (0..n).collect()
+    } else {
+        (0..max).map(|i| i * (n - 1) / (max - 1)).collect()
+    }
+}
+
+/// Runs `forward_exact` for one weight on `dev` over `ms` row counts and the three input dtypes,
+/// checks the accuracy contract and prints one table row per case.
+#[allow(clippy::too_many_arguments)]
+fn w8_check_forward_exact(
+    dev: &Device,
+    label: &str,
+    wtype: GgmlDType,
+    n: usize,
+    k: usize,
+    ms: &[usize],
+    cols_small: usize,
+    cols_large: usize,
+    compare_qmatmul: bool,
+) -> Result<()> {
+    let bytes = w8_weight_bytes(wtype, n, k, 0x5EED ^ (n * 31 + k) as u64);
+    let q_cpu = w8_qtensor(&bytes, wtype, n, k, &Device::Cpu)?;
+    let w_ref = q_cpu
+        .dequantize(&Device::Cpu)?
+        .flatten_all()?
+        .to_vec1::<f32>()?;
+    let q_dev = std::sync::Arc::new(w8_qtensor(&bytes, wtype, n, k, dev)?);
+    let exact_mv = dev.is_cuda()
+        && matches!(
+            wtype,
+            GgmlDType::Q8_0 | GgmlDType::Q4_0 | GgmlDType::Q4K | GgmlDType::Q5K | GgmlDType::Q6K
+        );
+    for &m in ms {
+        let cols = w8_cols(n, if m <= 8 { cols_small } else { cols_large });
+        let x32 = w8_input(m, k, 0xACE ^ (m * 7919 + k) as u64);
+        for dtype in [DType::F32, DType::BF16, DType::F16] {
+            let xr = w8_round_to(&x32, dtype);
+            let reference = w8_reference(&xr, &w_ref, m, k, &cols);
+            let x = Tensor::from_slice(&x32, (m, k), dev)?.to_dtype(dtype)?;
+            let y = q_dev.forward_exact(&x)?;
+            assert_eq!(y.dims(), [m, n]);
+            assert_eq!(y.dtype(), dtype);
+            let e = w8_err(&y, &reference, m, &cols, dtype)?;
+            let path = if m <= 8 {
+                if exact_mv {
+                    "mv"
+                } else {
+                    "f32-dense"
+                }
+            } else {
+                "dequant+gemm"
+            };
+            let mut line = format!(
+                "[W8A16-ACC] {label} {wtype:?} {n}x{k} m={m} in={dtype:?} path={path} max_rel={:.2e} rounding={:.2}",
+                e.rel, e.rounding
+            );
+            if m <= 8 || dtype == DType::F32 {
+                // f32 dequantized weights, f32 accumulation: only the output rounding differs.
+                if dtype == DType::F32 {
+                    assert!(e.rel <= 1e-5, "{line}");
+                } else {
+                    assert!(e.rounding <= 1.0, "{line}");
+                }
+            } else {
+                // Prefill in bf16 / f16: the weight is rounded to the activation dtype, then the
+                // same GEMM as a dense layer. Must equal `x.matmul(dequantize_to(dtype).t())`.
+                let tol = if dtype == DType::BF16 { 3e-2 } else { 5e-3 };
+                assert!(e.rel <= tol, "{line}");
+                if !dev.is_cuda() {
+                    // CPU: bf16 prefill runs in f32 (no bf16 matmul on the CPU backend).
+                    println!("{line}");
+                    continue;
+                }
+                let dense = q_dev.dequantize_to(dtype, dev)?;
+                let y_dense = x.matmul(&dense.t()?)?;
+                // Against weights rounded to the activation dtype the GEMM must only add the
+                // output rounding (f32 accumulation), for both paths.
+                let w_rounded = w8_round_to(&w_ref, dtype);
+                let ref_rounded = w8_reference(&xr, &w_rounded, m, k, &cols);
+                let er = w8_err(&y, &ref_rounded, m, &cols, dtype)?;
+                let erd = w8_err(&y_dense, &ref_rounded, m, &cols, dtype)?;
+                line.push_str(&format!(
+                    " rounding_vs_rounded_w={:.2} (dense {:.2})",
+                    er.rounding, erd.rounding
+                ));
+                // Never worse than the dense layer, and a single rounding when tiled.
+                assert!(er.rounding <= erd.rounding.max(1.0) + 0.05, "{line}");
+                let (a, b) = (w8_bits(&y)?, w8_bits(&y_dense)?);
+                let same = a.iter().zip(&b).filter(|(a, b)| a == b).count();
+                let ed = w8_err(&y_dense, &reference, m, &cols, dtype)?;
+                line.push_str(&format!(
+                    " dense_bf16_path_max_rel={:.2e} bit_identical={}/{}",
+                    ed.rel,
+                    same,
+                    a.len()
+                ));
+                let single_tile = n * k * dtype.size_in_bytes() <= 32 << 20;
+                let matmul_mode = std::env::var("CANDLE_W8A16_PREFILL_GEMM")
+                    .is_ok_and(|v| v.eq_ignore_ascii_case("matmul"));
+                if single_tile && matmul_mode {
+                    // Opt-in mode: the exact `Tensor::matmul` cuBLAS call.
+                    assert_eq!(same, a.len(), "{line}");
+                } else {
+                    // Default: f32 accumulation rounded once, never worse than the dense layer.
+                    assert!(er.rounding <= 1.05, "{line}");
+                    assert!(e.rel <= ed.rel * 1.05 + 1e-6, "{line}");
+                }
+            }
+            if compare_qmatmul {
+                let mm = quantized::QMatMul::from_arc(q_dev.clone())?;
+                if let Ok(yq) = mm.forward(&x) {
+                    let eq = w8_err(&yq, &reference, m, &cols, dtype)?;
+                    line.push_str(&format!(" | QMatMul::forward max_rel={:.2e}", eq.rel));
+                }
+            }
+            println!("{line}");
+        }
+    }
+    Ok(())
+}
+
+/// Qwen3-0.6B projection shapes (n = out, k = in).
+#[cfg(feature = "cuda")]
+const W8_QWEN3_SHAPES: [(&str, usize, usize); 5] = [
+    ("q_proj", 2048, 1024),
+    ("k/v_proj", 1024, 1024),
+    ("o_proj", 1024, 2048),
+    ("gate/up", 3072, 1024),
+    ("down", 1024, 3072),
+];
+#[cfg(feature = "cuda")]
+const W8_MS: [usize; 7] = [1, 2, 4, 8, 9, 64, 256];
+
+#[test]
+fn w8a16_forward_exact_cpu() -> Result<()> {
+    let dev = &Device::Cpu;
+    for wtype in [
+        GgmlDType::Q8_0,
+        GgmlDType::Q4K,
+        GgmlDType::Q6K,
+        GgmlDType::F16,
+    ] {
+        w8_check_forward_exact(dev, "cpu", wtype, 96, 512, &[1, 3, 9], 96, 96, false)?;
+    }
+    Ok(())
+}
+
+/// Backend-generic contract of `forward_exact` and `dequantize_to`, generated for every compiled
+/// backend by `test_device!` (CPU, CUDA, Metal, ROCm, Vulkan): weight types with and without a
+/// CUDA mat-vec kernel, decode (m <= 8) and prefill row counts, F32 / BF16 / F16 inputs.
+fn w8a16_generic(dev: &Device) -> Result<()> {
+    let (n, k) = (192, 1024);
+    let label = format!("{:?}", dev.location());
+    for wtype in [
+        GgmlDType::Q8_0,
+        GgmlDType::Q4_0,
+        GgmlDType::Q4K,
+        GgmlDType::Q5K,
+        GgmlDType::Q6K,
+        GgmlDType::F16,
+        GgmlDType::BF16,
+    ] {
+        w8_check_forward_exact(dev, &label, wtype, n, k, &[1, 3, 8, 9, 40], 1 << 20, 64, false)?;
+        // `dequantize_to` on the device against the CPU dequantization: bit exact on CPU / Metal
+        // and for the direct CUDA kernels, otherwise within one ulp of the target dtype (or of
+        // f32 at the weight scale, for kernels that contract the k-quant `d * q - m` to an FMA).
+        let bytes = w8_weight_bytes(wtype, n, k, 21);
+        let want_f32 = w8_qtensor(&bytes, wtype, n, k, &Device::Cpu)?.dequantize(&Device::Cpu)?;
+        let scale = want_f32.abs()?.max_all()?.to_scalar::<f32>()? as f64;
+        let q = w8_qtensor(&bytes, wtype, n, k, dev)?;
+        for dtype in [DType::F32, DType::F16, DType::BF16] {
+            let want = want_f32.to_dtype(dtype)?;
+            let got = q.dequantize_to(dtype, dev)?;
+            assert_eq!(got.dtype(), dtype);
+            assert_eq!(got.dims(), [n, k]);
+            assert!(got.device().same_device(dev));
+            let a = w8_bits(&got.to_device(&Device::Cpu)?)?;
+            let b = w8_bits(&want)?;
+            let af = got.to_device(&Device::Cpu)?.to_dtype(DType::F32)?.flatten_all()?;
+            let bf = want.to_dtype(DType::F32)?.flatten_all()?;
+            let (af, bf) = (af.to_vec1::<f32>()?, bf.to_vec1::<f32>()?);
+            let mut differ = 0;
+            for i in 0..a.len() {
+                if a[i] != b[i] {
+                    differ += 1;
+                    let d = (af[i] as f64 - bf[i] as f64).abs();
+                    let tol = w8_ulp(dtype, bf[i] as f64).max(f32::EPSILON as f64 * scale);
+                    assert!(
+                        d <= tol,
+                        "{label} {wtype:?} -> {dtype:?}: element {i} {} vs {}",
+                        af[i],
+                        bf[i]
+                    );
+                }
+            }
+            println!(
+                "[W8A16-DQ] {label} {wtype:?} -> {dtype:?}: {differ}/{} values differ from the CPU",
+                a.len()
+            );
+        }
+    }
+    Ok(())
+}
+
+test_device!(
+    w8a16_generic,
+    w8a16_generic_cpu,
+    w8a16_generic_cuda,
+    w8a16_generic_metal
+);
+
+#[test]
+fn w8a16_dequantize_to_cpu() -> Result<()> {
+    let (n, k) = (64, 512);
+    for wtype in [GgmlDType::Q8_0, GgmlDType::Q4K, GgmlDType::BF16] {
+        let bytes = w8_weight_bytes(wtype, n, k, 7);
+        let q = w8_qtensor(&bytes, wtype, n, k, &Device::Cpu)?;
+        for dtype in [DType::F32, DType::F16, DType::BF16] {
+            let a = q.dequantize_to(dtype, &Device::Cpu)?;
+            let b = q.dequantize(&Device::Cpu)?.to_dtype(dtype)?;
+            assert_eq!(a.dtype(), dtype);
+            assert_eq!(w8_bits(&a)?, w8_bits(&b)?, "{wtype:?} -> {dtype:?}");
+            let rows = q.dequantize_rows_to(5, 17, dtype, &Device::Cpu)?;
+            assert_eq!(w8_bits(&rows)?, w8_bits(&b.narrow(0, 5, 17)?)?);
+        }
+    }
+    Ok(())
+}
+
+#[cfg(feature = "cuda")]
+#[test]
+fn w8a16_dequantize_to_cuda() -> Result<()> {
+    let dev = &Device::new_cuda(0)?;
+    let (n, k) = (160, 1024);
+    for wtype in [
+        GgmlDType::Q8_0,
+        GgmlDType::Q4_0,
+        GgmlDType::Q4K,
+        GgmlDType::Q5K,
+        GgmlDType::Q6K,
+        GgmlDType::F32,
+        GgmlDType::F16,
+        GgmlDType::BF16,
+        // No direct kernel: f32 kernel + device cast (not bit exact, see below).
+        GgmlDType::Q4_1,
+        GgmlDType::Q5_0,
+        GgmlDType::Q3K,
+    ] {
+        let bytes = w8_weight_bytes(wtype, n, k, 11 + wtype.type_size() as u64);
+        let q_cpu = w8_qtensor(&bytes, wtype, n, k, &Device::Cpu)?;
+        let q_gpu = w8_qtensor(&bytes, wtype, n, k, dev)?;
+        let direct = !matches!(wtype, GgmlDType::Q4_1 | GgmlDType::Q5_0 | GgmlDType::Q3K);
+        for dtype in [DType::F32, DType::F16, DType::BF16] {
+            let want = q_cpu.dequantize(&Device::Cpu)?.to_dtype(dtype)?;
+            let got = q_gpu.dequantize_to(dtype, dev)?;
+            assert_eq!(got.dtype(), dtype);
+            assert!(got.device().is_cuda());
+            let (a, b) = (w8_bits(&got)?, w8_bits(&want)?);
+            let diff = a.iter().zip(&b).filter(|(a, b)| a != b).count();
+            println!(
+                "[W8A16-DQ] {wtype:?} -> {dtype:?}: {diff}/{} values differ from the CPU",
+                a.len()
+            );
+            if direct {
+                assert_eq!(diff, 0, "{wtype:?} -> {dtype:?} is not bit exact");
+                // Row ranges (block aligned offsets) of the direct kernels.
+                let rows = q_gpu.dequantize_rows_to(37, 101, dtype, dev)?;
+                assert_eq!(w8_bits(&rows)?, w8_bits(&want.narrow(0, 37, 101)?)?);
+            } else {
+                let got = got.to_device(&Device::Cpu)?;
+                let d = (got.to_dtype(DType::F32)? - want.to_dtype(DType::F32)?)?
+                    .abs()?
+                    .max_all()?
+                    .to_scalar::<f32>()?;
+                assert!(d <= 1e-3, "{wtype:?} -> {dtype:?}: max diff {d}");
+            }
+        }
+        // `QTensor::dequantize` of the float GGUF types now stays on the device too.
+        if matches!(wtype, GgmlDType::F32 | GgmlDType::F16 | GgmlDType::BF16) {
+            let a = q_gpu.dequantize(dev)?;
+            let b = q_cpu.dequantize(&Device::Cpu)?;
+            assert_eq!(w8_bits(&a)?, w8_bits(&b)?);
+            let a = q_gpu.dequantize_f16(dev)?;
+            assert_eq!(w8_bits(&a)?, w8_bits(&b.to_dtype(DType::F16)?)?);
+        }
+    }
+    Ok(())
+}
+
+#[cfg(feature = "cuda")]
+#[test]
+fn w8a16_forward_exact_qwen3_cuda() -> Result<()> {
+    let dev = &Device::new_cuda(0)?;
+    for (label, n, k) in W8_QWEN3_SHAPES {
+        w8_check_forward_exact(dev, label, GgmlDType::Q8_0, n, k, &W8_MS, 1 << 20, 48, true)?;
+    }
+    Ok(())
+}
+
+#[cfg(feature = "cuda")]
+#[test]
+fn w8a16_forward_exact_lm_head_cuda() -> Result<()> {
+    // A quarter of the 151936 x 1024 tied lm_head of Qwen3-0.6B (41 MB of Q8_0): the bf16 / f32
+    // prefill weight no longer fits one 32 MiB dequantization tile.
+    let dev = &Device::new_cuda(0)?;
+    let n = 151936 / 4;
+    w8_check_forward_exact(
+        dev,
+        "lm_head/4",
+        GgmlDType::Q8_0,
+        n,
+        1024,
+        &W8_MS,
+        384,
+        48,
+        true,
+    )
+}
+
+#[cfg(feature = "cuda")]
+#[test]
+fn w8a16_forward_exact_kquants_cuda() -> Result<()> {
+    let dev = &Device::new_cuda(0)?;
+    for wtype in [
+        GgmlDType::Q4_0,
+        GgmlDType::Q4K,
+        GgmlDType::Q5K,
+        GgmlDType::Q6K,
+    ] {
+        for (n, k) in [(1024, 1024), (1024, 3072), (640, 2048)] {
+            w8_check_forward_exact(
+                dev,
+                "kq",
+                wtype,
+                n,
+                k,
+                &[1, 3, 8, 9, 64],
+                1 << 20,
+                48,
+                false,
+            )?;
+        }
+    }
+    // Weight types without a mat-vec kernel: f32 dequantization + f32 GEMM for <= 8 rows.
+    for wtype in [
+        GgmlDType::Q5_0,
+        GgmlDType::Q3K,
+        GgmlDType::F16,
+        GgmlDType::BF16,
+    ] {
+        w8_check_forward_exact(
+            dev,
+            "other",
+            wtype,
+            256,
+            1024,
+            &[1, 8, 9],
+            1 << 20,
+            64,
+            false,
+        )?;
+    }
+    Ok(())
+}
+
+#[cfg(feature = "cuda")]
+#[test]
+fn w8a16_forward_exact_layouts_cuda() -> Result<()> {
+    let dev = &Device::new_cuda(0)?;
+    let (n, k) = (384, 1024);
+    let bytes = w8_weight_bytes(GgmlDType::Q8_0, n, k, 99);
+    let q = std::sync::Arc::new(w8_qtensor(&bytes, GgmlDType::Q8_0, n, k, dev)?);
+    let w = q.dequantize_to(DType::F32, dev)?;
+    let x32 = Tensor::from_vec(w8_input(12, k, 5), (12, k), dev)?;
+    let check = |x: &Tensor, what: &str| -> Result<()> {
+        for dtype in [DType::F32, DType::BF16] {
+            let x = x.to_dtype(dtype)?;
+            let y = q.forward_exact(&x)?;
+            let mut dims = x.dims().to_vec();
+            *dims.last_mut().unwrap() = n;
+            assert_eq!(y.dims(), dims.as_slice(), "{what}");
+            let flat = x.to_dtype(DType::F32)?.reshape(((), k))?;
+            let want = flat.matmul(&w.t()?)?;
+            let got = y.to_dtype(DType::F32)?.reshape(((), n))?;
+            let d = (got - &want)?.abs()?.max_all()?.to_scalar::<f32>()?;
+            let s = want.abs()?.max_all()?.to_scalar::<f32>()?;
+            let rows = flat.dim(0)?;
+            let tol = if dtype == DType::F32 {
+                1e-5
+            } else if rows <= 8 {
+                4e-3
+            } else {
+                3e-2
+            };
+            assert!(d / s <= tol, "{what} {dtype:?}: rel {}", d / s);
+        }
+        Ok(())
+    };
+    check(&x32.get(0)?, "rank-1")?;
+    check(&x32.narrow(0, 0, 6)?.reshape((2, 3, k))?, "rank-3, 6 rows")?;
+    check(&x32.reshape((3, 4, k))?, "rank-3, 12 rows")?;
+    check(&x32.reshape((2, 2, 3, k))?, "rank-4")?;
+    // Misaligned start (one element in): the mat-vec input is re-packed.
+    let flat = x32.flatten_all()?;
+    check(&flat.narrow(0, 1, 2 * k)?.reshape((2, k))?, "misaligned")?;
+    // Non-contiguous: every other row.
+    check(
+        &x32.reshape((6, 2, k))?.narrow(1, 0, 1)?.squeeze(1)?,
+        "strided rows",
+    )?;
+    // Transposed storage.
+    check(&x32.narrow(0, 0, 4)?.t()?.contiguous()?.t()?, "transposed")?;
+    // Zero rows.
+    let y = q.forward_exact(&Tensor::zeros((0, k), DType::BF16, dev)?)?;
+    assert_eq!(y.dims(), [0, n]);
+    // Wrong inner dimension.
+    assert!(q
+        .forward_exact(&Tensor::zeros((2, k + 32), DType::F32, dev)?)
+        .is_err());
+
+    // QMatMul::forward_exact on the three variants.
+    let mm = quantized::QMatMul::from_arc(q.clone())?;
+    let x = x32.narrow(0, 0, 2)?;
+    let a = mm.forward_exact(&x)?;
+    let b = q.forward_exact(&x)?;
+    assert_eq!(w8_bits(&a)?, w8_bits(&b)?);
+    let dense = quantized::QMatMul::Tensor(w.clone());
+    let c = dense.forward_exact(&x.to_dtype(DType::BF16)?)?;
+    assert_eq!(c.dtype(), DType::BF16);
+    Ok(())
+}
+
+/// Average GPU time of `f` in microseconds. The GPU is kept busy with large f32 matmuls while
+/// the timed calls are queued, so host-side overhead (this is a debug build) is excluded and the
+/// result is the back-to-back device time per call (kernels + launch gaps).
+#[cfg(feature = "cuda")]
+fn w8_gpu_time_us(
+    dev: &Device,
+    iters: usize,
+    mut f: impl FnMut() -> Result<Tensor>,
+) -> Result<(f64, bool)> {
+    use candle_core::cuda_backend::cudarc::driver::sys::CUevent_flags;
+    let cuda = dev.as_cuda_device()?;
+    let stream = cuda.cuda_stream();
+    for _ in 0..3 {
+        f()?;
+    }
+    dev.synchronize()?;
+    let filler = Tensor::ones((2048, 2048), DType::F32, dev)?;
+    let t_fill = std::time::Instant::now();
+    let f0 = stream
+        .record_event(Some(CUevent_flags::CU_EVENT_DEFAULT))
+        .map_err(candle_core::Error::wrap)?;
+    for _ in 0..10 {
+        let _ = filler.matmul(&filler)?;
+    }
+    let start = stream
+        .record_event(Some(CUevent_flags::CU_EVENT_DEFAULT))
+        .map_err(candle_core::Error::wrap)?;
+    let t0 = std::time::Instant::now();
+    for _ in 0..iters {
+        f()?;
+    }
+    let host = t0.elapsed().as_secs_f64() + (t0 - t_fill).as_secs_f64();
+    let end = stream
+        .record_event(Some(CUevent_flags::CU_EVENT_DEFAULT))
+        .map_err(candle_core::Error::wrap)?;
+    let ms = start.elapsed_ms(&end).map_err(candle_core::Error::wrap)?;
+    let fill_ms = f0.elapsed_ms(&start).map_err(candle_core::Error::wrap)?;
+    // Valid when the host finished queueing before the GPU drained the filler.
+    let valid = host * 1e3 < fill_ms as f64;
+    Ok((ms as f64 * 1e3 / iters as f64, valid))
+}
+
+/// Decode / prefill timing of `forward_exact` against `QMatMul::forward` (MMVQ / MMQ with Q8_1
+/// activations) and a resident dense BF16 weight (today's dequantize-to-BF16 path).
+/// Run with `cargo test --features cuda --test quantized_tests w8a16_bench -- --ignored --nocapture`
+/// (`CANDLE_W8A16_MV=<warps>x<rows>` overrides the mat-vec launch shape).
+#[cfg(feature = "cuda")]
+#[test]
+#[ignore]
+fn w8a16_bench_cuda() -> Result<()> {
+    let dev = &Device::new_cuda(0)?;
+    let shapes: Vec<(&str, usize, usize)> = std::env::var("W8A16_BENCH_SHAPES")
+        .ok()
+        .map(|s| {
+            W8_QWEN3_SHAPES
+                .iter()
+                .copied()
+                .chain([("lm_head", 151936, 1024)])
+                .filter(|(l, _, _)| s.split(',').any(|x| x == *l))
+                .collect()
+        })
+        .unwrap_or_else(|| {
+            W8_QWEN3_SHAPES
+                .iter()
+                .copied()
+                .chain([("lm_head", 151936, 1024)])
+                .collect()
+        });
+    let ms: Vec<usize> = std::env::var("W8A16_BENCH_M")
+        .ok()
+        .map(|s| s.split(',').filter_map(|v| v.parse().ok()).collect())
+        .unwrap_or_else(|| vec![1]);
+    // Back-to-back cost of a trivial kernel: the per-call floor included in every number below.
+    let tiny = Tensor::zeros(8, DType::F32, dev)?;
+    let (floor, _) = w8_gpu_time_us(dev, 100, || tiny.affine(1.0, 0.0))?;
+    println!("[W8A16-BENCH] floor (one trivial kernel per call) {floor:.1} us");
+    for (label, n, k) in shapes {
+        let bytes = w8_weight_bytes(GgmlDType::Q8_0, n, k, 3);
+        let q = std::sync::Arc::new(w8_qtensor(&bytes, GgmlDType::Q8_0, n, k, dev)?);
+        drop(bytes);
+        let w_bf16 = q.dequantize_to(DType::BF16, dev)?;
+        let mm = quantized::QMatMul::from_arc(q.clone())?;
+        for &m in &ms {
+            let iters = if n > 100_000 { 30 } else { 100 };
+            let x = Tensor::from_vec(w8_input(m, k, 1), (m, k), dev)?;
+            let xb = x.to_dtype(DType::BF16)?;
+            let wt = w_bf16.t()?;
+            let (exact_bf16, v1) = w8_gpu_time_us(dev, iters, || q.forward_exact(&xb))?;
+            let (exact_f32, v2) = w8_gpu_time_us(dev, iters, || q.forward_exact(&x))?;
+            let (mmvq, v3) = w8_gpu_time_us(dev, iters, || mm.forward(&xb))?;
+            let (dense, v4) = w8_gpu_time_us(dev, iters, || xb.matmul(&wt))?;
+            let valid = v1 && v2 && v3 && v4;
+            println!(
+                "[W8A16-BENCH] {label} {n}x{k} m={m}: forward_exact bf16 {exact_bf16:.1} us | forward_exact f32 {exact_f32:.1} us | QMatMul::forward (q8_1) {mmvq:.1} us | dense bf16 matmul {dense:.1} us{}",
+                if valid { "" } else { " (host-bound, unreliable)" }
+            );
+        }
+    }
+    Ok(())
+}

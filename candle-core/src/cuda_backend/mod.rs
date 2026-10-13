@@ -10,22 +10,19 @@ use cudarc::driver::{
     CudaSlice, DevicePtr, DeviceRepr, LaunchConfig, PushKernelArg, ValidAsZeroBits,
 };
 use half::{bf16, f16};
-use std::collections::HashMap;
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::Arc;
 
 #[cfg(feature = "cudnn")]
 pub mod cudnn;
 mod accel;
+mod delta_rule;
 mod device;
 mod error;
+pub mod offload;
 mod utils;
-pub use device::{CudaDevice, DeviceId};
+pub use device::{clear_cuda_graph_htod_cache, CudaDevice, CudaPoolStats, DeviceId};
 pub use error::{CudaError, WrapErr};
 pub use utils::{Map1, Map1Any, Map2, Map2Any, Map2InPlace, Map3, S};
-
-type ParamCache = HashMap<(DeviceId, Vec<usize>), Arc<CudaSlice<usize>>>;
-
-static CUDA_PARAM_CACHE: OnceLock<Mutex<ParamCache>> = OnceLock::new();
 
 pub enum SlicePtrOrNull<T> {
     Ptr(CudaSlice<T>),
@@ -64,9 +61,7 @@ impl crate::scalar::Scalar {
 impl SlicePtrOrNull<usize> {
     pub fn params_from_vec(dev: &CudaDevice, params: Vec<usize>) -> Result<Self> {
         if device::cuda_graph_htod_cache_enabled() {
-            let key = (dev.id(), params.clone());
-            let cache = CUDA_PARAM_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
-            if let Some(slice) = cache.lock().unwrap().get(&key).cloned() {
+            if let Some(slice) = dev.cached_params(&params) {
                 return Ok(SlicePtrOrNull::Cached(slice));
             }
 
@@ -80,8 +75,7 @@ impl SlicePtrOrNull<usize> {
             }
 
             let slice = Arc::new(dev.cuda_stream().clone_htod(&params).w()?);
-            let mut cache = cache.lock().unwrap();
-            let slice = cache.entry(key).or_insert_with(|| slice).clone();
+            let slice = dev.insert_cached_params(params, slice);
             return Ok(SlicePtrOrNull::Cached(slice));
         }
 
@@ -1229,6 +1223,17 @@ fn slice_src_and_dst<'a, T>(
 pub struct CudaStorage {
     pub slice: CudaStorageSlice,
     pub device: CudaDevice,
+}
+
+impl Drop for CudaStorage {
+    fn drop(&mut self) {
+        // The buffer is released right after this by `CudaSlice::drop` with `cuMemFreeAsync` on
+        // the device stream, which needs the context current on this thread. Tensors are often
+        // dropped on threads that never ran CUDA work (tokio / spawn_blocking workers); there the
+        // free would fail with CUDA_ERROR_INVALID_CONTEXT, leak the memory and leave a deferred
+        // error behind. cudarc does not bind in that path when event tracking is off.
+        let _ = self.device.bind_to_thread();
+    }
 }
 
 pub trait CudaDType: Sized {

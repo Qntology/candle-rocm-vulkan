@@ -26,6 +26,8 @@ pub mod cuda;
 pub mod fast_mmq;
 #[cfg(feature = "cuda")]
 pub mod fast_mmvq;
+#[cfg(feature = "cuda")]
+pub mod w8a16;
 #[cfg(not(feature = "cuda"))]
 mod cuda {
     pub use super::dummy_cuda::*;
@@ -842,6 +844,152 @@ impl QTensor {
         }
     }
 
+    /// Dequantizes to a dense tensor of `dtype` (F32, F16 or BF16) placed on `device`.
+    ///
+    /// The conversion runs on the tensor's own device when it is a GPU. On CUDA, Q8_0 / Q4_0 /
+    /// Q4K / Q5K / Q6K blocks and F32 / F16 / BF16 GGUF tensors are converted by one kernel
+    /// straight to `dtype` (one rounding, no f32 intermediate and no host round trip, bit exact
+    /// with `self.dequantize(&Device::Cpu)?.to_dtype(dtype)`); the other block types use the f32
+    /// kernel and a device cast. ROCm / Vulkan use their f32 (or f16) dequantization kernels and
+    /// a device cast; CPU / Metal dequantize to f32 and cast. The result is then moved to
+    /// `device` (in `dtype`) if that is another device.
+    pub fn dequantize_to(&self, dtype: DType, device: &Device) -> Result<Tensor> {
+        if !matches!(dtype, DType::F32 | DType::F16 | DType::BF16) {
+            crate::bail!("dequantize_to: unsupported dtype {dtype:?}")
+        }
+        let elem_count = self.shape.elem_count();
+        let none = crate::op::BackpropOp::none;
+        let t = match &self.storage {
+            QStorage::Cuda(s) => {
+                let st = s.dequantize_to(elem_count, dtype)?;
+                crate::tensor::from_storage(Storage::Cuda(st), self.shape.clone(), none(), false)
+            }
+            QStorage::Rocm(s) => {
+                let st = if dtype == DType::F16 {
+                    s.dequantize_f16(elem_count)?
+                } else {
+                    s.dequantize(elem_count)?
+                };
+                crate::tensor::from_storage(Storage::Rocm(st), self.shape.clone(), none(), false)
+                    .to_dtype(dtype)?
+            }
+            QStorage::Vulkan(s) => {
+                let st = if dtype == DType::F16 {
+                    s.dequantize_f16(elem_count)?
+                } else {
+                    s.dequantize(elem_count)?
+                };
+                crate::tensor::from_storage(Storage::Vulkan(st), self.shape.clone(), none(), false)
+                    .to_dtype(dtype)?
+            }
+            _ => self.dequantize(&self.device())?.to_dtype(dtype)?,
+        };
+        t.to_device(device)
+    }
+
+    /// Rows `row0..row0 + nrows` of a 2D quantized matrix, dequantized to `dtype` on `device`
+    /// (see [`Self::dequantize_to`]). Only the selected rows are converted on CUDA; the other
+    /// backends dequantize the whole matrix and narrow it.
+    pub fn dequantize_rows_to(
+        &self,
+        row0: usize,
+        nrows: usize,
+        dtype: DType,
+        device: &Device,
+    ) -> Result<Tensor> {
+        let (n, k) = self.shape.dims2()?;
+        if row0 + nrows > n {
+            crate::bail!("dequantize_rows_to: rows {row0}..{} out of {n}", row0 + nrows)
+        }
+        match &self.storage {
+            QStorage::Cuda(s) => {
+                let st = s.dequantize_range_to(row0 * k, nrows * k, dtype)?;
+                let none = crate::op::BackpropOp::none();
+                crate::tensor::from_storage(Storage::Cuda(st), (nrows, k), none, false)
+                    .to_device(device)
+            }
+            _ => self.dequantize_to(dtype, device)?.narrow(0, row0, nrows),
+        }
+    }
+
+    /// Exact weight-only quantized matmul `xs * dequant(self)^T`: the activations are never
+    /// quantized (unlike [`QMatMul::forward`], whose CUDA MMVQ / MMQ kernels round them to Q8_1
+    /// and whose CPU kernels round them to Q8_0 / Q8K).
+    ///
+    /// `self` is an `(n, k)` weight and `xs` an F32 / F16 / BF16 tensor of shape `(.., k)` (any
+    /// rank, any layout); the result has shape `(.., n)` and the dtype of `xs`.
+    ///
+    /// * CUDA, at most [`EXACT_MV_MAX_ROWS`] rows (`xs.elem_count() / k`, i.e. decode) and a
+    ///   Q8_0 / Q4_0 / Q4K / Q5K / Q6K weight: one mat-vec kernel dequantizes the weights in f32
+    ///   inside the kernel, reads `xs` in its own dtype, accumulates in f32 and rounds once to
+    ///   the output dtype.
+    /// * CUDA otherwise (prefill): the weight is dequantized on the device to the activation
+    ///   dtype (exactly `self.dequantize_to(xs.dtype(), ..)`) in row tiles of at most
+    ///   `CANDLE_W8A16_DEQUANT_TILE_MB` (default 32) MiB, a transient buffer, and multiplied by
+    ///   cuBLAS with f32 accumulation and f32 split-k reductions
+    ///   (`CUBLAS_MATH_DISALLOW_REDUCED_PRECISION_REDUCTION`), every output rounded once to the
+    ///   output dtype. That is the dense dequantize-to-bf16 layer (`Tensor::matmul`) without the
+    ///   extra roundings of the split-k kernels cuBLAS picks for some bf16 shapes; set
+    ///   `CANDLE_W8A16_PREFILL_GEMM=matmul` to issue the exact `Tensor::matmul` cuBLAS call
+    ///   instead (bit identical to the dense layer for weights that fit one tile, e.g. every
+    ///   Qwen3-0.6B projection). Weight types without a mat-vec kernel use f32 dequantization
+    ///   and an f32 GEMM for at most `EXACT_MV_MAX_ROWS` rows.
+    /// * ROCm: the backend's quantized matmul, which is already exact (f32 mat-vec `qmv_*` for
+    ///   at most 8 rows, otherwise f32 dequantization tiles + an f32 rocBLAS GEMM).
+    /// * CPU / Metal / Vulkan: dequantize + dense matmul, in f32 for at most
+    ///   `EXACT_MV_MAX_ROWS` rows and in the activation dtype otherwise (the CUDA semantics;
+    ///   bf16 on the CPU, which has no bf16 matmul, also uses f32).
+    pub fn forward_exact(&self, xs: &Tensor) -> Result<Tensor> {
+        let (_n, k) = self.shape.dims2()?;
+        let dims = xs.dims();
+        if dims.is_empty() || dims[dims.len() - 1] != k {
+            crate::bail!(
+                "forward_exact: input {:?} incompatible with weight {:?}",
+                xs.shape(),
+                self.shape
+            )
+        }
+        let dtype = xs.dtype();
+        if !matches!(dtype, DType::F32 | DType::F16 | DType::BF16) {
+            crate::bail!("forward_exact: unsupported input dtype {dtype:?}")
+        }
+        let rows = xs.elem_count() / k.max(1);
+        match &self.storage {
+            QStorage::Cuda(s) => {
+                // The mat-vec kernel loads 16 byte vectors of `xs`: re-pack a misaligned view.
+                let misaligned = rows <= EXACT_MV_MAX_ROWS
+                    && !(xs.layout().start_offset() * dtype.size_in_bytes()).is_multiple_of(16);
+                let xs = if misaligned {
+                    xs.force_contiguous()?
+                } else {
+                    xs.contiguous()?
+                };
+                let (st, shape) = match &*xs.storage() {
+                    Storage::Cuda(x) => s.fwd_exact(&self.shape, x, xs.layout())?,
+                    _ => crate::bail!("forward_exact: the input is not on the weight's CUDA device"),
+                };
+                let none = crate::op::BackpropOp::none();
+                Ok(crate::tensor::from_storage(Storage::Cuda(st), shape, none, false))
+            }
+            // The ROCm kernels need at least a 2D input.
+            QStorage::Rocm(_) if dims.len() == 1 => {
+                xs.unsqueeze(0)?.apply_op1_no_bwd(self)?.squeeze(0)
+            }
+            QStorage::Rocm(_) => xs.apply_op1_no_bwd(self),
+            _ => {
+                // The CPU backend has no bf16 matmul: bf16 prefill runs in f32 there.
+                let cpu_bf16 = dtype == DType::BF16 && xs.device().is_cpu();
+                let compute = if rows <= EXACT_MV_MAX_ROWS || cpu_bf16 {
+                    DType::F32
+                } else {
+                    dtype
+                };
+                let w = self.dequantize_to(compute, xs.device())?;
+                linear_forward(&xs.to_dtype(compute)?, &w)?.to_dtype(dtype)
+            }
+        }
+    }
+
     pub fn embedding(&self, ids: &Tensor) -> Result<Tensor> {
         let (rows, hidden) = self.shape.dims2()?;
         if !hidden.is_multiple_of(self.dtype().block_size()) {
@@ -953,6 +1101,31 @@ impl QTensor {
     }
 }
 
+/// Input rows up to which [`QTensor::forward_exact`] uses the exact mat-vec path.
+pub const EXACT_MV_MAX_ROWS: usize = 8;
+
+/// `x * w^T` for a dense `(n, k)` weight, the same computation as `candle_nn::Linear::forward`
+/// (contiguous inputs are flattened to one 2D matmul, others use a broadcast matmul).
+fn linear_forward(x: &Tensor, w: &Tensor) -> Result<Tensor> {
+    let dims = x.dims();
+    match *dims {
+        [k] => x.reshape((1, k))?.matmul(&w.t()?)?.squeeze(0),
+        [_, _] => x.matmul(&w.t()?),
+        [b1, b2, _, _] if !x.is_contiguous() => x.matmul(&w.broadcast_left((b1, b2))?.t()?),
+        [bsize, _, _] if !x.is_contiguous() => x.matmul(&w.broadcast_left(bsize)?.t()?),
+        _ => {
+            let k = dims[dims.len() - 1];
+            let rows = x.elem_count() / k.max(1);
+            let mut out_dims = dims[..dims.len() - 1].to_vec();
+            out_dims.push(w.dim(0)?);
+            x.contiguous()?
+                .reshape((rows, k))?
+                .matmul(&w.t()?)?
+                .reshape(out_dims)
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 pub enum QMatMul {
     QTensor(std::sync::Arc<QTensor>),
@@ -1026,6 +1199,25 @@ impl QMatMul {
             _ => w.t()?,
         };
         xs.to_dtype(DType::F16)?.matmul(&w)?.to_dtype(in_dtype)
+    }
+
+    /// Exact weight-only matmul (no activation quantization), see [`QTensor::forward_exact`].
+    /// The output has the dtype of `xs`.
+    ///
+    /// Dense variants: `Tensor` (F32 weights) runs the matmul in f32 when `xs` has another dtype;
+    /// `TensorF16` (opt-in via `CANDLE_DEQUANTIZE_ALL_F16`) behaves like `forward`.
+    pub fn forward_exact(&self, xs: &Tensor) -> Result<Tensor> {
+        match self {
+            Self::QTensor(t) => t.forward_exact(xs),
+            Self::Tensor(w) => {
+                if xs.dtype() == w.dtype() {
+                    crate::Module::forward(self, xs)
+                } else {
+                    crate::Module::forward(self, &xs.to_dtype(w.dtype())?)?.to_dtype(xs.dtype())
+                }
+            }
+            Self::TensorF16(_) => crate::Module::forward(self, xs),
+        }
     }
 
     pub fn indexed_moe_forward(&self, x: &Tensor, ids: &Tensor) -> Result<Tensor> {
