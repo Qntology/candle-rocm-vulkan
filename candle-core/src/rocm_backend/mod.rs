@@ -6,6 +6,7 @@ mod accel;
 mod delta_rule;
 mod device;
 pub mod kernels;
+pub mod offload;
 mod storage;
 pub mod utils;
 

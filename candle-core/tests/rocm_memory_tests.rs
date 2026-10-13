@@ -1033,3 +1033,221 @@ fn buffer_cache_reuses_freed_buffers_and_trim_releases_them() -> Result<()> {
     assert_eq!(hipmem::cached_bytes(ord), 0, "trim_memory_pool(0) did not release the cache");
     Ok(())
 }
+
+// ---------------------------------------------------------------------------------------------
+// Pinned host buffers + copy stream (rocm_backend::offload), same checks as cuda_memory_tests
+// ---------------------------------------------------------------------------------------------
+
+fn with_rocm_storage<R>(t: &Tensor, f: impl FnOnce(&candle_core::RocmStorage) -> R) -> R {
+    let (storage, _layout) = t.storage_and_layout();
+    match &*storage {
+        candle_core::Storage::Rocm(s) => f(s),
+        _ => panic!("not a ROCm tensor"),
+    }
+}
+
+fn f32_bytes(v: &[f32]) -> Vec<u8> {
+    v.iter().flat_map(|x| x.to_le_bytes()).collect()
+}
+
+fn bytes_f32(b: &[u8]) -> Vec<f32> {
+    b.chunks_exact(4)
+        .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+        .collect()
+}
+
+/// Uploads and downloads through the copy stream land in order with the compute (NULL) stream:
+/// an upload after the kernels queued before it, a download after the kernel that produced its
+/// source, partial ranges at byte offsets, staging buffer reuse, out-of-range requests rejected.
+/// ROCm specific: a buffer dropped after an un-waited download goes back to the buffer cache;
+/// the next allocation of that size reuses it, and its kernels must not overwrite the bytes
+/// before the copy read them.
+#[test]
+fn pinned_upload_download_round_trip_and_ordering() -> Result<()> {
+    let _g = serial();
+    let dev = device()?;
+    let r = rocm(&dev)?;
+    let copy = r.copy_stream()?;
+
+    let n = 1 << 20;
+    let bytes = n * 4;
+    let pattern: Vec<f32> = (0..n).map(|i| (i % 1000) as f32 - 500.).collect();
+    let mut host = r.alloc_pinned(bytes)?;
+    assert_eq!(host.len(), bytes);
+    host.as_mut_slice().copy_from_slice(&f32_bytes(&pattern));
+
+    // Upload ordering: the copy must land after the compute work queued before it (a slow queue
+    // of matmuls followed by an in-place fill of the destination with 7s).
+    let dst = Tensor::zeros(n, DType::F32, &dev)?;
+    let busy = queue_busy_work(&dev)?;
+    let sevens = (Tensor::ones(n, DType::F32, &dev)? * 7.)?;
+    dst.slice_set(&sevens, 0, 0)?;
+    let up = with_rocm_storage(&dst, |s| copy.upload(&host, 0, s, 0, bytes))?;
+    println!("[rocm-offload] upload complete right after queuing: {}", up.is_complete());
+    up.wait_on_compute(&r)?;
+    let got = dst.to_vec1::<f32>()?;
+    assert_eq!(got, pattern, "upload not ordered after the compute writes");
+    drop(busy);
+
+    // Download ordering: the copy must read the result of compute queued before it.
+    let busy = queue_busy_work(&dev)?;
+    let doubled = (&dst * 2.)?;
+    let mut out = r.alloc_pinned(bytes)?;
+    let down = with_rocm_storage(&doubled, |s| copy.download(s, 0, &mut out, 0, bytes))?;
+    down.wait_on_compute(&r)?;
+    down.synchronize()?;
+    assert!(down.is_complete());
+    let got = bytes_f32(out.as_slice());
+    let want: Vec<f32> = pattern.iter().map(|v| v * 2.).collect();
+    assert_eq!(got, want, "download not ordered after the compute that produced it");
+    drop(busy);
+
+    // Partial ranges at byte offsets, and reuse of the staging buffer.
+    let off = 4096;
+    let len = 64 * 1024;
+    host.as_mut_slice()[off..off + len].fill(0);
+    let up = with_rocm_storage(&dst, |s| copy.upload(&host, off, s, off, len))?;
+    up.wait_on_compute(&r)?;
+    let got = dst.to_vec1::<f32>()?;
+    for (i, (g, p)) in got.iter().zip(pattern.iter()).enumerate() {
+        let in_range = i * 4 >= off && i * 4 < off + len;
+        assert_eq!(*g, if in_range { 0. } else { *p }, "element {i}");
+    }
+
+    // An un-waited event is waited by its drop: the source can be dropped right after, its
+    // buffer goes back to the cache, and the next allocation of the same size (which reuses it)
+    // is filled only after the copy read the old bytes.
+    let busy = queue_busy_work(&dev)?;
+    let ev = with_rocm_storage(&dst, |s| copy.download(s, 0, &mut out, 0, bytes))?;
+    drop(ev);
+    drop(dst);
+    let reused = (Tensor::ones(n, DType::F32, &dev)? * -1.)?;
+    copy.synchronize()?;
+    let got = bytes_f32(out.as_slice());
+    let mut want = pattern.clone();
+    for (i, w) in want.iter_mut().enumerate() {
+        if i * 4 >= off && i * 4 < off + len {
+            *w = 0.;
+        }
+    }
+    assert_eq!(got, want, "the copy saw writes queued after its event was dropped");
+    assert_eq!(reused.narrow(0, 0, 4)?.to_vec1::<f32>()?, vec![-1.; 4]);
+    drop(busy);
+
+    // Out-of-range requests are rejected.
+    let small = Tensor::zeros(16, DType::F32, &dev)?;
+    assert!(with_rocm_storage(&small, |s| copy.upload(&host, 0, s, 0, 128)).is_err());
+    assert!(with_rocm_storage(&small, |s| copy.upload(&host, bytes - 8, s, 0, 16)).is_err());
+    assert!(with_rocm_storage(&small, |s| copy.download(s, 32, &mut out, 0, 64)).is_err());
+    // Zero-sized buffers and copies are fine.
+    let empty = r.alloc_pinned(0)?;
+    assert!(empty.is_empty());
+    with_rocm_storage(&small, |s| copy.upload(&empty, 0, s, 0, 0))?.wait_on_compute(&r)?;
+    dev.synchronize_all()?;
+    Ok(())
+}
+
+/// The copy stream runs next to the compute stream: an upload queued before a long stretch of
+/// kernels that do not touch its destination completes while those kernels still run.
+#[test]
+fn copy_stream_overlaps_compute() -> Result<()> {
+    let _g = serial();
+    let dev = device()?;
+    let r = rocm(&dev)?;
+    let copy = r.copy_stream()?;
+    let bytes = 32 * MIB;
+    let mut host = r.alloc_pinned(bytes)?;
+    host.as_mut_slice().fill(3);
+    let dst = Tensor::zeros(bytes, DType::U8, &dev)?;
+    dev.synchronize_all()?;
+    let ev = with_rocm_storage(&dst, |s| copy.upload(&host, 0, s, 0, bytes))?;
+    let busy = queue_busy_work(&dev)?;
+    let t0 = Instant::now();
+    ev.synchronize()?;
+    let copy_ms = ms(t0);
+    let t1 = Instant::now();
+    dev.synchronize_all()?;
+    let rest_ms = ms(t1);
+    println!(
+        "[rocm-offload] 32 MiB upload done {copy_ms:.2} ms after queuing the kernels; the kernels needed {rest_ms:.2} ms more"
+    );
+    assert!(
+        rest_ms > 1.0,
+        "the upload only completed once the compute queue drained (no overlap)"
+    );
+    ev.wait_on_compute(&r)?;
+    assert_eq!(dst.narrow(0, 0, 4)?.to_vec1::<u8>()?, vec![3; 4]);
+    drop(busy);
+    Ok(())
+}
+
+/// Host-to-device bandwidth of the pinned copy stream against a pageable upload, and overlap with
+/// compute (`cargo test --test rocm_memory_tests -- --ignored --nocapture bench_`).
+#[test]
+#[ignore]
+fn bench_pinned_copy_stream_vs_pageable_upload() -> Result<()> {
+    let _g = serial();
+    let dev = device()?;
+    let r = rocm(&dev)?;
+    let copy = r.copy_stream()?;
+    for &mib in &[1usize, 8, 64] {
+        let bytes = mib * MIB;
+        let data: Vec<f32> = (0..bytes / 4).map(|i| i as f32).collect();
+        let mut host = r.alloc_pinned(bytes)?;
+        host.as_mut_slice().copy_from_slice(&f32_bytes(&data));
+        let dst = Tensor::zeros(bytes / 4, DType::F32, &dev)?;
+        dev.synchronize_all()?;
+        let reps = 10;
+
+        let t0 = Instant::now();
+        for _ in 0..reps {
+            let t = Tensor::from_slice(&data, bytes / 4, &dev)?;
+            drop(t);
+        }
+        dev.synchronize_all()?;
+        let pageable = t0.elapsed().as_secs_f64() / reps as f64;
+
+        let t0 = Instant::now();
+        for _ in 0..reps {
+            let ev = with_rocm_storage(&dst, |s| copy.upload(&host, 0, s, 0, bytes))?;
+            ev.wait_on_compute(&r)?;
+        }
+        dev.synchronize_all()?;
+        let pinned = t0.elapsed().as_secs_f64() / reps as f64;
+        println!(
+            "{mib:3} MiB: pageable {:7.2} ms ({:5.2} GB/s) | pinned copy stream {:7.2} ms ({:5.2} GB/s)",
+            pageable * 1e3,
+            bytes as f64 / pageable / 1e9,
+            pinned * 1e3,
+            bytes as f64 / pinned / 1e9
+        );
+
+        let time = |f: &dyn Fn() -> Result<()>| -> Result<f64> {
+            dev.synchronize_all()?;
+            let t0 = Instant::now();
+            f()?;
+            dev.synchronize_all()?;
+            Ok(t0.elapsed().as_secs_f64() * 1e3)
+        };
+        let busy = time(&|| queue_busy_work(&dev).map(drop))?;
+        let seq = time(&|| {
+            let t = Tensor::from_slice(&data, bytes / 4, &dev)?;
+            let b = queue_busy_work(&dev)?;
+            drop((b, t));
+            Ok(())
+        })?;
+        let other = Tensor::zeros(bytes / 4, DType::F32, &dev)?;
+        let overlap = time(&|| {
+            let ev = with_rocm_storage(&other, |s| copy.upload(&host, 0, s, 0, bytes))?;
+            let b = queue_busy_work(&dev)?;
+            // The kernels above do not read `other`; a reader would call `wait_on_compute` first.
+            ev.synchronize()?;
+            drop(b);
+            Ok(())
+        })?;
+        println!(
+            "        busy work {busy:7.2} ms | + pageable upload {seq:7.2} ms | + copy stream upload {overlap:7.2} ms"
+        );
+    }
+    Ok(())
+}
