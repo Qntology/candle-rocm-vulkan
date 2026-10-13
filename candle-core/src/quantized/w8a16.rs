@@ -11,7 +11,8 @@
 //! * `dequantize`: Q8_0 / Q4_0 / Q4K / Q5K / Q6K blocks or F32 / F16 / BF16 elements straight to
 //!   an f32 / f16 / bf16 buffer, one rounding and no f32 intermediate.
 //! * `gemm_tiles`: the prefill path, `x · Wᵀ` with `W` dequantized in row tiles into a transient
-//!   buffer and multiplied by cuBLAS (f32 accumulation, f16 / bf16 results rounded once).
+//!   buffer and multiplied by cuBLAS (f32 accumulation and f32 split-k reductions, f16 / bf16
+//!   results rounded once).
 
 use super::GgmlDType;
 use crate::cuda_backend::{CudaDevice, CudaStorage, CudaStorageSlice, WrapErr};
@@ -377,36 +378,96 @@ pub fn dequant_tile_rows(k: usize, dtype: DType) -> usize {
     (dequant_tile_bytes() / (k.max(1) * dtype.size_in_bytes())).max(1)
 }
 
-/// Whether f16 / bf16 prefill GEMMs of a single tile use the exact cuBLAS call of
-/// `Tensor::matmul` (`CANDLE_W8A16_PREFILL_GEMM=matmul`, bit identical to a dense layer holding
-/// the dequantized weight) instead of the default f32-output GEMM + one rounding.
-pub fn prefill_gemm_matches_matmul() -> bool {
-    static NATIVE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *NATIVE.get_or_init(|| {
-        std::env::var("CANDLE_W8A16_PREFILL_GEMM")
-            .map(|v| v.trim().eq_ignore_ascii_case("matmul"))
-            .unwrap_or(false)
+/// How [`gemm_tiles`] issues f16 / bf16 GEMMs (`CANDLE_W8A16_PREFILL_GEMM`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PrefillGemm {
+    /// Default (`exact`): f16 / bf16 output, f32 compute, and the cuBLAS math mode
+    /// `CUBLAS_MATH_DISALLOW_REDUCED_PRECISION_REDUCTION` for the call, so split-k partial sums
+    /// are reduced in f32 and every output is the f32 dot product rounded once.
+    Exact,
+    /// `staged`: each tile GEMM writes an f32 buffer that a small kernel rounds into the
+    /// output (same numerics as `Exact`, one extra buffer and kernel per tile).
+    Staged,
+    /// `matmul`: the exact cuBLAS call `Tensor::matmul` issues (bit identical to a dense layer
+    /// holding the dequantized weight, including the reduced precision split-k reductions
+    /// cuBLAS may pick). Only for weights that fit one tile; several tiles use `Exact`.
+    Matmul,
+}
+
+/// The f16 / bf16 prefill GEMM mode from `CANDLE_W8A16_PREFILL_GEMM` (`exact`, `staged` or
+/// `matmul`; default `exact`).
+pub fn prefill_gemm_mode() -> PrefillGemm {
+    static MODE: std::sync::OnceLock<PrefillGemm> = std::sync::OnceLock::new();
+    *MODE.get_or_init(|| {
+        match std::env::var("CANDLE_W8A16_PREFILL_GEMM")
+            .map(|v| v.trim().to_ascii_lowercase())
+            .as_deref()
+        {
+            Ok("matmul") => PrefillGemm::Matmul,
+            Ok("staged") => PrefillGemm::Staged,
+            _ => PrefillGemm::Exact,
+        }
     })
+}
+
+/// Runs `f` (which issues cuBLAS calls on the device's handle) with
+/// `CUBLAS_MATH_DISALLOW_REDUCED_PRECISION_REDUCTION` set on the handle, then restores the
+/// previous math mode. candle never changes the math mode itself (it is `CUBLAS_DEFAULT_MATH`);
+/// a mode that already forbids reduced precision reductions (the flag, or pedantic math) or an
+/// unknown value is left untouched. Calls of other threads that land in the window only get
+/// the more precise reduction.
+fn with_f32_reductions<R>(dev: &CudaDevice, f: impl FnOnce() -> Result<R>) -> Result<R> {
+    use cudarc::cublas::sys::{self, cublasMath_t as M};
+    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    let _guard = LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    let handle = *dev.blas.handle();
+    let mut prev = 0u32;
+    // SAFETY: valid handle; the mode is written as a C int into `prev` (read as u32, never
+    // materialized as a possibly invalid enum value).
+    unsafe { sys::cublasGetMathMode(handle, &mut prev as *mut u32 as *mut M) }
+        .result()
+        .w()?;
+    let restore = match prev {
+        0 => Some(M::CUBLAS_DEFAULT_MATH),
+        1 => Some(M::CUBLAS_TENSOR_OP_MATH),
+        // TF32 only concerns f32 data, not the f16 / bf16 GEMMs issued here.
+        3 => Some(M::CUBLAS_TF32_TENSOR_OP_MATH),
+        _ => None,
+    };
+    if restore.is_some() {
+        // SAFETY: valid handle and mode.
+        unsafe {
+            sys::cublasSetMathMode(handle, M::CUBLAS_MATH_DISALLOW_REDUCED_PRECISION_REDUCTION)
+        }
+        .result()
+        .w()?;
+    }
+    let r = f();
+    if let Some(mode) = restore {
+        // SAFETY: valid handle; `mode` is the mode read above.
+        let _ = unsafe { sys::cublasSetMathMode(handle, mode) };
+    }
+    r
 }
 
 /// `y = x · Wᵀ` for the `rows × k` contiguous input `x` starting at element `x_off` and an
 /// `n × k` weight produced by `tile(row0, nrows)` as dense row tiles of at most `tile_rows`
 /// rows in the dtype of `x` (f32 / f16 / bf16). A tile is freed (stream ordered) as soon as its
-/// GEMM is queued, so at most one tile is alive.
+/// GEMM is queued, so at most one tile is alive. Each tile GEMM writes its columns
+/// `row0..row0 + nrows` of the output directly (ldc = n) except in the `staged` mode.
 ///
-/// * f16 / bf16 (default): each tile GEMM (f16 / bf16 inputs, f32 compute) writes an f32
-///   `rows × nrows` buffer that one kernel rounds into the columns `row0..row0 + nrows` of the
-///   output, so every output is the f32 dot product rounded once. A plain f16 / bf16 cuBLAS
-///   GEMM (what `Tensor::matmul` issues) can pick split-k kernels that reduce partial sums in
-///   the output type: on an RTX 3050 the Qwen3 `down` projection (1024 x 3072) at 256 rows
-///   and skinny shapes (256 x 1024 at 9 rows) come out with errors of 30-130 output ulps that
-///   way.
-/// * f16 / bf16 with `CANDLE_W8A16_PREFILL_GEMM=matmul` and a single tile: the exact cuBLAS call
+/// * f16 / bf16, default ([`PrefillGemm::Exact`]): f32 compute with
+///   `CUBLAS_MATH_DISALLOW_REDUCED_PRECISION_REDUCTION`, so every output is the f32 dot product
+///   rounded once. A plain f16 / bf16 cuBLAS GEMM (what `Tensor::matmul` issues) can pick
+///   split-k kernels that reduce partial sums in the output type: on an RTX 3050 the Qwen3
+///   `down` projection (1024 x 3072) at 256 rows and skinny shapes (256 x 1024 at 9 rows) come
+///   out with errors of 30-130 output ulps that way.
+/// * f16 / bf16, `CANDLE_W8A16_PREFILL_GEMM=staged`: f32 output tiles rounded by a small kernel
+///   (same numerics as the default, extra buffer and kernel).
+/// * f16 / bf16, `CANDLE_W8A16_PREFILL_GEMM=matmul` and a single tile: the exact cuBLAS call
 ///   `Tensor::matmul` issues for `x.matmul(&w.t())`, i.e. bit identical to the dense
-///   dequantize-to-bf16 layer (including its split-k behaviour). Several tiles always use the
-///   f32 output.
-/// * f32: each tile GEMM writes its columns of the output directly (ldc = n), with the
-///   `Tensor::matmul` cuBLAS configuration.
+///   dequantize-to-bf16 layer (including its split-k behaviour). Several tiles use the default.
+/// * f32: f32 compute (no TF32), except in the `matmul` mode, which mirrors `Tensor::matmul`.
 #[allow(clippy::too_many_arguments)]
 pub fn gemm_tiles(
     dev: &CudaDevice,
@@ -428,14 +489,18 @@ pub fn gemm_tiles(
     if rows > max || n > max || k > max {
         bail!("w8a16 gemm: shape rows={rows} n={n} k={k} too large")
     }
-    // f16 / bf16: f32 GEMM output tiles, bounded by the same byte budget.
-    let staged = dtype != DType::F32 && (tile_rows < n || !prefill_gemm_matches_matmul());
-    let tile_rows = if staged {
+    let kind = match prefill_gemm_mode() {
+        PrefillGemm::Matmul if tile_rows >= n => GemmKind::Matmul,
+        PrefillGemm::Staged if dtype != DType::F32 => GemmKind::F32Out,
+        _ => GemmKind::Exact,
+    };
+    // Staged: f32 GEMM output tiles, bounded by the same byte budget.
+    let tile_rows = if kind == GemmKind::F32Out {
         tile_rows.min((dequant_tile_bytes() / (rows * 4)).max(1))
     } else {
         tile_rows
     };
-    let cvt = if staged {
+    let cvt = if kind == GemmKind::F32Out {
         let (osfx, octype) = elem_ctype(dtype)?;
         let name = format!("w8a16_cvt2d_f32_{osfx}");
         Some(func(
@@ -477,7 +542,7 @@ pub fn gemm_tiles(
                         let (b, _gb) = xv.device_ptr(&stream);
                         let (c, _gc) = acc.device_ptr_mut(&stream);
                         // SAFETY: a = tn × k tile, b = rows × k input, c = rows × tn f32 buffer.
-                        unsafe { gemm_ex(dev, dtype, true, tn, rows, k, a, b, c, tn) }?;
+                        unsafe { gemm_ex(dev, dtype, kind, tn, rows, k, a, b, c, tn) }?;
                     }
                     let mut dst = out.slice_mut(n0..);
                     let (rows_i, tn_i, ld) = (rows as i32, tn as i32, n as i64);
@@ -498,7 +563,12 @@ pub fn gemm_tiles(
                     let c = c + (n0 * std::mem::size_of::<$t>()) as u64;
                     // SAFETY: a = tn × k weight tile, b = rows × k input, c = column n0 of the
                     // rows × n output (ldc = n); all three live until the call is queued.
-                    unsafe { gemm_ex(dev, dtype, false, tn, rows, k, a, b, c, n) }?;
+                    let call = || unsafe { gemm_ex(dev, dtype, kind, tn, rows, k, a, b, c, n) };
+                    if kind == GemmKind::Exact && dtype != DType::F32 {
+                        with_f32_reductions(dev, call)?;
+                    } else {
+                        call()?;
+                    }
                 }
                 drop(w);
                 n0 += tn;
@@ -514,14 +584,23 @@ pub fn gemm_tiles(
     }
 }
 
+/// cuBLAS configuration of one [`gemm_ex`] call.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum GemmKind {
+    /// C has the input dtype; issued exactly like `cuda_backend::gemm_strided_batched_*` for a
+    /// 2D `Tensor::matmul` (batch 1, same strides, `CUBLAS_GEMM_DEFAULT_TENSOR_OP`, f32 compute
+    /// unless the matching `gemm_reduced_precision_*` flag is set).
+    Matmul,
+    /// C has the input dtype, f32 compute regardless of the reduced precision flags (the
+    /// caller also forbids reduced precision split-k reductions, see [`with_f32_reductions`]).
+    Exact,
+    /// C is f32, f32 compute.
+    F32Out,
+}
+
 /// Column-major `C[tn × rows] = A[k × tn]ᵀ · B[k × rows]` (i.e. row-major
-/// `y[rows × tn] = x[rows × k] · w[tn × k]ᵀ`) with leading dimension `ldc`.
-///
-/// With `c_f32 == false`, A, B and C have type `dtype` and the call is issued exactly like
-/// `cuda_backend::gemm_strided_batched_{f32,f16,bf16}` for a 2D `Tensor::matmul` (batch 1,
-/// same strides, `CUBLAS_GEMM_DEFAULT_TENSOR_OP`, f32 compute unless the matching
-/// `gemm_reduced_precision_*` flag is set). With `c_f32 == true`, C is f32 and the compute type
-/// is always f32.
+/// `y[rows × tn] = x[rows × k] · w[tn × k]ᵀ`) with leading dimension `ldc`; A and B have type
+/// `dtype`, C and the compute type follow `kind`.
 ///
 /// # Safety
 /// `a`, `b` and `c` must be device pointers covering the described matrices.
@@ -529,7 +608,7 @@ pub fn gemm_tiles(
 unsafe fn gemm_ex(
     dev: &CudaDevice,
     dtype: DType,
-    c_f32: bool,
+    kind: GemmKind,
     tn: usize,
     rows: usize,
     k: usize,
@@ -550,17 +629,18 @@ unsafe fn gemm_ex(
         &zero_f32 as *const f32 as *const c_void,
     );
     let c32 = sys::cublasComputeType_t::CUBLAS_COMPUTE_32F;
+    let mirror = kind == GemmKind::Matmul;
     let (data_type, compute, (alpha, beta)) = match dtype {
         DType::F32 => (
             sys::cudaDataType_t::CUDA_R_32F,
-            if gemm_reduced_precision_f32() && !c_f32 {
+            if mirror && gemm_reduced_precision_f32() {
                 sys::cublasComputeType_t::CUBLAS_COMPUTE_32F_FAST_TF32
             } else {
                 c32
             },
             f32s,
         ),
-        DType::F16 if gemm_reduced_precision_f16() && !c_f32 => (
+        DType::F16 if mirror && gemm_reduced_precision_f16() => (
             sys::cudaDataType_t::CUDA_R_16F,
             sys::cublasComputeType_t::CUBLAS_COMPUTE_16F,
             (
@@ -571,7 +651,7 @@ unsafe fn gemm_ex(
         DType::F16 => (sys::cudaDataType_t::CUDA_R_16F, c32, f32s),
         DType::BF16 => (
             sys::cudaDataType_t::CUDA_R_16BF,
-            if gemm_reduced_precision_bf16() && !c_f32 {
+            if mirror && gemm_reduced_precision_bf16() {
                 sys::cublasComputeType_t::CUBLAS_COMPUTE_32F_FAST_16BF
             } else {
                 c32
@@ -580,7 +660,7 @@ unsafe fn gemm_ex(
         ),
         d => bail!("w8a16 gemm: unsupported dtype {d:?}"),
     };
-    let c_type = if c_f32 {
+    let c_type = if kind == GemmKind::F32Out {
         sys::cudaDataType_t::CUDA_R_32F
     } else {
         data_type

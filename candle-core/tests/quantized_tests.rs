@@ -1874,6 +1874,70 @@ fn w8a16_forward_exact_cpu() -> Result<()> {
     Ok(())
 }
 
+/// Backend-generic contract of `forward_exact` and `dequantize_to`, generated for every compiled
+/// backend by `test_device!` (CPU, CUDA, Metal, ROCm, Vulkan): weight types with and without a
+/// CUDA mat-vec kernel, decode (m <= 8) and prefill row counts, F32 / BF16 / F16 inputs.
+fn w8a16_generic(dev: &Device) -> Result<()> {
+    let (n, k) = (192, 1024);
+    let label = format!("{:?}", dev.location());
+    for wtype in [
+        GgmlDType::Q8_0,
+        GgmlDType::Q4_0,
+        GgmlDType::Q4K,
+        GgmlDType::Q5K,
+        GgmlDType::Q6K,
+        GgmlDType::F16,
+        GgmlDType::BF16,
+    ] {
+        w8_check_forward_exact(dev, &label, wtype, n, k, &[1, 3, 8, 9, 40], 1 << 20, 64, false)?;
+        // `dequantize_to` on the device against the CPU dequantization: bit exact on CPU / Metal
+        // and for the direct CUDA kernels, otherwise within one ulp of the target dtype (or of
+        // f32 at the weight scale, for kernels that contract the k-quant `d * q - m` to an FMA).
+        let bytes = w8_weight_bytes(wtype, n, k, 21);
+        let want_f32 = w8_qtensor(&bytes, wtype, n, k, &Device::Cpu)?.dequantize(&Device::Cpu)?;
+        let scale = want_f32.abs()?.max_all()?.to_scalar::<f32>()? as f64;
+        let q = w8_qtensor(&bytes, wtype, n, k, dev)?;
+        for dtype in [DType::F32, DType::F16, DType::BF16] {
+            let want = want_f32.to_dtype(dtype)?;
+            let got = q.dequantize_to(dtype, dev)?;
+            assert_eq!(got.dtype(), dtype);
+            assert_eq!(got.dims(), [n, k]);
+            assert!(got.device().same_device(dev));
+            let a = w8_bits(&got.to_device(&Device::Cpu)?)?;
+            let b = w8_bits(&want)?;
+            let af = got.to_device(&Device::Cpu)?.to_dtype(DType::F32)?.flatten_all()?;
+            let bf = want.to_dtype(DType::F32)?.flatten_all()?;
+            let (af, bf) = (af.to_vec1::<f32>()?, bf.to_vec1::<f32>()?);
+            let mut differ = 0;
+            for i in 0..a.len() {
+                if a[i] != b[i] {
+                    differ += 1;
+                    let d = (af[i] as f64 - bf[i] as f64).abs();
+                    let tol = w8_ulp(dtype, bf[i] as f64).max(f32::EPSILON as f64 * scale);
+                    assert!(
+                        d <= tol,
+                        "{label} {wtype:?} -> {dtype:?}: element {i} {} vs {}",
+                        af[i],
+                        bf[i]
+                    );
+                }
+            }
+            println!(
+                "[W8A16-DQ] {label} {wtype:?} -> {dtype:?}: {differ}/{} values differ from the CPU",
+                a.len()
+            );
+        }
+    }
+    Ok(())
+}
+
+test_device!(
+    w8a16_generic,
+    w8a16_generic_cpu,
+    w8a16_generic_cuda,
+    w8a16_generic_metal
+);
+
 #[test]
 fn w8a16_dequantize_to_cpu() -> Result<()> {
     let (n, k) = (64, 512);

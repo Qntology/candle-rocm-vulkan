@@ -926,8 +926,9 @@ impl QTensor {
     /// * CUDA otherwise (prefill): the weight is dequantized on the device to the activation
     ///   dtype (exactly `self.dequantize_to(xs.dtype(), ..)`) in row tiles of at most
     ///   `CANDLE_W8A16_DEQUANT_TILE_MB` (default 32) MiB, a transient buffer, and multiplied by
-    ///   cuBLAS with f32 accumulation into an f32 buffer that is rounded once to the output
-    ///   dtype. That is the dense dequantize-to-bf16 layer (`Tensor::matmul`) without the
+    ///   cuBLAS with f32 accumulation and f32 split-k reductions
+    ///   (`CUBLAS_MATH_DISALLOW_REDUCED_PRECISION_REDUCTION`), every output rounded once to the
+    ///   output dtype. That is the dense dequantize-to-bf16 layer (`Tensor::matmul`) without the
     ///   extra roundings of the split-k kernels cuBLAS picks for some bf16 shapes; set
     ///   `CANDLE_W8A16_PREFILL_GEMM=matmul` to issue the exact `Tensor::matmul` cuBLAS call
     ///   instead (bit identical to the dense layer for weights that fit one tile, e.g. every
