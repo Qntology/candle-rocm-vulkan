@@ -31,6 +31,41 @@ fn kv_cache() -> Result<()> {
     Ok(())
 }
 
+/// Growth past the capacity (geometric, one copy) keeps the contents, zeroes the spare rows and
+/// works along an inner dim.
+#[test]
+fn kv_cache_growth() -> Result<()> {
+    let mut cache = candle_nn::kv_cache::Cache::new(1, 4);
+    let mut want: Vec<Tensor> = vec![];
+    let mut caps = vec![];
+    for step in 0..12u32 {
+        let len = 1 + (step as usize % 5);
+        let vals: Vec<u32> = (0..(2 * len * 3) as u32).map(|i| i + 1 + 100 * step).collect();
+        let t = Tensor::from_vec(vals, (2, len, 3), &Device::Cpu)?;
+        cache.append(&t)?;
+        want.push(t);
+        caps.push(cache.max_seq_len());
+        let got = cache.current_data()?.unwrap();
+        assert_eq!(
+            got.to_vec3::<u32>()?,
+            Tensor::cat(&want, 1)?.to_vec3::<u32>()?,
+            "step {step}"
+        );
+        let all = cache.all_data().as_ref().unwrap();
+        assert_eq!(all.dim(1)?, cache.max_seq_len());
+        let spare = cache.max_seq_len() - cache.current_seq_len();
+        if spare > 0 {
+            let z = all.narrow(1, cache.current_seq_len(), spare)?;
+            assert_eq!(z.sum_all()?.to_scalar::<u32>()?, 0);
+        }
+    }
+    // 4, then +4 (grow_by), then +half the capacity
+    assert_eq!(caps.first(), Some(&4));
+    assert!(caps.windows(2).all(|w| w[1] == w[0] || w[1] >= w[0] + 4));
+    assert!(*caps.last().unwrap() < 2 * cache.current_seq_len() + 4);
+    Ok(())
+}
+
 #[test]
 fn rotating_kv_cache() -> Result<()> {
     let mut cache = candle_nn::kv_cache::RotatingCache::new(0, 6);

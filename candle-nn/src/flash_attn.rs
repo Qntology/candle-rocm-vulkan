@@ -44,6 +44,10 @@ pub struct FlashAttnConfig {
     pub split_kv: Option<SplitKv>,
     /// Force the fused (`true`) or unfused (`false`) path for this call.
     pub fused: Option<bool>,
+    /// Return the error of the fused kernels instead of falling back to the unfused path (also
+    /// when `fused == Some(true)` but the device has no fused kernels). Self-checks use it so
+    /// that they test the kernels, not the fallback.
+    pub strict: bool,
 }
 
 impl FlashAttnConfig {
@@ -59,6 +63,7 @@ impl FlashAttnConfig {
             version: None,
             split_kv: None,
             fused: None,
+            strict: false,
         }
     }
 
@@ -96,6 +101,12 @@ impl FlashAttnConfig {
 
     pub fn fused(mut self, fused: bool) -> Self {
         self.fused = Some(fused);
+        self
+    }
+
+    /// Fused kernel errors propagate instead of falling back (the `strict` field).
+    pub fn strict(mut self, strict: bool) -> Self {
+        self.strict = strict;
         self
     }
 
@@ -192,6 +203,7 @@ impl FlashAttnOp {
             .or(conf.flash_attn.version)
             .unwrap_or(auto_version);
         p.split_kv = self.cfg.split_kv.unwrap_or(conf.flash_attn.split_kv);
+        p.gqa_pack = conf.flash_attn.gqa_decode;
         p
     }
 
@@ -202,11 +214,15 @@ impl FlashAttnOp {
         }
     }
 
-    /// Whether K/V go to the kernels as they are: same dtype as the queries, or FP8 when FP8
-    /// K/V are enabled.
+    /// Whether K/V go to the kernels as they are: same dtype as the queries, FP8 when FP8 K/V
+    /// are enabled, or exact F16 / BF16 K/V with F32 queries (the kernels widen them to f32,
+    /// which is exact, so the results equal those of converted K/V).
     #[cfg(any(feature = "cuda", feature = "rocm"))]
     fn kv_as_is(q: DType, k: DType, v: DType) -> bool {
-        k == v && (k == q || (k == DType::F8E4M3 && accel::config().flash_attn.fp8_kv))
+        k == v
+            && (k == q
+                || (k == DType::F8E4M3 && accel::config().flash_attn.fp8_kv)
+                || (q == DType::F32 && matches!(k, DType::F16 | DType::BF16)))
     }
 }
 
@@ -403,11 +419,25 @@ impl candle::CustomOp3 for FlashAttnOp {
     }
 }
 
+static LAST_FALLBACK: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+
+/// Why the last call that wanted the fused kernels ran the unfused path (or a concatenating
+/// fallback of [`flash_attn_blocks`]) instead; `None` when no call fell back yet.
+pub fn last_fallback_reason() -> Option<String> {
+    LAST_FALLBACK
+        .lock()
+        .map(|g| g.clone())
+        .unwrap_or_else(|p| p.into_inner().clone())
+}
+
 fn warn_fallback(err: &candle::Error) {
     use std::collections::HashSet;
     use std::sync::Mutex;
     static SEEN: Mutex<Option<HashSet<String>>> = Mutex::new(None);
     let msg = err.to_string();
+    if let Ok(mut g) = LAST_FALLBACK.lock() {
+        *g = Some(msg.clone());
+    }
     let first = SEEN
         .lock()
         .map(|mut g| g.get_or_insert_with(HashSet::new).insert(msg.clone()))
@@ -448,8 +478,14 @@ fn run(q: &Tensor, k: &Tensor, v: &Tensor, op: &FlashAttnOp) -> Result<Tensor> {
     if fused && supported {
         match q.apply_op3_no_bwd(k, v, op) {
             Ok(t) => return Ok(t),
+            Err(e) if op.cfg.strict => return Err(e),
             Err(e) => warn_fallback(&e),
         }
+    } else if op.cfg.strict && op.cfg.fused == Some(true) {
+        bail!(
+            "flash-attn: no fused kernels for {:?} (strict mode)",
+            q.device().location()
+        )
     }
     unfused(q, k, v, op)
 }
@@ -507,6 +543,246 @@ pub fn flash_attn_bhsd(
         cfg,
     )?;
     o.transpose(1, 2)
+}
+
+/// One block of a paged KV cache: `k` / `v` are `(batch, kv_heads, capacity, row)` tensors of
+/// which the first `rows` positions of the third axis are valid. `row` is the head dim for dense
+/// blocks ([`flash_attn_blocks`]) and the packed row words for compressed blocks
+/// ([`crate::turbo_quant::attention_packed_blocks`]). The keys of a call are the valid rows of
+/// its blocks in order.
+///
+/// The paged kernels read the blocks in place when every block has a contiguous last dim, the
+/// same row stride as the other blocks (separately for K and V), a head stride that is a whole
+/// number of rows and a batch stride of `kv_heads` head strides, e.g. full capacity buffers
+/// or their `narrow(2, 0, n)` views. Other layouts take the concatenating fallback.
+#[derive(Debug, Clone, Copy)]
+pub struct KvBlockRef<'a> {
+    pub k: &'a Tensor,
+    pub v: &'a Tensor,
+    pub rows: usize,
+}
+
+/// Placement of one block for the paged kernels: start offset (elements), row stride
+/// (elements) and capacity (head stride in rows); `None` when the layout does not fit.
+#[cfg_attr(not(any(feature = "cuda", feature = "rocm")), allow(dead_code))]
+pub(crate) fn paged_block_layout(
+    t: &Tensor,
+    rows: usize,
+) -> Result<Option<(usize, usize, usize)>> {
+    let (b, h, cap, w) = t.dims4()?;
+    let s = t.stride();
+    if rows > cap || (w > 1 && s[3] != 1) {
+        return Ok(None);
+    }
+    let row = s[2];
+    if row < w || row == 0 {
+        return Ok(None);
+    }
+    let head = if h > 1 {
+        s[1]
+    } else if b > 1 {
+        s[0]
+    } else {
+        cap.max(rows) * row
+    };
+    if head % row != 0 || (b > 1 && h > 1 && s[0] != h * s[1]) {
+        return Ok(None);
+    }
+    let cap_rows = head / row;
+    if cap_rows < rows.max(1) || cap_rows > u32::MAX as usize {
+        return Ok(None);
+    }
+    Ok(Some((t.layout().start_offset(), row, cap_rows)))
+}
+
+/// Checks the shapes of paged blocks against `(batch, kv_heads, _, row)` of the first one and
+/// returns `(kv_heads, total rows)`.
+pub(crate) fn check_blocks(
+    blocks: &[KvBlockRef<'_>],
+    batch: usize,
+    what: &str,
+) -> Result<(usize, usize)> {
+    let Some(first) = blocks.first() else {
+        bail!("{what}: no blocks")
+    };
+    let (_, hkv, _, kw) = first.k.dims4()?;
+    let (_, _, _, vw) = first.v.dims4()?;
+    let mut lk = 0;
+    for (i, blk) in blocks.iter().enumerate() {
+        let (bk, hk, ck, wk) = blk.k.dims4()?;
+        let (bv, hv, cv, wv) = blk.v.dims4()?;
+        if bk != batch || bv != batch || hk != hkv || hv != hkv || wk != kw || wv != vw {
+            bail!(
+                "{what}: block {i} k {:?} / v {:?} do not match batch {batch}, {hkv} kv heads, rows of {kw} / {vw}",
+                blk.k.dims(),
+                blk.v.dims()
+            )
+        }
+        if blk.rows > ck || blk.rows > cv {
+            bail!(
+                "{what}: block {i} has {} rows but capacities {ck} / {cv}",
+                blk.rows
+            )
+        }
+        if blk.k.dtype() != first.k.dtype() || blk.v.dtype() != first.v.dtype() {
+            bail!("{what}: block {i} has another dtype than block 0")
+        }
+        lk += blk.rows;
+    }
+    if lk == 0 {
+        bail!("{what}: the blocks hold no keys")
+    }
+    Ok((hkv, lk))
+}
+
+/// The valid rows of the blocks concatenated on `device` (the fallback of the paged paths).
+pub(crate) fn cat_blocks(blocks: &[KvBlockRef<'_>], device: &Device) -> Result<(Tensor, Tensor)> {
+    let mut ks = Vec::with_capacity(blocks.len());
+    let mut vs = Vec::with_capacity(blocks.len());
+    for blk in blocks.iter().filter(|b| b.rows > 0) {
+        ks.push(blk.k.narrow(2, 0, blk.rows)?.to_device(device)?);
+        vs.push(blk.v.narrow(2, 0, blk.rows)?.to_device(device)?);
+    }
+    if ks.len() == 1 {
+        return Ok((ks.remove(0), vs.remove(0)));
+    }
+    Ok((Tensor::cat(&ks, 2)?, Tensor::cat(&vs, 2)?))
+}
+
+/// Attention of `q: (batch, q_heads, seq_q, head_dim)` over the dense K/V of paged cache
+/// blocks (any dtype the kernels read: the query dtype, FP8, or F16 / BF16 with F32 queries),
+/// without concatenating them: decoding (`seq_q <= 4`) on CUDA / ROCm runs a row kernel over a
+/// block table of up to 128 blocks. Longer queries, other devices, other layouts and more
+/// blocks concatenate the valid rows and run [`flash_attn_bhsd`] (same results up to the
+/// summation order). Masks, soft-capping and ALiBi of `cfg` are bottom-right aligned over the
+/// concatenated keys. Output `(batch, q_heads, seq_q, head_dim)` in the query dtype.
+pub fn flash_attn_blocks(
+    q: &Tensor,
+    blocks: &[KvBlockRef<'_>],
+    cfg: &FlashAttnConfig,
+) -> Result<Tensor> {
+    let (b, _, _, d) = q.dims4()?;
+    let (_hkv, _lk) = check_blocks(blocks, b, "flash-attn blocks")?;
+    if blocks[0].k.dim(3)? != d || blocks[0].v.dim(3)? != d {
+        bail!(
+            "flash-attn blocks: k {:?} / v {:?} do not match the head dim {d} of q",
+            blocks[0].k.dims(),
+            blocks[0].v.dims()
+        )
+    }
+    #[cfg(any(feature = "cuda", feature = "rocm"))]
+    match paged_flash_attn(q, blocks, cfg, _hkv, _lk) {
+        Ok(Some(t)) => return Ok(t),
+        Ok(None) => {}
+        Err(e) if cfg.strict => return Err(e),
+        Err(e) => warn_fallback(&e),
+    }
+    let (k, v) = cat_blocks(blocks, q.device())?;
+    flash_attn_bhsd(q, &k, &v, cfg)
+}
+
+/// The paged row kernel, `Ok(None)` when it does not apply.
+#[cfg(any(feature = "cuda", feature = "rocm"))]
+fn paged_flash_attn(
+    q: &Tensor,
+    blocks: &[KvBlockRef<'_>],
+    cfg: &FlashAttnConfig,
+    hkv: usize,
+    lk: usize,
+) -> Result<Option<Tensor>> {
+    use att::PagedKv;
+    let fused = cfg
+        .fused
+        .unwrap_or_else(|| accel::config().flash_attn_allowed(q.device()));
+    if !fused || !matches!(q.device(), Device::Cuda(_) | Device::Rocm(_)) {
+        return Ok(None);
+    }
+    let (_, _, lq, _) = q.dims4()?;
+    let kv_dtype = blocks[0].k.dtype();
+    if lq > att::FA_DECODE_MAX_Q
+        || blocks.len() > att::FA_MAX_PAGES
+        || blocks[0].v.dtype() != kv_dtype
+        || !FlashAttnOp::kv_as_is(q.dtype(), kv_dtype, kv_dtype)
+        || blocks.iter().any(|x| {
+            !x.k.device().same_device(q.device()) || !x.v.device().same_device(q.device())
+        })
+    {
+        return Ok(None);
+    }
+    // (block, k offset, k capacity, v offset, v capacity) of the non-empty blocks
+    let mut place = Vec::with_capacity(blocks.len());
+    let (mut k_row, mut v_row) = (None, None);
+    for blk in blocks.iter().filter(|x| x.rows > 0) {
+        let (Some((ko, kr, kc)), Some((vo, vr, vc))) = (
+            paged_block_layout(blk.k, blk.rows)?,
+            paged_block_layout(blk.v, blk.rows)?,
+        ) else {
+            return Ok(None);
+        };
+        if *k_row.get_or_insert(kr) != kr || *v_row.get_or_insert(vr) != vr {
+            return Ok(None);
+        }
+        place.push((blk.rows, ko, kc, vo, vc));
+    }
+    let (Some(k_row), Some(v_row)) = (k_row, v_row) else {
+        return Ok(None);
+    };
+    let op = FlashAttnOp::new(cfg, q.device())?;
+    let qt = q.transpose(1, 2)?;
+    let geom = AttnGeometry::paged(qt.layout(), hkv, lk, k_row, v_row)?;
+    if !geom.kernel_supported() {
+        return Ok(None);
+    }
+    let params = op.params(accel::profile(q.device()).flash_attn_version);
+    let alibi_bs = op.alibi_bs(&geom)?;
+    let (qg, _) = qt.storage_and_layout();
+    let guards: Vec<_> = blocks
+        .iter()
+        .filter(|x| x.rows > 0)
+        .map(|blk| (blk.k.storage_and_layout().0, blk.v.storage_and_layout().0))
+        .collect();
+    let alibi_g = op.alibi.as_ref().map(|t| t.storage_and_layout());
+    macro_rules! launch {
+        ($variant:ident, $qs:ident) => {{
+            let mut pk = Vec::with_capacity(place.len());
+            for (&(rows, ko, kc, vo, vc), (kg, vg)) in place.iter().zip(guards.iter()) {
+                let (Storage::$variant(ks), Storage::$variant(vs)) = (&**kg, &**vg) else {
+                    bail!("flash-attn blocks: a block is on another device")
+                };
+                pk.push(PagedKv {
+                    k: ks,
+                    k_offset: ko,
+                    v: vs,
+                    v_offset: vo,
+                    rows,
+                    k_cap: kc,
+                    v_cap: vc,
+                });
+            }
+            let mut extra = FaExtra::default();
+            if let Some((g, l)) = alibi_g.as_ref() {
+                let Storage::$variant(s) = &**g else {
+                    bail!("flash-attn: the alibi slopes are on another device")
+                };
+                extra.alibi = Some((s, l.start_offset(), alibi_bs));
+            }
+            Storage::$variant($qs.flash_attn_paged(&pk, &geom, &params, &extra)?)
+        }};
+    }
+    let out = match &*qg {
+        #[cfg(feature = "cuda")]
+        Storage::Cuda(qs) => launch!(Cuda, qs),
+        #[cfg(feature = "rocm")]
+        Storage::Rocm(qs) => launch!(Rocm, qs),
+        _ => return Ok(None),
+    };
+    let o = Tensor::from_storage(
+        out,
+        geom.out_shape(),
+        candle::op::BackpropOp::none(),
+        false,
+    );
+    Ok(Some(o.transpose(1, 2)?))
 }
 
 /// Variable length attention over packed sequences: `q: (total_q, hq, d)`,

@@ -121,6 +121,11 @@ path = "tests/accel_vulkan.rs"
 required-features = ["vulkan"]
 
 [[test]]
+name = "accel_cuda"
+path = "tests/accel_cuda.rs"
+required-features = ["cuda"]
+
+[[test]]
 name = "sdpa"
 path = "tests/sdpa.rs"
 
