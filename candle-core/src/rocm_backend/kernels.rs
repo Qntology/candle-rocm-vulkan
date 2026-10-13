@@ -16,6 +16,8 @@ pub enum Module {
     FlashAttn,
     /// TurboQuant / microscaling quantization (`turbo_quant.hip`, `turbo-quant` feature).
     TurboQuant,
+    /// Fused Gated DeltaNet (`delta_rule.hip`).
+    DeltaRule,
 }
 
 pub const UNARY: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/unary.co"));
@@ -30,6 +32,7 @@ pub const QUANTIZED: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/quantized
 pub const GEMM: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/gemm.co"));
 pub const FLASH_ATTN: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/flash_attn.co"));
 pub const TURBO_QUANT: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/turbo_quant.co"));
+pub const DELTA_RULE: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/delta_rule.co"));
 
 /// GPU architectures the embedded code objects were built for.
 pub const COMPILED_ARCHS: &str = env!("CANDLE_ROCM_ARCHS");
@@ -48,7 +51,7 @@ pub fn compiled_for(arch: &str) -> bool {
 }
 
 impl Module {
-    pub const ALL: [Module; 12] = [
+    pub const ALL: [Module; 13] = [
         Module::Unary,
         Module::Binary,
         Module::Cast,
@@ -61,6 +64,7 @@ impl Module {
         Module::Gemm,
         Module::FlashAttn,
         Module::TurboQuant,
+        Module::DeltaRule,
     ];
 
     pub fn index(self) -> usize {
@@ -81,6 +85,7 @@ impl Module {
             Module::Gemm => "gemm",
             Module::FlashAttn => "flash_attn",
             Module::TurboQuant => "turbo_quant",
+            Module::DeltaRule => "delta_rule",
         }
     }
 
@@ -98,6 +103,7 @@ impl Module {
             Module::Gemm => GEMM,
             Module::FlashAttn => FLASH_ATTN,
             Module::TurboQuant => TURBO_QUANT,
+            Module::DeltaRule => DELTA_RULE,
         }
     }
 }

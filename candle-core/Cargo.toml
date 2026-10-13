@@ -123,6 +123,10 @@ name = "custom_op_tests"
 path = "tests/custom_op_tests.rs"
 
 [[test]]
+name = "delta_rule_tests"
+path = "tests/delta_rule_tests.rs"
+
+[[test]]
 name = "display_tests"
 path = "tests/display_tests.rs"
 

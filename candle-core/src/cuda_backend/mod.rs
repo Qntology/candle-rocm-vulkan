@@ -15,6 +15,7 @@ use std::sync::Arc;
 #[cfg(feature = "cudnn")]
 pub mod cudnn;
 mod accel;
+mod delta_rule;
 mod device;
 mod error;
 pub mod offload;
