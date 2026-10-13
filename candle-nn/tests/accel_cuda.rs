@@ -609,7 +609,7 @@ fn bench_decode_summary() {
             let scale = 1.0 / (d as f32).sqrt();
             let before_cfg = strict(scale).split_kv(SplitKv::Fixed(old_splits(hq, lk)));
             let after_cfg = strict(scale);
-            let mut row = |name: &str, before: f64, after: f64| {
+            let row = |name: &str, before: f64, after: f64| {
                 println!(
                     "| {name} | {hq}/{hkv}/{d} | {lk} | {before:.4} | {after:.4} | {:.2}x |",
                     before / after

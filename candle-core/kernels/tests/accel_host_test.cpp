@@ -425,6 +425,39 @@ static Arrays op_combine(const Arrays &in) {
     return res;
 }
 
+// ax_h2f before the branch-free version, for the check that both give the same bits.
+static float h2f_legacy(ax_u16 h) {
+    const ax_u32 s = ((ax_u32)(h & 0x8000u)) << 16;
+    const ax_u32 e = (h >> 10) & 0x1fu;
+    const ax_u32 m = h & 0x3ffu;
+    if (e == 0) {
+        const float v = (float)m * 5.9604644775390625e-8f; // m * 2^-24
+        return s ? -v : v;
+    }
+    if (e == 31) return ax_u2f(s | 0x7f800000u | (m << 13));
+    return ax_u2f(s | ((e + 112u) << 23) | (m << 13));
+}
+
+// Every e4m3 code through ax_e4m3_to_f / ax_e4m3_to_f_fast and every f16 value through ax_h2f
+// and the legacy decoder (the element loads of the kernels).
+static Arrays op_decoders(const Arrays &) {
+    std::vector<float> e_ref(256), e_fast(256), h(65536), h_legacy(65536);
+    for (ax_u32 c = 0; c < 256; ++c) {
+        e_ref[c] = ax_e4m3_to_f(c);
+        e_fast[c] = ax_e4m3_to_f_fast(c);
+    }
+    for (ax_u32 x = 0; x < 65536; ++x) {
+        h[x] = ax_h2f((ax_u16)x);
+        h_legacy[x] = h2f_legacy((ax_u16)x);
+    }
+    Arrays res;
+    res["e4m3_ref"] = make_arr(e_ref, 0);
+    res["e4m3_fast"] = make_arr(e_fast, 0);
+    res["h2f"] = make_arr(h, 0);
+    res["h2f_legacy"] = make_arr(h_legacy, 0);
+    return res;
+}
+
 int main(int argc, char **argv) {
     if (argc != 3) {
         fprintf(stderr, "usage: %s <in> <out>\n", argv[0]);
@@ -441,6 +474,7 @@ int main(int argc, char **argv) {
         else if (op == "tq_dequant") out = op_tq_dequant(in);
         else if (op == "tq_attn") out = op_tq_attn(in);
         else if (op == "combine") out = op_combine(in);
+        else if (op == "decoders") out = op_decoders(in);
         else throw std::runtime_error("unknown op " + op);
         write_arrays(argv[2], out);
     } catch (const std::exception &e) {

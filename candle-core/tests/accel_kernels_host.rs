@@ -643,6 +643,41 @@ fn fa_combine_matches_previous_formula() {
     }
 }
 
+/// The branch-free element decoders of the kernels (`ax_e4m3_to_f_fast`, `ax_h2f`) give the bits
+/// of the previous decoders for every input, and the values of the Rust codecs (NaNs aside).
+#[test]
+fn element_decoders_exhaustive() {
+    if harness().is_none() {
+        return;
+    }
+    let mut a = Arrays::default();
+    a.str("op", "decoders");
+    let out = run(&a);
+    let bits = |n: &str| -> Vec<u32> { out.get_f32(n).iter().map(|x| x.to_bits()).collect() };
+    let (e_ref, e_fast) = (bits("e4m3_ref"), bits("e4m3_fast"));
+    assert_eq!(e_ref.len(), 256);
+    for c in 0..256usize {
+        assert_eq!(e_fast[c], e_ref[c], "e4m3 code {c:#04x}");
+        let want = e4m3_to_f32(c as u8);
+        if !want.is_nan() {
+            assert_eq!(e_ref[c], want.to_bits(), "e4m3 code {c:#04x} vs the Rust codec");
+        } else {
+            assert!(f32::from_bits(e_ref[c]).is_nan(), "e4m3 code {c:#04x}");
+        }
+    }
+    let (h, h_legacy) = (bits("h2f"), bits("h2f_legacy"));
+    assert_eq!(h.len(), 65536);
+    for x in 0..65536usize {
+        assert_eq!(h[x], h_legacy[x], "f16 bits {x:#06x}");
+        let want = half::f16::from_bits(x as u16).to_f32();
+        if !want.is_nan() {
+            assert_eq!(h[x], want.to_bits(), "f16 bits {x:#06x} vs half");
+        } else {
+            assert!(f32::from_bits(h[x]).is_nan(), "f16 bits {x:#06x}");
+        }
+    }
+}
+
 /// Runs `tq_attn` on the host emulator over rows `(b, hkv, lk)` with a row stride of `rw`
 /// words, or over the same rows as paged blocks of `(rows, capacity)` when `pages` is set (the
 /// spare rows hold junk with a huge scale). `fp8` selects the FP8 specialization, `group` > 1
