@@ -10,8 +10,17 @@ pub type hipModule_t = *mut c_void;
 pub type hipFunction_t = *mut c_void;
 pub type hipDeviceptr_t = *mut c_void;
 pub type hipMemPool_t = *mut c_void;
+pub type hipEvent_t = *mut c_void;
 
 pub const HIP_SUCCESS: hipError_t = 0;
+/// `hipErrorNotReady`: `hipEventQuery` / `hipStreamQuery` on work that has not completed.
+pub const HIP_ERROR_NOT_READY: hipError_t = 600;
+/// `hipStreamNonBlocking`: the stream does not synchronize with the legacy NULL stream.
+pub const hipStreamNonBlocking: u32 = 0x1;
+/// `hipEventDisableTiming`: no timestamp, cheapest event for ordering.
+pub const hipEventDisableTiming: u32 = 0x2;
+/// `hipHostMallocPortable`: pinned memory usable by every device's copies.
+pub const hipHostMallocPortable: u32 = 0x1;
 pub const HIP_MEMPOOL_ATTR_RELEASE_THRESHOLD: c_int = 0x4;
 /// `hipMemPoolAttrReservedMemCurrent` (uint64_t), same value as CUDA's.
 pub const HIP_MEMPOOL_ATTR_RESERVED_MEM_CURRENT: c_int = 0x5;
@@ -118,6 +127,24 @@ extern "C" {
         kind: hipMemcpyKind,
     ) -> hipError_t;
     pub fn hipMemset(dst: *mut c_void, value: c_int, size: usize) -> hipError_t;
+    pub fn hipMemcpyAsync(
+        dst: *mut c_void,
+        src: *const c_void,
+        size: usize,
+        kind: hipMemcpyKind,
+        stream: hipStream_t,
+    ) -> hipError_t;
+    pub fn hipHostMalloc(ptr: *mut *mut c_void, size: usize, flags: u32) -> hipError_t;
+    pub fn hipHostFree(ptr: *mut c_void) -> hipError_t;
+    pub fn hipStreamCreateWithFlags(stream: *mut hipStream_t, flags: u32) -> hipError_t;
+    pub fn hipStreamDestroy(stream: hipStream_t) -> hipError_t;
+    pub fn hipStreamSynchronize(stream: hipStream_t) -> hipError_t;
+    pub fn hipStreamWaitEvent(stream: hipStream_t, event: hipEvent_t, flags: u32) -> hipError_t;
+    pub fn hipEventCreateWithFlags(event: *mut hipEvent_t, flags: u32) -> hipError_t;
+    pub fn hipEventRecord(event: hipEvent_t, stream: hipStream_t) -> hipError_t;
+    pub fn hipEventQuery(event: hipEvent_t) -> hipError_t;
+    pub fn hipEventSynchronize(event: hipEvent_t) -> hipError_t;
+    pub fn hipEventDestroy(event: hipEvent_t) -> hipError_t;
     pub fn hipDeviceSynchronize() -> hipError_t;
     pub fn hipGetLastError() -> hipError_t;
     pub fn hipModuleLoad(module: *mut hipModule_t, fname: *const c_char) -> hipError_t;
