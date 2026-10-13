@@ -448,7 +448,7 @@ fn time_ms(dev: &Device, iters: usize, mut f: impl FnMut()) -> f64 {
         unreachable!("CUDA benchmark")
     };
     static BLOCKER: std::sync::OnceLock<(Tensor, Tensor)> = std::sync::OnceLock::new();
-    let (a, b) = BLOCKER.get_or_init(|| (randn(&[3072, 3072], dev), randn(&[3072, 3072], dev)));
+    let (a, b) = BLOCKER.get_or_init(|| (randn(&[4096, 4096], dev), randn(&[4096, 4096], dev)));
     let stream = cd.cuda_stream();
     let event = || {
         let e = stream
@@ -460,8 +460,10 @@ fn time_ms(dev: &Device, iters: usize, mut f: impl FnMut()) -> f64 {
     };
     f();
     dev.synchronize().unwrap();
-    let mut best = f64::INFINITY;
-    for _ in 0..3 {
+    // best of three measurements whose calls were all queued while the blocker ran (host
+    // enqueue shorter than the blocker); runs with a slower host are retried
+    let (mut best, mut any, mut clean) = (f64::INFINITY, f64::INFINITY, 0);
+    for _ in 0..10 {
         let e_block = event();
         let _busy = a.matmul(b).unwrap();
         let e0 = event();
@@ -471,12 +473,20 @@ fn time_ms(dev: &Device, iters: usize, mut f: impl FnMut()) -> f64 {
         }
         let host = t.elapsed().as_secs_f64() * 1e3;
         let e1 = event();
-        let gpu = e0.elapsed_ms(&e1).unwrap() as f64;
+        let gpu = e0.elapsed_ms(&e1).unwrap() as f64 / iters as f64;
         let blocker = e_block.elapsed_ms(&e0).unwrap() as f64;
-        if host > blocker {
-            eprintln!("bench: host enqueue {host:.2} ms > blocker {blocker:.2} ms, GPU time inflated");
+        any = any.min(gpu);
+        if host < blocker {
+            best = best.min(gpu);
+            clean += 1;
+            if clean == 3 {
+                break;
+            }
         }
-        best = best.min(gpu / iters as f64);
+    }
+    if clean == 0 {
+        eprintln!("bench: host enqueue never fit under the blocker, GPU time may be inflated");
+        return any;
     }
     best
 }
@@ -518,7 +528,7 @@ fn bench_split_heuristic() {
                     set_gqa(gqa);
                     let run = |split: SplitKv| {
                         let cfg = strict(scale).split_kv(split);
-                        time_ms(&dev, 20, || {
+                        time_ms(&dev, 10, || {
                             flash_attn_bhsd(&q, &k, &v, &cfg).unwrap();
                         })
                     };
@@ -537,7 +547,7 @@ fn bench_split_heuristic() {
                 set_gqa(gqa);
                 let run = |split: SplitKv| {
                     let cfg = strict(scale).split_kv(split);
-                    time_ms(&dev, 20, || {
+                    time_ms(&dev, 10, || {
                         attention_packed(&q, &kr, &vr, lk, &kq, &vq, &cfg).unwrap();
                     })
                 };
@@ -575,6 +585,79 @@ fn bench_row(
     println!(" s{} |", best.1);
 }
 
+/// Decode attention before / after this change set: "before" = the previous defaults (split
+/// rule of 2 workgroups per CU with 256+ keys per split, plain row kernels, generic `tq_attn`,
+/// F16 K/V converted to F32 first); "after" = the current defaults.
+#[test]
+#[ignore]
+fn bench_decode_summary() {
+    let _g = LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    let Some(dev) = gpu() else { return };
+    let cus = accel::profile(&dev).compute_units;
+    let old_splits = |rows: usize, lk: usize| {
+        let target = 2 * cus;
+        if rows >= target {
+            1
+        } else {
+            target.div_ceil(rows).min(lk.div_ceil(256)).clamp(1, 64)
+        }
+    };
+    println!("| path | hq/hkv/d | lk | before ms | after ms | speedup |");
+    for (hq, hkv, d) in [(16usize, 4usize, 256usize), (16, 8, 128)] {
+        for lk in [1024usize, 2048, 4096, 8192] {
+            let (k32, v32) = (randn(&[1, hkv, lk, d], &dev), randn(&[1, hkv, lk, d], &dev));
+            let scale = 1.0 / (d as f32).sqrt();
+            let before_cfg = strict(scale).split_kv(SplitKv::Fixed(old_splits(hq, lk)));
+            let after_cfg = strict(scale);
+            let mut row = |name: &str, before: f64, after: f64| {
+                println!(
+                    "| {name} | {hq}/{hkv}/{d} | {lk} | {before:.4} | {after:.4} | {:.2}x |",
+                    before / after
+                );
+            };
+            for (name, qd, kvd) in [
+                ("exact f32 kv, f32 q", DType::F32, DType::F32),
+                ("exact f16 kv, f32 q", DType::F32, DType::F16),
+                ("exact bf16 kv, bf16 q", DType::BF16, DType::BF16),
+                ("fp8 kv, f32 q", DType::F32, DType::F8E4M3),
+            ] {
+                let q = randn(&[1, hq, 1, d], &dev).to_dtype(qd).unwrap();
+                let (k, v) = (to_kv(&k32, kvd), to_kv(&v32, kvd));
+                set_gqa(false);
+                let before = time_ms(&dev, 10, || {
+                    // the previous kv_as_is converted f16 K/V to the query dtype first
+                    if kvd == DType::F16 {
+                        let (kc, vc) = (k.to_dtype(qd).unwrap(), v.to_dtype(qd).unwrap());
+                        flash_attn_bhsd(&q, &kc, &vc, &before_cfg).unwrap();
+                    } else {
+                        flash_attn_bhsd(&q, &k, &v, &before_cfg).unwrap();
+                    }
+                });
+                set_gqa(true);
+                let after = time_ms(&dev, 10, || {
+                    flash_attn_bhsd(&q, &k, &v, &after_cfg).unwrap();
+                });
+                row(name, before, after);
+            }
+            let kq = TurboQuantizer::new(QuantFormat::Fp8, d, RotationKind::None, 1, &dev).unwrap();
+            let vq = TurboQuantizer::new(QuantFormat::Fp8, d, RotationKind::None, 3, &dev).unwrap();
+            let (kr, vr) = (pack(&kq, &k32), pack(&vq, &v32));
+            let q = randn(&[1, hq, 1, d], &dev);
+            set_gqa(false);
+            set_fp8_fast(false);
+            let before = time_ms(&dev, 10, || {
+                attention_packed(&q, &kr, &vr, lk, &kq, &vq, &before_cfg).unwrap();
+            });
+            set_gqa(true);
+            set_fp8_fast(true);
+            let after = time_ms(&dev, 10, || {
+                attention_packed(&q, &kr, &vr, lk, &kq, &vq, &after_cfg).unwrap();
+            });
+            row("turbo-quant fp8 rows", before, after);
+        }
+    }
+}
+
 /// Paged decode over blocks against concatenating the blocks first (the old path of callers).
 #[test]
 #[ignore]
@@ -589,10 +672,10 @@ fn bench_paged_vs_cat() {
         let q = randn(&[1, hq, 1, d], &dev);
         let cfg = strict(1.0 / 16.0);
         let dense = make_blocks(n, 1024, 1000, hkv, d, &|t: &Tensor| t.clone(), &dev);
-        let paged = time_ms(&dev, 20, || {
+        let paged = time_ms(&dev, 10, || {
             flash_attn_blocks(&q, &refs(&dense), &cfg).unwrap();
         });
-        let cat = time_ms(&dev, 20, || {
+        let cat = time_ms(&dev, 10, || {
             let (k, v) = cat_valid(&dense);
             flash_attn_bhsd(&q, &k, &v, &cfg).unwrap();
         });
@@ -601,10 +684,10 @@ fn bench_paged_vs_cat() {
             .iter()
             .map(|(k, v, r)| (pack(&kq, k), pack(&vq, v), *r))
             .collect();
-        let paged = time_ms(&dev, 20, || {
+        let paged = time_ms(&dev, 10, || {
             attention_packed_blocks(&q, &refs(&packed), &kq, &vq, &cfg).unwrap();
         });
-        let cat = time_ms(&dev, 20, || {
+        let cat = time_ms(&dev, 10, || {
             let (k, v) = cat_valid(&packed);
             let lk = k.dim(2).unwrap();
             attention_packed(&q, &k, &v, lk, &kq, &vq, &cfg).unwrap();

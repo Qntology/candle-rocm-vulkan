@@ -977,6 +977,7 @@ impl TurboKvCache {
                     match fused_attention_rows(q, kd, vd, self.seq_len(), kq, vq, cfg) {
                         Ok(Some(o)) => return Ok(o),
                         Ok(None) => {}
+                        Err(e) if cfg.strict => return Err(e),
                         Err(e) => warn_cpu_fallback("attention", &e),
                     }
                 }
@@ -1051,6 +1052,7 @@ pub fn attention_packed(
         match fused_attention_rows(q, &kd, &vd, kv_len, kq, vq, cfg) {
             Ok(Some(o)) => return Ok(o),
             Ok(None) => {}
+            Err(e) if cfg.strict => return Err(e),
             Err(e) => warn_cpu_fallback("attention", &e),
         }
     }
@@ -1196,13 +1198,13 @@ fn tq_prepare(
         softcap: cfg.softcap.unwrap_or(0.0),
         window_left: win(cfg.window_size_left),
         window_right: win(cfg.window_size_right),
-        // key splits per workgroup count (GQA-packed kernels run several heads per workgroup)
-        splits: att::split_count_for(
-            b * hq * lq
-                / match q.device() {
-                    Device::Cuda(_) | Device::Rocm(_) => accel::turbo::tq_attn_group(hq, hkv),
-                    _ => 1,
-                },
+        // GQA-packed kernels run several heads per workgroup (CUDA / ROCm)
+        splits: att::split_count_grouped(
+            b * hq * lq,
+            match q.device() {
+                Device::Cuda(_) | Device::Rocm(_) => accel::turbo::tq_attn_group(hq, hkv),
+                _ => 1,
+            },
             lk,
             cfg.split_kv.unwrap_or(conf.flash_attn.split_kv),
             accel::profile(q.device()).compute_units,

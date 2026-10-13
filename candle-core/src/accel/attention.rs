@@ -465,23 +465,41 @@ pub fn split_count(geom: &AttnGeometry, policy: SplitKv, compute_units: usize) -
 /// Workgroups per compute unit that [`split_count_for`] aims for.
 pub const SPLIT_WORKGROUPS_PER_CU: usize = 64;
 
-/// Number of key splits for `rows` query rows over `lk` keys (row kernels `fa_row*` / `tq_attn*`):
-/// one 128-key window per split, as long as the GPU gets fewer than
-/// [`SPLIT_WORKGROUPS_PER_CU`] workgroups per compute unit, at most [`FA_MAX_SPLITS`].
+/// Number of key splits for `rows` query rows over `lk` keys (row kernels `fa_row*` / `tq_attn*`
+/// with one query head per workgroup): [`split_count_grouped`] with `group = 1`.
+pub fn split_count_for(rows: usize, lk: usize, policy: SplitKv, compute_units: usize) -> usize {
+    split_count_grouped(rows, 1, lk, policy, compute_units)
+}
+
+/// Number of key splits for `rows` query rows over `lk` keys when every workgroup runs `group`
+/// query heads (GQA-packed `fa_rowg*` / `tq_attng*`): one 128-key window per split (64 keys
+/// for packed workgroups, which do `group` times the work per key and come `group` times fewer)
+/// while the GPU gets fewer than [`SPLIT_WORKGROUPS_PER_CU`] workgroups per compute unit, at
+/// most [`FA_MAX_SPLITS`].
 ///
 /// The row kernels are latency bound (one serial dot product per lane and key), so more,
-/// shorter splits keep winning until a split is a single window. Measured on an RTX 3050 laptop
-/// GPU (16 SMs) for decoding (16 or 64 query rows, 1K-8K keys, f32 / bf16 queries, f32 / f16 /
-/// bf16 / FP8 / TurboQuant FP8 K/V): within 3% of the best fixed split count on average (worst
-/// case 10%), 1.4x-3x faster than the previous rule (2 workgroups per CU, 256+ keys per split).
-pub fn split_count_for(rows: usize, lk: usize, policy: SplitKv, compute_units: usize) -> usize {
+/// shorter splits keep winning down to about one window per split. Measured on an RTX 3050
+/// laptop GPU (16 SMs) for decoding (16 or 64 query rows, Hq/Hkv/D 16/4/256 and 16/8/128,
+/// 1K-8K keys, f32 / bf16 queries, f32 / f16 / bf16 / FP8 / TurboQuant FP8 K/V): within about
+/// 4% (plain) / 8% (packed) of the best fixed split count on average, 1.4x-3x faster than the
+/// previous rule (2 workgroups per CU, 256+ keys per split).
+pub fn split_count_grouped(
+    rows: usize,
+    group: usize,
+    lk: usize,
+    policy: SplitKv,
+    compute_units: usize,
+) -> usize {
     match policy {
         SplitKv::Off => 1,
         SplitKv::Fixed(n) => n.clamp(1, FA_MAX_SPLITS),
         SplitKv::Auto => {
-            let rows = rows.max(1);
-            let by_occupancy = (SPLIT_WORKGROUPS_PER_CU * compute_units.max(1)).div_ceil(rows);
-            let by_keys = lk.div_ceil(FA_THREADS).max(1);
+            let group = group.max(1);
+            let workgroups = (rows / group).max(1);
+            let by_occupancy =
+                (SPLIT_WORKGROUPS_PER_CU * compute_units.max(1)).div_ceil(workgroups);
+            let keys = if group > 1 { FA_THREADS / 2 } else { FA_THREADS };
+            let by_keys = lk.div_ceil(keys).max(1);
             by_occupancy.min(by_keys).clamp(1, FA_MAX_SPLITS)
         }
     }
@@ -585,7 +603,7 @@ pub struct RowLaunch {
 }
 
 /// Row kernel launch for a call: GQA packing when `p.gqa_pack` allows it (dense batches,
-/// `hq / hkv` a multiple of 2), key splits from [`split_count_for`] over the workgroups.
+/// `hq / hkv` a multiple of 2), key splits from [`split_count_grouped`].
 pub fn row_launch(
     geom: &AttnGeometry,
     p: &FlashAttnParams,
@@ -600,7 +618,7 @@ pub fn row_launch(
     } else {
         1
     };
-    let splits = split_count_for(geom.out_rows() / g, geom.lk, p.split_kv, compute_units);
+    let splits = split_count_grouped(geom.out_rows(), g, geom.lk, p.split_kv, compute_units);
     let prefix = match (paged, g) {
         (false, 1) => "fa_row_".to_string(),
         (true, 1) => "fa_rowp_".to_string(),
@@ -784,6 +802,9 @@ mod tests {
         // many rows: fewer splits, none past 64 workgroups per compute unit
         assert_eq!(split_count_for(64, 2048, SplitKv::Auto, 16), 16);
         assert_eq!(split_count_for(4096, 2048, SplitKv::Auto, 16), 1);
+        assert_eq!(split_count_grouped(16, 4, 1024, SplitKv::Auto, 16), 16);
+        assert_eq!(split_count_grouped(16, 4, 8192, SplitKv::Auto, 16), 64);
+        assert_eq!(split_count_grouped(4096, 4, 2048, SplitKv::Auto, 16), 1);
         p.split_kv = SplitKv::Off;
         assert_eq!(plan(&dec, &p, 64 * 1024, 60), FaPlan::Row { splits: 1 });
     }
@@ -822,7 +843,8 @@ mod tests {
         let mut p = FlashAttnParams::new(1.0);
         let l = row_launch(&geom, &p, 16, DType::F32, DType::F16, false).unwrap();
         assert_eq!(l.name, "fa_rowg4_f32_f16");
-        assert_eq!((l.grid, l.splits, l.group), ((4, 16, 1), 16, 4));
+        // packed workgroups: 64 keys per split
+        assert_eq!((l.grid, l.splits, l.group), ((4, 32, 1), 32, 4));
         assert_eq!(l.shared_bytes, 4 * row_smem_bytes(256));
         let l = row_launch(&geom, &p, 16, DType::BF16, DType::F8E4M3, true).unwrap();
         assert_eq!(l.name, "fa_rowpg4_bf16_fp8");
