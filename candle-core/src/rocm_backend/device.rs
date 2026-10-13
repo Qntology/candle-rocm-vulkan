@@ -141,6 +141,8 @@ struct DeviceInner {
     arch: Option<GpuArch>,
     gemm_backend: AtomicU8,
     accel: OnceLock<crate::accel::AccelProfile>,
+    /// Non-blocking stream used by [`super::offload::CopyStream`], created on first use.
+    copy_stream: Mutex<Option<Arc<super::offload::RawStream>>>,
 }
 
 /// A ROCm (HIP) GPU device. Clones share the same underlying context, rocBLAS handle and
@@ -285,6 +287,7 @@ impl RocmDevice {
                 arch,
                 gemm_backend: AtomicU8::new(gemm_backend.as_u8()),
                 accel: OnceLock::new(),
+                copy_stream: Mutex::new(None),
             }),
         })
     }
@@ -441,6 +444,17 @@ impl RocmDevice {
             hip_runtime::memory::set_pool_release_threshold(self.inner.ordinal as i32, bytes).w()?;
         }
         Ok(())
+    }
+
+    /// The shared copy stream of this device (see [`super::offload`]), created on first use.
+    pub(crate) fn raw_copy_stream(&self) -> Result<Arc<super::offload::RawStream>> {
+        let mut slot = self.inner.copy_stream.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some(s) = slot.as_ref() {
+            return Ok(s.clone());
+        }
+        let s = Arc::new(super::offload::RawStream::new(self.inner.ordinal)?);
+        *slot = Some(s.clone());
+        Ok(s)
     }
 
     /// The ROCm backend keeps no per-device quantized matmul scratch: nothing to free.
