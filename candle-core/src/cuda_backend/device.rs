@@ -106,15 +106,33 @@ impl CudaPoolStats {
     }
 }
 
-/// Default release threshold of the memory pool (`CANDLE_CUDA_POOL_KEEP_MB`, default 256 MiB,
-/// `max` never releases on synchronization).
+/// Default release threshold of the memory pool (`CANDLE_CUDA_POOL_KEEP_MB`, or the shared
+/// `CANDLE_GPU_POOL_KEEP_MB`; default 256 MiB, `max` never releases on synchronization).
 fn pool_keep_bytes_from_env() -> u64 {
     const DEFAULT_MB: u64 = 256;
-    match std::env::var("CANDLE_CUDA_POOL_KEEP_MB") {
+    let v = std::env::var("CANDLE_CUDA_POOL_KEEP_MB")
+        .or_else(|_| std::env::var("CANDLE_GPU_POOL_KEEP_MB"));
+    match v {
         Ok(v) if v.trim().eq_ignore_ascii_case("max") => u64::MAX,
-        Ok(v) => v.trim().parse::<u64>().unwrap_or(DEFAULT_MB) << 20,
+        Ok(v) => v.trim().parse::<u64>().unwrap_or(DEFAULT_MB).saturating_mul(1 << 20),
         Err(_) => DEFAULT_MB << 20,
     }
+}
+
+/// `CANDLE_CUDA_CHECK_LAUNCH=1`: check the launches of the statically compiled (cudart) kernels,
+/// see [`CudaDevice::check_ffi_launch`].
+fn check_launch_from_env() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| match std::env::var("CANDLE_CUDA_CHECK_LAUNCH") {
+        Ok(v) => v == "1" || v.eq_ignore_ascii_case("true"),
+        Err(_) => false,
+    })
+}
+
+extern "C" {
+    /// CUDA runtime (linked through `candle-kernels`): returns and clears the last error of the
+    /// calling thread's runtime calls, launch configuration errors included.
+    fn cudaGetLastError() -> std::ffi::c_int;
 }
 
 fn event_tracking_from_env() -> bool {
@@ -627,6 +645,22 @@ impl CudaDevice {
     /// which then skips its work, so it is better drained explicitly.
     pub fn take_deferred_error(&self) -> Option<String> {
         self.context.check_err().err().map(|e| format!("{e:?}"))
+    }
+
+    /// With `CANDLE_CUDA_CHECK_LAUNCH=1`, turns a failed launch of the kernels that `candle-kernels`
+    /// compiles statically (MMQ/MMVQ, launched through the CUDA runtime, which reports nothing to
+    /// the caller) into an error: checks `cudaGetLastError`, then waits for the stream so that
+    /// execution faults surface here. A no-op otherwise.
+    pub(crate) fn check_ffi_launch(&self, what: &str) -> Result<()> {
+        if !check_launch_from_env() {
+            return Ok(());
+        }
+        let code = unsafe { cudaGetLastError() };
+        if code != 0 {
+            crate::bail!("{what}: kernel launch failed (cudaError_t {code})")
+        }
+        self.synchronize()
+            .map_err(|e| crate::Error::Msg(format!("{what}: kernel execution failed: {e}")))
     }
 
     /// Drains and logs a stale deferred error before a synchronization.

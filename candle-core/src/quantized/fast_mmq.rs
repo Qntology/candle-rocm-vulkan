@@ -350,6 +350,7 @@ pub fn try_fwd(
         );
     }
     drop(workspaces);
+    dev.check_ffi_launch("fast_mmq")?;
 
     let mut out_shape = rhs_l.shape().dims().to_vec();
     out_shape.pop();

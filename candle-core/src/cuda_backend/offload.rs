@@ -33,6 +33,14 @@
 //! [`CopyEvent::wait_on_compute`] was called for it: a buffer freed before that may be handed to
 //! another allocation while the copy still runs. Dropping a [`CopyEvent`] that was never waited
 //! on queues that wait on the compute stream, which orders frees issued afterwards.
+//!
+//! Performance notes (RTX 3050 laptop, Windows/WDDM, `cuda_memory_tests` bench): a pinned upload
+//! reaches ~6.6 GB/s against 5-6 GB/s for a pageable `Tensor::from_slice`, and a 64 MiB upload
+//! queued before 26 ms of unrelated kernels finished with them (30 ms in total, 43 ms on the
+//! compute stream). Since a copy starts after the compute work queued before it, issue uploads
+//! early (e.g. a few layers ahead). Keep this for large transfers: for tiny copies (kernel
+//! parameters, tens of bytes) a pinned source measured several times slower than the pageable
+//! path, which the driver handles very cheaply.
 
 use super::{CudaDevice, CudaStorage, CudaStorageSlice, WrapErr};
 use crate::{bail, Result};
@@ -67,7 +75,7 @@ impl RawEvent {
     }
 
     fn is_complete(&self) -> bool {
-        unsafe { drv::event::query(self.event) }.is_ok()
+        bind_context_raw(&self.ctx).is_ok() && unsafe { drv::event::query(self.event) }.is_ok()
     }
 
     fn synchronize(&self) -> Result<()> {

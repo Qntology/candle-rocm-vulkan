@@ -173,7 +173,7 @@ fn pool_keep_bytes() -> u64 {
         .or_else(|_| std::env::var("CANDLE_GPU_POOL_KEEP_MB"));
     match v {
         Ok(v) if v.trim().eq_ignore_ascii_case("max") => u64::MAX,
-        Ok(v) => v.trim().parse::<u64>().unwrap_or(DEFAULT_MB) << 20,
+        Ok(v) => v.trim().parse::<u64>().unwrap_or(DEFAULT_MB).saturating_mul(1 << 20),
         Err(_) => DEFAULT_MB << 20,
     }
 }

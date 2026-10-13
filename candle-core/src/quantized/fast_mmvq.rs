@@ -206,6 +206,7 @@ pub fn try_fwd(
                     stream_ptr,
                 );
             }
+            dev.check_ffi_launch("fast_mmvq")?;
 
             let out_storage = CudaStorage::wrap_cuda_slice(out, dev.clone());
             Ok(Some((out_storage, out_shape.into())))
@@ -240,6 +241,7 @@ pub fn try_fwd(
                     stream_ptr,
                 );
             }
+            dev.check_ffi_launch("fast_mmvq")?;
 
             let out_storage = CudaStorage::wrap_cuda_slice(out, dev.clone());
             Ok(Some((out_storage, out_shape.into())))
@@ -274,6 +276,7 @@ pub fn try_fwd(
                     stream_ptr,
                 );
             }
+            dev.check_ffi_launch("fast_mmvq")?;
 
             let out_storage = CudaStorage::wrap_cuda_slice(out, dev.clone());
             Ok(Some((out_storage, out_shape.into())))
