@@ -171,6 +171,11 @@ name = "rocm_tests"
 path = "tests/rocm_tests.rs"
 
 [[test]]
+name = "rocm_memory_tests"
+path = "tests/rocm_memory_tests.rs"
+required-features = ["rocm"]
+
+[[test]]
 name = "vulkan_tests"
 path = "tests/vulkan_tests.rs"
 

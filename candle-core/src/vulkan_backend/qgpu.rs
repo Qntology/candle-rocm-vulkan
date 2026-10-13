@@ -55,7 +55,8 @@ fn vram_reserve() -> u64 {
 }
 
 pub(crate) fn enabled(dev: &VulkanDevice) -> bool {
-    weights_enabled_env()
+    shaders::exec_mode() != shaders::ExecMode::Host
+        && weights_enabled_env()
         && dev.ctx().device_type != vk::PhysicalDeviceType::CPU
         && dev.ctx().native_ok.load(Ordering::Relaxed)
 }
@@ -1223,13 +1224,15 @@ fn mirror_after() -> u32 {
     *V.get_or_init(|| env_mb("CANDLE_VULKAN_MIRROR_AFTER", 2).max(1) as u32)
 }
 
-fn mirror_of(rhs: &VulkanStorage) -> Option<Arc<GpuBuf>> {
+/// VRAM copy of a weight. `force` mirrors on first use (fixed [`shaders::ExecMode::Gpu`]),
+/// otherwise only from the `CANDLE_VULKAN_MIRROR_AFTER`-th use.
+fn mirror_of(rhs: &VulkanStorage, force: bool) -> Option<Arc<GpuBuf>> {
     let mut slot = rhs.mirror.lock().ok()?;
     if let Some(m) = slot.as_ref() {
         return Some(m.clone());
     }
     let uses = rhs.rhs_uses.fetch_add(1, Ordering::Relaxed) + 1;
-    if uses < mirror_after() {
+    if !force && uses < mirror_after() {
         return None;
     }
     let bytes = rhs.as_bytes();
@@ -1263,11 +1266,15 @@ pub(crate) fn dense_matmul(
     let Some((tag, decl, load)) = rhs_variant(rhs.dtype) else {
         return Ok(None);
     };
-    let worthwhile = rhs.capacity_bytes >= MIRROR_MIN_BYTES
+    // Fixed GPU mode: no size thresholds, no GEMV, mirror on first use, errors are returned
+    // (the path never depends on the batch size or on earlier calls).
+    let fixed = shaders::exec_mode() == shaders::ExecMode::Gpu;
+    let worthwhile = fixed
+        || rhs.capacity_bytes >= MIRROR_MIN_BYTES
         || (rhs.capacity_bytes >= (256 << 10) && b * m >= 32);
     if lhs.dtype != rhs.dtype
         || !worthwhile
-        || 2 * b * m * n * k < (1 << 22)
+        || (!fixed && 2 * b * m * n * k < (1 << 22))
         || rhs_l.dims().len() < 2
         || lhs_l.dims().len() < 2
     {
@@ -1290,8 +1297,13 @@ pub(crate) fn dense_matmul(
     let mirror = if unified(ctx) {
         None
     } else {
-        match mirror_of(rhs) {
+        match mirror_of(rhs, fixed) {
             Some(mb) => Some(mb),
+            None if fixed => {
+                return Err(Error::Msg(
+                    "vulkan dense matmul (fixed GPU mode): cannot mirror the weight to VRAM".into(),
+                ))
+            }
             None => return Ok(None),
         }
     };
@@ -1320,7 +1332,7 @@ pub(crate) fn dense_matmul(
             }
         };
         let out32 = dev.alloc_buffer(big_m * n, DType::F32)?;
-        let gemv = big_m <= GEMV_MAX_M;
+        let gemv = !fixed && big_m <= GEMV_MAX_M;
         let x_aligned = unified(ctx) && x_off % 4 == 0 || !unified(ctx);
         let vec = dense_vec_variant(rhs.dtype).filter(|&(_, width, _)| {
             gemv && x_aligned && sbk == 1 && w_off % width == 0 && sbn % width == 0 && k % width == 0
@@ -1414,6 +1426,7 @@ pub(crate) fn dense_matmul(
     })();
     match res {
         Ok(out) => Ok(Some(out)),
+        Err(e) if fixed => Err(e),
         Err(_) => Ok(None)
     }
 }
@@ -1432,7 +1445,9 @@ pub(crate) fn act_matmul(
 ) -> Result<Option<VulkanStorage>> {
     let dev = &lhs.device;
     let ctx = dev.ctx();
-    if !enabled(dev) || unified(ctx) || !act_enabled_env() {
+    // Fixed GPU mode keeps activation x activation matmuls on the CPU path (its flops
+    // threshold would make the path depend on the batch size).
+    if !enabled(dev) || unified(ctx) || !act_enabled_env() || shaders::exec_mode() == shaders::ExecMode::Gpu {
         return Ok(None);
     }
     if lhs.dtype != DType::F32 || rhs.dtype != DType::F32 {

@@ -1081,3 +1081,76 @@ fn dummy_dtypes_load_and_fail_fast() -> Result<()> {
     }
     Ok(())
 }
+
+fn same_bits(a: &Tensor, b: &Tensor) -> Result<bool> {
+    let a: Vec<f32> = a.flatten_all()?.to_vec1()?;
+    let b: Vec<f32> = b.flatten_all()?.to_vec1()?;
+    Ok(a.len() == b.len() && a.iter().zip(b.iter()).all(|(x, y)| x.to_bits() == y.to_bits()))
+}
+
+/// `scoped_exec_mode(Host | Gpu)`: a row's result does not depend on how many rows the call
+/// has, where the row sits, or how often the weight was used before (in `Auto` mode a weight is
+/// mirrored to VRAM only from its 2nd use and small calls stay on the CPU path, so the same row
+/// can change bits between calls). Batch-invariant callers such as an embedding cache rely on
+/// this. `Host` equals the CPU backend bit for bit.
+#[test]
+fn fixed_exec_modes_are_batch_invariant() -> Result<()> {
+    let _guard = MODE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let dev = vulkan();
+    let (k, n, rows) = (384usize, 1152usize, 300usize);
+    let x_cpu = randn(&[rows, k], DType::F32)?;
+    let w_cpu = randn(&[n, k], DType::F32)?;
+    let q_cpu = randn(&[4, 12, 9, 32], DType::F32)?;
+    let kt_cpu = randn(&[4, 12, 32, 9], DType::F32)?;
+    let cpu_lin = x_cpu.matmul(&w_cpu.t()?)?;
+    let cpu_att = q_cpu.matmul(&kt_cpu)?;
+    for mode in [shaders::ExecMode::Host, shaders::ExecMode::Gpu] {
+        // Fresh storages: the weight's first use happens inside the mode.
+        let w = w_cpu.to_device(&dev)?;
+        let x = x_cpu.to_device(&dev)?;
+        let _m = shaders::scoped_exec_mode(mode);
+        assert_eq!(shaders::exec_mode(), mode);
+        let full = x.matmul(&w.t()?)?.to_device(&Device::Cpu)?;
+        let mut bad = Vec::new();
+        for take in [1usize, 2, 3, 4, 5, 7, 8, 9, 15, 16, 17, 31, 32, 33, 64, 299] {
+            for start in [0usize, rows - take] {
+                let part = x
+                    .narrow(0, start, take)?
+                    .contiguous()?
+                    .matmul(&w.t()?)?
+                    .to_device(&Device::Cpu)?;
+                if !same_bits(&part, &full.narrow(0, start, take)?)? {
+                    bad.push((take, start));
+                }
+            }
+        }
+        assert!(
+            bad.is_empty(),
+            "{mode:?}: (rows, start) calls whose rows differ from the same rows of the {rows}-row call: {bad:?}"
+        );
+        let q = q_cpu.to_device(&dev)?;
+        let kt = kt_cpu.to_device(&dev)?;
+        let att4 = q.matmul(&kt)?.to_device(&Device::Cpu)?;
+        let att1 = q
+            .narrow(0, 2, 1)?
+            .matmul(&kt.narrow(0, 2, 1)?)?
+            .to_device(&Device::Cpu)?;
+        assert!(
+            same_bits(&att1, &att4.narrow(0, 2, 1)?)?,
+            "{mode:?}: batched activation matmul depends on the batch size"
+        );
+        if mode == shaders::ExecMode::Host {
+            assert!(same_bits(&full, &cpu_lin)?, "Host mode differs from the CPU backend");
+            assert!(same_bits(&att4, &cpu_att)?, "Host mode differs from the CPU backend (attention)");
+        } else {
+            assert_close(&full, &cpu_lin, "Gpu mode dense matmul vs CPU")?;
+            assert_close(&att4, &cpu_att, "Gpu mode activation matmul vs CPU")?;
+        }
+    }
+    assert_eq!(
+        shaders::exec_mode(),
+        shaders::ExecMode::Auto,
+        "the guard did not restore the thread's mode"
+    );
+    Ok(())
+}

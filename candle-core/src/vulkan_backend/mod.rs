@@ -1584,6 +1584,9 @@ impl BackendStorage for VulkanStorage {
         }
         let lhs = self.host_view();
         let rhs = rhs.host_view();
+        if shaders::exec_mode() != shaders::ExecMode::Auto {
+            return self.upload(host_matmul_row_invariant(&lhs, &rhs, bmnk, lhs_l, rhs_l)?);
+        }
         self.upload(lhs.matmul(&rhs, bmnk, lhs_l, rhs_l)?)
     }
 
@@ -1816,4 +1819,30 @@ impl BackendDevice for VulkanDevice {
     fn synchronize(&self) -> Result<()> {
         shaders::wait_idle(self)
     }
+}
+
+/// CPU matmul of the fixed exec modes ([`shaders::scoped_exec_mode`]). The CPU GEMM computes a
+/// single-row product (`m == 1`) along another code path than `m >= 2`, which changes that
+/// row's bits (rows 2..299 of a 300-row call match every other row count). A 1-row matmul is
+/// therefore run on two copies of the row and the first is kept, so that a row's result never
+/// depends on the row count of the call.
+fn host_matmul_row_invariant(
+    lhs: &CpuStorage,
+    rhs: &CpuStorage,
+    (b, m, n, k): (usize, usize, usize, usize),
+    lhs_l: &Layout,
+    rhs_l: &Layout,
+) -> Result<CpuStorage> {
+    if m != 1 {
+        return lhs.matmul(rhs, (b, m, n, k), lhs_l, rhs_l);
+    }
+    let dims = lhs_l.dims();
+    let r = dims.len();
+    let twice = CpuStorage::U32(vec![0, 0]);
+    let lhs2 = lhs.index_select(&twice, lhs_l, &Layout::contiguous(2), r - 2)?;
+    let mut dims2 = dims.to_vec();
+    dims2[r - 2] = 2;
+    let out2 = lhs2.matmul(rhs, (b, 2, n, k), &Layout::contiguous(dims2.as_slice()), rhs_l)?;
+    let first = CpuStorage::U32(vec![0]);
+    out2.index_select(&first, &Layout::contiguous((b, 2, n)), &Layout::contiguous(1), 1)
 }

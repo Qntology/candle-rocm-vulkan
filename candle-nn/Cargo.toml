@@ -126,6 +126,11 @@ path = "tests/accel_cuda.rs"
 required-features = ["cuda"]
 
 [[test]]
+name = "accel_rocm"
+path = "tests/accel_rocm.rs"
+required-features = ["rocm", "flash-attn"]
+
+[[test]]
 name = "sdpa"
 path = "tests/sdpa.rs"
 
