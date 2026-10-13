@@ -79,6 +79,10 @@ name = "candle_core"
 path = "src/lib.rs"
 
 [[example]]
+name = "device_probe"
+path = "examples/device_probe.rs"
+
+[[example]]
 name = "basics"
 path = "examples/basics.rs"
 
@@ -108,6 +112,10 @@ path = "tests/accel_kernels_host.rs"
 [[test]]
 name = "bilinear_tests"
 path = "tests/bilinear_tests.rs"
+
+[[test]]
+name = "matmul_m_invariance_tests"
+path = "tests/matmul_m_invariance_tests.rs"
 
 [[test]]
 name = "conv_tests"

@@ -275,9 +275,41 @@ fn registry() -> &'static Mutex<HashMap<usize, Weak<VulkanContext>>> {
 fn load_entry() -> Result<ash::Entry> {
     match unsafe { ash::Entry::load() } {
         Ok(e) => Ok(e),
-        Err(e) => Err(Error::Msg(format!(
-            "vulkan: failed to load the Vulkan loader ({e}); is a Vulkan driver installed?"
-        ))),
+        Err(e) => {
+            // macOS: `libvulkan.dylib` is not on dyld's default search path when it comes from Homebrew
+            // (`brew install vulkan-loader molten-vk`, /opt/homebrew/lib) or the LunarG SDK
+            // ($VULKAN_SDK/lib), and DYLD_* variables are stripped by SIP-protected launchers.
+            #[cfg(any(target_os = "macos", target_os = "ios"))]
+            {
+                let mut candidates: Vec<std::path::PathBuf> = Vec::new();
+                if let Some(sdk) = std::env::var_os("VULKAN_SDK") {
+                    candidates.push(std::path::Path::new(&sdk).join("lib/libvulkan.dylib"));
+                }
+                for dir in ["/opt/homebrew/lib", "/usr/local/lib"] {
+                    candidates.push(std::path::Path::new(dir).join("libvulkan.dylib"));
+                }
+                for c in candidates.iter().filter(|c| c.exists()) {
+                    if let Ok(entry) = unsafe { ash::Entry::load_from(c) } {
+                        return Ok(entry);
+                    }
+                }
+            }
+            Err(Error::Msg(format!(
+                "vulkan: failed to load the Vulkan loader ({e}); is a Vulkan driver installed?"
+            )))
+        }
+    }
+}
+
+/// Whether to ask the loader for portability (non-conformant, e.g. MoltenVK) drivers.
+/// Loaders since 1.3.216 hide them unless the instance enables `VK_KHR_portability_enumeration`
+/// with `ENUMERATE_PORTABILITY_KHR`. On by default on Apple platforms (MoltenVK is the only
+/// driver there); elsewhere `CANDLE_VULKAN_PORTABILITY=1` opts in, so existing Windows / Linux
+/// device selection is unchanged.
+fn want_portability_enumeration() -> bool {
+    match std::env::var("CANDLE_VULKAN_PORTABILITY") {
+        Ok(v) => !matches!(v.trim(), "0" | "false" | "off"),
+        Err(_) => cfg!(any(target_os = "macos", target_os = "ios")),
     }
 }
 
@@ -288,7 +320,23 @@ fn create_instance(entry: &ash::Entry) -> Result<ash::Instance> {
         .application_version(vk::make_api_version(0, 0, 1, 0))
         .engine_name(app_name)
         .api_version(vk::API_VERSION_1_2);
-    let create_info = vk::InstanceCreateInfo::default().application_info(&app_info);
+    let portability = want_portability_enumeration()
+        && unsafe { entry.enumerate_instance_extension_properties(None) }
+            .map(|exts| {
+                exts.iter().any(|e| {
+                    e.extension_name_as_c_str()
+                        .map(|n| n == ash::khr::portability_enumeration::NAME)
+                        .unwrap_or(false)
+                })
+            })
+            .unwrap_or(false);
+    let ext_names = [ash::khr::portability_enumeration::NAME.as_ptr()];
+    let mut create_info = vk::InstanceCreateInfo::default().application_info(&app_info);
+    if portability {
+        create_info = create_info
+            .enabled_extension_names(&ext_names)
+            .flags(vk::InstanceCreateFlags::ENUMERATE_PORTABILITY_KHR);
+    }
     unsafe { entry.create_instance(&create_info, None) }
         .map_err(|e| Error::Msg(format!("vulkan: create_instance failed: {e:?}")))
 }
@@ -461,15 +509,16 @@ fn init_vulkan(gpu_id: usize) -> Result<VulkanContext> {
         }
     };
 
-    let memory_budget_ext = unsafe { instance.enumerate_device_extension_properties(physical) }
-        .map(|exts| {
-            exts.iter().any(|e| {
-                e.extension_name_as_c_str()
-                    .map(|n| n == ash::ext::memory_budget::NAME)
-                    .unwrap_or(false)
-            })
-        })
-        .unwrap_or(false);
+    let device_exts =
+        unsafe { instance.enumerate_device_extension_properties(physical) }.unwrap_or_default();
+    let has_device_ext = |name: &std::ffi::CStr| {
+        device_exts
+            .iter()
+            .any(|e| e.extension_name_as_c_str().map(|n| n == name).unwrap_or(false))
+    };
+    let memory_budget_ext = has_device_ext(ash::ext::memory_budget::NAME);
+    // A portability driver (MoltenVK) that advertises VK_KHR_portability_subset must have it enabled.
+    let portability_subset_ext = has_device_ext(ash::khr::portability_subset::NAME);
 
     let queue_priorities = [1.0f32];
     let queue_create_infos = [vk::DeviceQueueCreateInfo::default()
@@ -478,6 +527,9 @@ fn init_vulkan(gpu_id: usize) -> Result<VulkanContext> {
     let mut ext_names = Vec::new();
     if memory_budget_ext {
         ext_names.push(ash::ext::memory_budget::NAME.as_ptr());
+    }
+    if portability_subset_ext {
+        ext_names.push(ash::khr::portability_subset::NAME.as_ptr());
     }
     let device_create_info = vk::DeviceCreateInfo::default()
         .queue_create_infos(&queue_create_infos)
