@@ -350,8 +350,14 @@ fn profile_tiers_and_lds() {
     );
     assert_eq!(prof.max_shared_mem, 64 * 1024);
     if prof.arch.starts_with("gfx10") {
-        // RDNA1 / RDNA2 (gfx1010 .. gfx1036): FlashAttention-1 tier, FP8 decoded in software
-        assert_eq!(prof.flash_attn_version, FlashAttnVersion::V1, "{prof}");
+        // RDNA1 (gfx101x): FlashAttention-1 tier; RDNA2 (gfx103x): FlashAttention-2 tier.
+        // Both decode FP8 in software.
+        let want = if prof.arch.starts_with("gfx103") {
+            FlashAttnVersion::V2
+        } else {
+            FlashAttnVersion::V1
+        };
+        assert_eq!(prof.flash_attn_version, want, "{prof}");
         assert!(!prof.native_fp8 && !prof.native_fp4 && !prof.native_mx, "{prof}");
         assert_eq!(prof.fp8_format, QuantFormat::Fp8);
     }

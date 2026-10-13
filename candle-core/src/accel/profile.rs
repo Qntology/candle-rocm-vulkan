@@ -11,8 +11,8 @@
 //! | AMD gfx950 (MI350) | V3 | FP8, MXFP4/6/8 | MXFP4 | MXFP8 |
 //! | AMD gfx940-942 (MI300) | V3 | FP8 (FNUZ) | MXFP4 (emulated) | FP8 |
 //! | AMD gfx1200/1201 (RDNA4) | V3 | FP8 | MXFP4 (emulated) | FP8 |
-//! | AMD gfx90a (MI200), gfx11xx (RDNA3/3.5) | V2 | - | MXFP4 (emulated) | FP8 (emulated) |
-//! | AMD gfx908, gfx10xx (RDNA1/2), older | V1 | - | MXFP4 (emulated) | FP8 (emulated) |
+//! | AMD gfx90a (MI200), gfx11xx (RDNA3/3.5), gfx103x (RDNA2) | V2 | - | MXFP4 (emulated) | FP8 (emulated) |
+//! | AMD gfx908, gfx101x (RDNA1), older | V1 | - | MXFP4 (emulated) | FP8 (emulated) |
 //! | Vulkan | V2 if 32 KiB+ shared memory, else V1 | - | MXFP4 (emulated) | FP8 (emulated) |
 //!
 //! FA tiers follow Dao-AILab: FA2 needs Ampere+ (and on ROCm CDNA2+/RDNA3+, the targets of its
@@ -107,6 +107,10 @@ impl AccelProfile {
             n if n.starts_with("gfx12") => (FlashAttnVersion::V3, true, false),
             "gfx90a" => (FlashAttnVersion::V2, false, false),
             n if n.starts_with("gfx11") => (FlashAttnVersion::V2, false, false),
+            // RDNA2: the V2 tiles fit the 64 KiB LDS and run prefill 2.0-2.5x faster than the V1
+            // row kernel on an RX 6600 (gfx1032, l = 2048). V3 is slower there (its 50-58 KB of LDS
+            // limits occupancy). Decode keeps the row kernels either way.
+            n if n.starts_with("gfx103") => (FlashAttnVersion::V2, false, false),
             _ => (FlashAttnVersion::V1, false, false),
         };
         Self {
@@ -280,6 +284,10 @@ mod tests {
         );
         assert_eq!(
             AccelProfile::rocm("gfx1030", 40).flash_attn_version,
+            FlashAttnVersion::V2
+        );
+        assert_eq!(
+            AccelProfile::rocm("gfx1010", 40).flash_attn_version,
             FlashAttnVersion::V1
         );
         assert_eq!(
