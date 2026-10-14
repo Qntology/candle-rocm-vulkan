@@ -3,7 +3,8 @@
 //! error compounds through the per-token decay over a sequence):
 //!
 //! 1. `gdn_conv_f32`: causal depthwise conv over `[conv_state ; tokens]` (+ bias) and SiLU, one
-//!    thread per (channel, token, batch).
+//!    thread per (channel, token, batch); the token-0 threads also write the new conv state (the
+//!    last K-1 entries), so a decode step is two dispatches and no tensor ops.
 //! 2. `gdn_scan_f32`: per (value head, batch), one thread per value column holding the `[dk]`
 //!    column of the recurrent state; the threadgroup stages q / k of the token, reduces their
 //!    squared norms (L2 norm, q scale), and every thread runs the CPU kernel's update order:
@@ -69,6 +70,7 @@ kernel void gdn_conv_f32(
     device const float *w [[buffer(2)]],
     device const float *bias [[buffer(3)]],
     device float *y [[buffer(4)]],
+    device float *cs_out [[buffer(6)]],
     constant GdnConvParams &p [[buffer(5)]],
     uint3 tg [[threadgroup_position_in_grid]],
     uint3 tl [[thread_position_in_threadgroup]],
@@ -93,6 +95,19 @@ kernel void gdn_conv_f32(
         acc += w[ulong(c) * p.kw + j] * xv;
     }
     y[(ulong(b) * p.t + t) * p.c + c] = acc * gdn_sigmoid(acc);
+    if (t == 0u) {
+        // New conv state: entries T .. T + K-2 of [conv_state ; tokens] (copies, no arithmetic).
+        for (uint m = 0u; m < km1; ++m) {
+            const uint i = p.t + m;
+            float xv;
+            if (i < km1) {
+                xv = p.has_cs != 0u ? cs[(ulong(b) * p.c + c) * km1 + i] : 0.0f;
+            } else {
+                xv = x[(ulong(b) * p.t + (i - km1)) * p.c + c];
+            }
+            cs_out[(ulong(b) * p.c + c) * km1 + m] = xv;
+        }
+    }
 }
 
 kernel void gdn_scan_f32(
@@ -279,18 +294,6 @@ pub(super) fn gated_delta_rule(inp: &GdnInputs, cfg: &GdnConfig) -> Result<GdnOu
         .map(f32c)
         .transpose()?;
     // New conv state: the last K-1 entries of [conv_state ; tokens] (copies only, no arithmetic).
-    let conv_state = if km1 == 0 {
-        Tensor::zeros((bsz, c, 0), dtype, &dev)?
-    } else {
-        let prev = match &cs {
-            Some(cs) => cs.clone(),
-            None => Tensor::zeros((bsz, c, km1), DType::F32, &dev)?,
-        };
-        Tensor::cat(&[&prev, &xf.transpose(1, 2)?], 2)?
-            .narrow(2, t, km1)?
-            .to_dtype(dtype)?
-            .contiguous()?
-    };
     let w = f32c(inp.conv_weight)?;
     let bias = inp.conv_bias.map(f32c).transpose()?;
     let a = f32c(inp.a)?;
@@ -307,6 +310,9 @@ pub(super) fn gated_delta_rule(inp: &GdnInputs, cfg: &GdnConfig) -> Result<GdnOu
     let n_out = bsz * t * hv * dv;
     let n_state = bsz * hv * dk * dv;
     let conv_buf = m.new_buffer(n_conv, DType::F32, "gdn_conv")?;
+    let n_cs = bsz * c * km1;
+    // (width-1 conv: an empty state; the kernel never writes it, the binding still needs a buffer)
+    let cs_buf = m.new_buffer(n_cs.max(1), DType::F32, "gdn_conv_state")?;
     let out_buf = m.new_buffer(n_out, DType::F32, "gdn_out")?;
     let s_buf = m.new_buffer(n_state, DType::F32, "gdn_state")?;
     let conv_params = GdnConvParams {
@@ -348,6 +354,7 @@ pub(super) fn gated_delta_rule(inp: &GdnInputs, cfg: &GdnConfig) -> Result<GdnOu
             e.set_input_buffer(i, Some(buf), *off);
         }
         e.set_output_buffer(4, Some(&conv_buf), 0);
+        e.set_output_buffer(6, Some(&cs_buf), 0);
         e.set_bytes(5, &conv_params);
         e.dispatch_thread_groups(
             MTLSize {
@@ -389,6 +396,17 @@ pub(super) fn gated_delta_rule(inp: &GdnInputs, cfg: &GdnConfig) -> Result<GdnOu
             BackpropOp::none(),
             false,
         )
+    };
+    let conv_state = if km1 == 0 {
+        Tensor::zeros((bsz, c, 0), dtype, &dev)?
+    } else {
+        Tensor::from_storage(
+            Storage::Metal(MetalStorage::new(cs_buf, m.clone(), n_cs, DType::F32)),
+            (bsz, c, km1),
+            BackpropOp::none(),
+            false,
+        )
+        .to_dtype(dtype)?
     };
     Ok(GdnOutput {
         out: mk(out_buf, n_out, (bsz, t, hv, dv)).to_dtype(dtype)?,
