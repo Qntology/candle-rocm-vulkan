@@ -287,6 +287,13 @@ fn gpu() -> Option<Device> {
             return Some(d);
         }
     }
+    // Metal: native scan kernel (after its self-check); Vulkan with host-shared memory: the CPU
+    // kernel on the device tensors.
+    for d in [Device::new_metal(0), Device::new_vulkan(0)].into_iter().flatten() {
+        if fused_gdn_supported(&d) {
+            return Some(d);
+        }
+    }
     None
 }
 
