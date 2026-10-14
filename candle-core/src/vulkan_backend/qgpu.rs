@@ -1252,6 +1252,84 @@ fn mirror_of(rhs: &VulkanStorage, force: bool) -> Option<Arc<GpuBuf>> {
     Some(buf)
 }
 
+/// Fixed GPU mode on host-shared memory: weight matmuls with at most this many rows
+/// (`CANDLE_VULKAN_HOST_SMALL_M`, 0 = off) run on the host instead of one GPU round trip each,
+/// for the weight shapes whose host results are bit-identical to the GPU kernel's
+/// ([`host_route_ok`]), so the rows still do not depend on the batch they are in.
+fn host_small_m() -> usize {
+    static V: OnceLock<usize> = OnceLock::new();
+    *V.get_or_init(|| {
+        std::env::var("CANDLE_VULKAN_HOST_SMALL_M")
+            .ok()
+            .and_then(|v| v.trim().parse().ok())
+            .unwrap_or(32)
+    })
+}
+
+thread_local! {
+    static HOST_ROUTE_CHECK: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Whether the host matmul of the fixed modes (`host_matmul_row_invariant`) gives the bits of
+/// the GPU GEMM kernel for this F32 weight: both run one k-ordered multiply-add chain per output
+/// element (measured on Apple Silicon: CPU, MoltenVK and Metal give the same digest). Checked
+/// once per (device, K, N, weight strides) on 16 rows of the real weight; a difference keeps
+/// that shape on the GPU.
+fn host_route_ok(
+    lhs: &VulkanStorage,
+    rhs: &VulkanStorage,
+    (n, k): (usize, usize),
+    (sbk, sbn, w_off): (usize, usize, usize),
+) -> bool {
+    type Key = (usize, usize, usize, usize, usize);
+    static CACHE: OnceLock<Mutex<std::collections::HashMap<Key, bool>>> = OnceLock::new();
+    let dev = &lhs.device;
+    let key = (dev.ctx() as *const VulkanContext as usize, k, n, sbk, sbn);
+    let cache = CACHE.get_or_init(|| Mutex::new(std::collections::HashMap::new()));
+    if let Some(ok) = cache.lock().ok().and_then(|g| g.get(&key).copied()) {
+        return ok;
+    }
+    let rows = 16usize;
+    let check = || -> Result<bool> {
+        let mut x = 0x9E37_79B9_7F4A_7C15u64;
+        let data: Vec<f32> = (0..rows * k)
+            .map(|_| {
+                x ^= x << 13;
+                x ^= x >> 7;
+                x ^= x << 17;
+                ((x >> 40) as f32 / (1u64 << 24) as f32 * 4.0) - 2.0
+            })
+            .collect();
+        let cpu = crate::CpuStorage::F32(data);
+        let lhs_g = dev.storage_from_cpu_storage(&cpu)?;
+        let lhs_t = Layout::contiguous((1, rows, k));
+        let rhs_t = Layout::new(crate::Shape::from((1, k, n)), vec![0, sbk, sbn], w_off);
+        HOST_ROUTE_CHECK.with(|f| f.set(true));
+        let gpu = dense_matmul(&lhs_g, rhs, (1, rows, n, k), &lhs_t, &rhs_t);
+        HOST_ROUTE_CHECK.with(|f| f.set(false));
+        let Some(gpu) = gpu? else { return Ok(false) };
+        let host = super::host_matmul_row_invariant(&cpu, &rhs.host_view(), (1, rows, n, k), &lhs_t, &rhs_t)?;
+        let g = gpu.host_view();
+        Ok(match (&*g, &host) {
+            (crate::CpuStorage::F32(a), crate::CpuStorage::F32(b)) => {
+                a.len() >= b.len() && a[..b.len()].iter().zip(b).all(|(x, y)| x.to_bits() == y.to_bits())
+            }
+            _ => false,
+        })
+    };
+    let ok = check().unwrap_or(false);
+    eprintln!(
+        "[VK-HOST-SMALL-M] weight {k}x{n}: host bits {} the GPU kernel's -> rows <= {} {}",
+        if ok { "==" } else { "!=" },
+        host_small_m(),
+        if ok { "run on the host" } else { "stay on the GPU" }
+    );
+    if let Ok(mut g) = cache.lock() {
+        g.insert(key, ok);
+    }
+    ok
+}
+
 pub(crate) fn dense_matmul(
     lhs: &VulkanStorage,
     rhs: &VulkanStorage,
@@ -1294,6 +1372,15 @@ pub(crate) fn dense_matmul(
         return Ok(None);
     }
     let ctx = dev.ctx();
+    if fixed
+        && unified(ctx)
+        && lhs.dtype == DType::F32
+        && (2..=host_small_m()).contains(&big_m)
+        && !HOST_ROUTE_CHECK.with(|f| f.get())
+        && host_route_ok(lhs, rhs, (n, k), (sbk, sbn, w_off))
+    {
+        return Ok(None);
+    }
     let mirror = if unified(ctx) {
         None
     } else {
