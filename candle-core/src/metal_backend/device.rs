@@ -252,6 +252,11 @@ impl MetalDevice {
     /// allocates the buffer and copies over the existing data before returning the MTLBuffer.
     pub fn new_buffer_with_data<T>(&self, data: &[T]) -> Result<Arc<Buffer>> {
         let size = core::mem::size_of_val(data);
+        if size == 0 {
+            // newBufferWithBytes returns nil for a zero length: an empty tensor gets a pooled
+            // buffer like the other allocations (allocate_buffer rounds 0 up to 1 byte).
+            return self.allocate_buffer(0);
+        }
         let new_buffer = self
             .device
             .new_buffer_with_data(data.as_ptr().cast(), size, RESOURCE_OPTIONS)
