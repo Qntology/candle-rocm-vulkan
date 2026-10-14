@@ -6,9 +6,13 @@
 //! `beta = sigmoid(b)` and `g = neg_a * softplus(a + dt_bias)`, and the sequential gated delta
 //! rule scan with the recurrent state kept on chip. The CPU implementation (rayon over
 //! (batch, value head)) follows the transformers reference
-//! (`torch_recurrent_gated_delta_rule`) operation by operation and is the test oracle. Vulkan
-//! and Metal return an error ([`fused_gdn_supported`] is false) so that callers keep their
-//! tensor-op path.
+//! (`torch_recurrent_gated_delta_rule`) operation by operation and is the test oracle.
+//! Vulkan devices whose tensors live in host-shared memory (Apple Silicon under MoltenVK,
+//! integrated GPUs, lavapipe) run that CPU kernel on the device tensors: the tensor path costs
+//! one GPU round trip per op there. Metal runs a native scan kernel (`delta_rule/metal_gdn.rs`)
+//! after the convolution and the norms in tensor ops, enabled per device by a self-check
+//! against the CPU kernel. Other devices return an error ([`fused_gdn_supported`] is false)
+//! so that callers keep their tensor-op path.
 
 #[cfg(any(feature = "cuda", feature = "rocm"))]
 use crate::accel::delta::{self as gd, GdnScanArgs};
@@ -18,6 +22,9 @@ use crate::{bail, DType, Device, Result, Tensor};
 use rayon::prelude::*;
 
 pub use crate::accel::delta::GDN_MAX_HEAD_K_DIM;
+
+#[cfg(feature = "metal")]
+mod metal_gdn;
 
 /// Which key head a value head reads when there are more value heads than key heads.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -112,9 +119,9 @@ pub struct GdnOutput {
     pub recurrent_state: Tensor,
 }
 
-/// Whether [`fused_gated_delta_rule`] / [`fused_gated_rms_norm`] have a native implementation
-/// on `device` (CPU, and CUDA / ROCm builds that carry the kernels). Callers keep their tensor
-/// path when this is false.
+/// Whether [`fused_gated_delta_rule`] has a native implementation on `device` (CPU, CUDA / ROCm
+/// builds that carry the kernels, Vulkan devices with host-shared memory, Metal devices that
+/// pass the scan kernel's self-check). Callers keep their tensor path when this is false.
 pub fn fused_gdn_supported(device: &Device) -> bool {
     match device {
         Device::Cpu => true,
@@ -123,6 +130,10 @@ pub fn fused_gdn_supported(device: &Device) -> bool {
         Device::Rocm(_) => !crate::rocm_backend::kernels::Module::DeltaRule
             .image()
             .is_empty(),
+        #[cfg(feature = "vulkan")]
+        Device::Vulkan(v) => v.host_shared_memory(),
+        #[cfg(feature = "metal")]
+        Device::Metal(m) => metal_gdn::self_check(m),
         _ => false,
     }
 }
@@ -132,7 +143,7 @@ pub fn fused_gdn_supported(device: &Device) -> bool {
 pub fn fused_gdn_supported_for(device: &Device, cfg: &GdnConfig) -> bool {
     fused_gdn_supported(device)
         && cfg.validate().is_ok()
-        && (device.is_cpu() || cfg.head_k_dim <= GDN_MAX_HEAD_K_DIM)
+        && (device.is_cpu() || device.is_vulkan() || cfg.head_k_dim <= GDN_MAX_HEAD_K_DIM)
 }
 
 fn float_dtype(dtype: DType, what: &str) -> Result<()> {
@@ -278,6 +289,10 @@ pub fn fused_gated_delta_rule(
         Device::Cpu => cpu::gated_delta_rule(&inputs, cfg),
         #[cfg(any(feature = "cuda", feature = "rocm"))]
         Device::Cuda(_) | Device::Rocm(_) => gpu_gated_delta_rule(&inputs, cfg),
+        #[cfg(feature = "vulkan")]
+        Device::Vulkan(v) if v.host_shared_memory() => host_gated_delta_rule(&inputs, cfg),
+        #[cfg(feature = "metal")]
+        Device::Metal(_) => metal_gdn::gated_delta_rule(&inputs, cfg),
         d => bail!(
             "gated delta rule: no fused implementation on {:?}, use the tensor path",
             d.location()
@@ -295,6 +310,47 @@ struct GdnInputs<'a> {
     neg_a: &'a Tensor,
     dt_bias: &'a Tensor,
     recurrent_state: Option<&'a Tensor>,
+}
+
+/// The CPU kernel on the host copies of device tensors (Vulkan with host-shared memory): exact
+/// CPU numerics, one copy in and out instead of one GPU round trip per op of the tensor path.
+#[cfg(feature = "vulkan")]
+fn host_gated_delta_rule(inp: &GdnInputs, cfg: &GdnConfig) -> Result<GdnOutput> {
+    let dev = inp.mixed_qkv.device().clone();
+    let host = |t: &Tensor| t.to_device(&Device::Cpu);
+    let host_opt = |t: Option<&Tensor>| t.map(host).transpose();
+    let (x, cw, a, b, na, dtb) = (
+        host(inp.mixed_qkv)?,
+        host(inp.conv_weight)?,
+        host(inp.a)?,
+        host(inp.b)?,
+        host(inp.neg_a)?,
+        host(inp.dt_bias)?,
+    );
+    let (cb, cs, st) = (
+        host_opt(inp.conv_bias)?,
+        host_opt(inp.conv_state)?,
+        host_opt(inp.recurrent_state)?,
+    );
+    let o = cpu::gated_delta_rule(
+        &GdnInputs {
+            mixed_qkv: &x,
+            conv_weight: &cw,
+            conv_bias: cb.as_ref(),
+            conv_state: cs.as_ref(),
+            a: &a,
+            b: &b,
+            neg_a: &na,
+            dt_bias: &dtb,
+            recurrent_state: st.as_ref(),
+        },
+        cfg,
+    )?;
+    Ok(GdnOutput {
+        out: o.out.to_device(&dev)?,
+        conv_state: o.conv_state.to_device(&dev)?,
+        recurrent_state: o.recurrent_state.to_device(&dev)?,
+    })
 }
 
 /// `t` with a unit stride on its last dim; returns it with (offset, stride 0, stride 1).

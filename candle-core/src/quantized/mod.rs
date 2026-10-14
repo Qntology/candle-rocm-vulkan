@@ -979,6 +979,16 @@ impl QTensor {
             _ => {
                 // The CPU backend has no bf16 matmul: bf16 prefill runs in f32 there.
                 let cpu_bf16 = dtype == DType::BF16 && xs.device().is_cpu();
+                // f16 on the CPU (and on Vulkan, whose f16 matmul runs on the host gemm): the gemm
+                // crate's f16 kernel accumulates in f16 on AArch64 with FEAT_FP16 (Apple Silicon:
+                // max_rel 5.7e-3 vs 5.1e-4 on x86 in w8a16_generic_cpu / _cuda::vulkan). Keep the
+                // CUDA semantics instead: weight rounded to f16, f32 accumulation.
+                let host_gemm = xs.device().is_cpu() || xs.device().is_vulkan();
+                let cpu_f16 = dtype == DType::F16 && host_gemm && rows > EXACT_MV_MAX_ROWS;
+                if cpu_f16 {
+                    let w = self.dequantize_to(DType::F16, xs.device())?.to_dtype(DType::F32)?;
+                    return linear_forward(&xs.to_dtype(DType::F32)?, &w)?.to_dtype(dtype);
+                }
                 let compute = if rows <= EXACT_MV_MAX_ROWS || cpu_bf16 {
                     DType::F32
                 } else {

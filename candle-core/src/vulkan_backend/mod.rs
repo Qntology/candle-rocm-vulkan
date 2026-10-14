@@ -762,6 +762,13 @@ impl VulkanDevice {
         &self.inner
     }
 
+    /// Whether tensors of this device live in memory the CPU reads at host speed (integrated /
+    /// unified-memory GPUs such as Apple Silicon under MoltenVK, and CPU devices such as
+    /// lavapipe). Host kernels then run on device tensors without a PCIe round trip.
+    pub fn host_shared_memory(&self) -> bool {
+        self.inner.default_native || self.inner.device_type == vk::PhysicalDeviceType::CPU
+    }
+
     pub(crate) fn limits(&self) -> Limits {
         self.inner.limits
     }

@@ -465,11 +465,61 @@ fn debug_choice(q: &Tensor, fused: bool) {
     );
 }
 
+/// Metal: the fused `scaled_dot_product_attention` kernels of candle-metal-kernels (MLX port,
+/// [`crate::ops::sdpa`]: GQA, causal aligned bottom-right like the other backends, one-pass
+/// vector kernel for decode, two-pass above 1024 keys). `None` for the options they do not
+/// cover (sliding windows, ALiBi, soft-capping, FP8, other head dims), which stay unfused.
+#[cfg(feature = "metal")]
+fn metal_sdpa(q: &Tensor, k: &Tensor, v: &Tensor, cfg: &FlashAttnConfig) -> Result<Option<Tensor>> {
+    let causal = match (cfg.window_size_left, cfg.window_size_right) {
+        (None, None) => false,
+        (None, Some(0)) => true,
+        _ => return Ok(None),
+    };
+    if cfg.softcap.is_some() || cfg.alibi_slopes.is_some() {
+        return Ok(None);
+    }
+    let dt = q.dtype();
+    if !matches!(dt, DType::F32 | DType::F16 | DType::BF16) || k.dtype() != dt || v.dtype() != dt {
+        return Ok(None);
+    }
+    let (b, sq, hq, d) = q.dims4()?;
+    let (bk, skv, hkv, dk) = k.dims4()?;
+    if v.dims4()? != (bk, skv, hkv, d) || bk != b || dk != d || hkv == 0 || hq % hkv != 0 || sq == 0 || skv == 0 {
+        return Ok(None);
+    }
+    let head_dim_ok = matches!(d, 32 | 64 | 72 | 80 | 96 | 128 | 256 | 512);
+    if !head_dim_ok || (sq > 1 && d == 512 && dt == DType::F32) || (causal && sq > skv) {
+        return Ok(None);
+    }
+    let bhsd = |x: &Tensor| x.transpose(1, 2)?.contiguous();
+    let o = crate::ops::sdpa(
+        &bhsd(q)?,
+        &bhsd(k)?,
+        &bhsd(v)?,
+        None,
+        causal && sq > 1,
+        cfg.softmax_scale,
+        1.0,
+    )?;
+    Ok(Some(o.transpose(1, 2)?.contiguous()?))
+}
+
 fn run(q: &Tensor, k: &Tensor, v: &Tensor, op: &FlashAttnOp) -> Result<Tensor> {
     let fused = op
         .cfg
         .fused
         .unwrap_or_else(|| accel::config().flash_attn_allowed(q.device()));
+    #[cfg(feature = "metal")]
+    if fused && q.device().is_metal() {
+        debug_choice(q, true);
+        match metal_sdpa(q, k, v, &op.cfg) {
+            Ok(Some(t)) => return Ok(t),
+            Ok(None) => {}
+            Err(e) if op.cfg.strict => return Err(e),
+            Err(e) => warn_fallback(&e),
+        }
+    }
     let supported = matches!(
         q.device(),
         Device::Cpu | Device::Cuda(_) | Device::Rocm(_) | Device::Vulkan(_)
