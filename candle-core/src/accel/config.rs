@@ -146,6 +146,9 @@ pub struct BackendSwitches {
     pub rocm: bool,
     pub vulkan: bool,
     pub cpu: bool,
+    /// Metal: FlashAttention runs the fused `scaled_dot_product_attention` kernels of
+    /// candle-metal-kernels (no TurboQuant kernels on Metal).
+    pub metal: bool,
 }
 
 impl Default for BackendSwitches {
@@ -161,6 +164,7 @@ impl BackendSwitches {
             rocm: true,
             vulkan: true,
             cpu: true,
+            metal: true,
         }
     }
 
@@ -170,6 +174,7 @@ impl BackendSwitches {
             rocm: false,
             vulkan: false,
             cpu: false,
+            metal: false,
         }
     }
 
@@ -188,6 +193,7 @@ impl BackendSwitches {
                 "rocm" | "hip" | "amd" => out.rocm = true,
                 "vulkan" | "vk" => out.vulkan = true,
                 "cpu" => out.cpu = true,
+                "metal" | "mps" | "apple" => out.metal = true,
                 _ => return Err(format!("unknown backend {part:?} in {s:?}")),
             }
         }
@@ -200,6 +206,8 @@ impl BackendSwitches {
             crate::Device::Cuda(_) => self.cuda,
             crate::Device::Rocm(_) => self.rocm,
             crate::Device::Vulkan(_) => self.vulkan,
+            crate::Device::Metal(_) => self.metal,
+            #[allow(unreachable_patterns)]
             _ => false,
         }
     }
@@ -445,9 +453,11 @@ impl AccelConfig {
             && (device.is_cpu() || FLASH_ATTN_COMPILED)
     }
 
-    /// Whether the TurboQuant GPU kernels may run on `device`.
+    /// Whether the TurboQuant GPU kernels may run on `device` (there are no Metal kernels).
     pub fn turbo_quant_kernels_allowed(&self, device: &crate::Device) -> bool {
-        self.turbo_quant.backends.allows(device) && (device.is_cpu() || TURBO_QUANT_COMPILED)
+        self.turbo_quant.backends.allows(device)
+            && !device.is_metal()
+            && (device.is_cpu() || TURBO_QUANT_COMPILED)
     }
 }
 
