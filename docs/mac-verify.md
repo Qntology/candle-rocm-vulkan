@@ -133,12 +133,18 @@ PKG_CONFIG_PATH=$P PKG_CONFIG_ALLOW_CROSS=1 RUSTONIG_SYSTEM_LIBONIG=1 \
   - 장치 메모리가 곧 시스템 RAM이라 free 반환 측정이 의미가 없습니다.
 - 전역 상태를 바꾸는 테스트는 `#[ignore]`로 두고 `--test-threads 1`로 단독 실행합니다.
   - 해당 테스트: accel 설정, GDN override, 장치 전체 메모리 측정.
+- **가상 러너의 시간은 런마다 1.2~2배 흔들립니다.** 코드가 그대로인 CPU 융합 GDN이 21.0 → 25.3 · 40.0 ms, MoltenVK GDN 텐서 경로 디코드가 2.03 → 3.47 ms로 변했습니다.
+  - 런 사이 절대 시간 비교로 회귀를 판단하지 않습니다. 같은 잡 안의 비율과, 바뀌지 않은 경로의 기준 시간을 함께 봅니다.
+  - 두 경로의 단건 지연은 한쪽씩 몰아서 재지 않고 번갈아 재서 중앙값을 씁니다. 몰아서 잰 평균은 순간 지연이 한쪽에만 실려 57.0 / 97.6 ms처럼 뒤집힌 결과가 나왔습니다(같은 런 조건에서 번갈아 재면 87.9 / 76.8 ms).
+- **시드 없는 무작위 입력 + 경계에 가까운 기준은 가끔 실패합니다.** `half_kv_storage_error_is_small`(앱)은 약 0.5% 확률로 2e-3을 넘었습니다. 고정 시드로 바꿨습니다.
 
 ### 1-7. CI 운영 원칙 (사용자 합의)
 
 - 건너뛴 실행은 통과가 아닙니다. 측정 줄이 없으면 `require_measured`가 PASS를 NOT RUN으로 바꿉니다.
 - **중복 테스트를 하지 않습니다.**
-  - 바뀐 경로만 다시 돌립니다. dispatch 입력: `phases`, `app`, `fork`, `embed_backends`, `embed_compare`, `accel_tests`, `full`.
+  - 바뀐 경로만 다시 돌립니다. dispatch 입력: `phases`, `app`, `fork`, `fork_tests`, `embed_backends`, `real_backends`, `embed_compare`(1 · 0 · `speed`), `accel_tests`, `runner`, `full`.
+  - `embed_compare=speed`는 기본 정책의 속도 · 비트 동일 테스트만 돌립니다(판정 테스트 제외).
+- 포크 브랜치가 master에 병합되면 logis-center의 패치 시리즈 일부가 이미 master에 있게 됩니다. `apply-fork-patches.sh`는 patch-id가 master 커밋과 같은 패치를 건너뜁니다. 시리즈는 항상 `-o` 절대 경로로 다시 만듭니다.
   - CPU 측정은 Metal · Vulkan 잡 안에서 함께 하므로 CPU 잡의 accel 단계는 건너뜁니다.
   - 포크 GDN 테스트는 GPU 잡에서 GPU 케이스만 돌립니다. f64 기준과 호스트 에뮬레이션은 CPU 잡에서 돌립니다.
 - 앱 잡은 단계마다 별도 step과 timeout을 둡니다(build 70, suite 30, embed 75, bench 30, real 50, accel 90분). 늦은 단계가 앞 결과를 잃지 않게 하기 위해서입니다.
@@ -154,14 +160,15 @@ PKG_CONFIG_PATH=$P PKG_CONFIG_ALLOW_CROSS=1 RUSTONIG_SYSTEM_LIBONIG=1 \
 | `d0121b1` | 행 불변성 테스트(M 1..300 · 위치 · 스레드) + `device_probe` 예제 | ✅ PR #10 |
 | `91a7ab2` | MoltenVK: portability enumeration · portability_subset · 로더 경로 | ✅ PR #10 |
 | `30e502f` | Metal `Device::mem_info` = recommendedMaxWorkingSetSize − currentAllocatedSize | ✅ PR #10 |
-| `c663a23` | GLSL `barrier()` → 워크그룹 배리어 | 브랜치만 |
-| `c1de501` | CPU f16 `forward_exact` 프리필 f32 누산 | 브랜치만 |
-| `a08ba34` | Vulkan tests: GPU 상주 Q8_0 = 정확한 W8A32, Vulkan f16 `forward_exact` f32 누산 | 브랜치만 |
-| `3ad5050` | **Metal FlashAttention → fused sdpa 커널** (MLX 포트, GQA, causal 오른쪽 아래 정렬, 디코드 vector / 1024키 초과 2-pass). `BackendSwitches.metal`. TurboQuant는 Metal에서 계속 꺼둠 | 브랜치만 |
-| `f947435` | **Gated DeltaNet 융합 경로**: Vulkan(`host_shared_memory()`)은 CPU 커널을 장치 텐서 위에서 실행, Metal은 네이티브 스캔(자가 점검 후 사용). `delta_rule_tests`의 GPU 케이스가 Metal · Vulkan에서도 돎 | 브랜치만 |
-| `51e2256` | **Vulkan 고정 GPU 모드: 작은 M(2..=32, `CANDLE_VULKAN_HOST_SMALL_M`) F32 가중치 matmul은 host로**. 장치 · 형태마다 host 결과 == GPU 결과(비트)일 때만 적용, `[VK-HOST-SMALL-M]` 로그 | 브랜치만 |
-| `806aba6` | **Metal GDN 정밀화**: conv · SiLU · L2 norm · 게이트를 fast math 없는 커널(`gdn_conv_f32`, `gdn_scan_f32`)에서 precise 수학으로, CPU 커널과 같은 갱신 순서 | 브랜치만 |
-| `e4a7314` | **Metal 빈 텐서**: `new_buffer_with_data`가 길이 0을 `newBufferWithBytes`(nil 반환)에 넘기던 것 → 풀 버퍼(`allocate_buffer(0)`) | 브랜치만 |
+| `c663a23` | GLSL `barrier()` → 워크그룹 배리어 | ✅ PR #11 |
+| `c1de501` | CPU f16 `forward_exact` 프리필 f32 누산 | ✅ PR #11 |
+| `a08ba34` | Vulkan tests: GPU 상주 Q8_0 = 정확한 W8A32, Vulkan f16 `forward_exact` f32 누산 | ✅ PR #11 |
+| `3ad5050` | **Metal FlashAttention → fused sdpa 커널** (MLX 포트, GQA, causal 오른쪽 아래 정렬, 디코드 vector / 1024키 초과 2-pass). `BackendSwitches.metal`. TurboQuant는 Metal에서 계속 꺼둠 | ✅ PR #11 |
+| `f947435` | **Gated DeltaNet 융합 경로**: Vulkan(`host_shared_memory()`)은 CPU 커널을 장치 텐서 위에서 실행, Metal은 네이티브 스캔(자가 점검 후 사용). `delta_rule_tests`의 GPU 케이스가 Metal · Vulkan에서도 돎 | ✅ PR #11 |
+| `51e2256` | **Vulkan 고정 GPU 모드: 작은 M(2..=32, `CANDLE_VULKAN_HOST_SMALL_M`) F32 가중치 matmul은 host로**. 장치 · 형태마다 host 결과 == GPU 결과(비트)일 때만 적용, `[VK-HOST-SMALL-M]` 로그 | ✅ PR #11 |
+| `806aba6` | **Metal GDN 정밀화**: conv · SiLU · L2 norm · 게이트를 fast math 없는 커널(`gdn_conv_f32`, `gdn_scan_f32`)에서 precise 수학으로, CPU 커널과 같은 갱신 순서 | ✅ PR #11 |
+| `e4a7314` | **Metal 빈 텐서**: `new_buffer_with_data`가 길이 0을 `newBufferWithBytes`(nil 반환)에 넘기던 것 → 풀 버퍼(`allocate_buffer(0)`) | ✅ PR #11 |
+| `a633c43` | **Metal GDN 디코드 디스패치 감소**: conv 커널(`gdn_conv_f32`)이 새 conv 상태도 직접 씀(buffer 6, t==0 스레드). 스텝당 디스패치 2개(conv · scan), conv 상태용 별도 cat/narrow 없음 | 브랜치만 |
 
 ---
 
@@ -171,6 +178,7 @@ PKG_CONFIG_PATH=$P PKG_CONFIG_ALLOW_CROSS=1 RUSTONIG_SYSTEM_LIBONIG=1 \
 |---|---|
 | [38499518771](https://github.com/sungu-che/logis-center/actions/runs/38499518771) | 전체 |
 | [38506246088](https://github.com/sungu-che/logis-center/actions/runs/38506246088) | 포크 개선(`3ad5050` · `f947435` · `51e2256`) 검증 |
+| [38513842101](https://github.com/sungu-che/logis-center/actions/runs/38513842101) | `a633c43`(Metal conv 상태) 검증: fork는 `delta-rule-metal`만 (`fork_tests`) |
 
 ### 3-1. 포크 잡
 
@@ -181,6 +189,7 @@ PKG_CONFIG_PATH=$P PKG_CONFIG_ALLOW_CROSS=1 RUSTONIG_SYSTEM_LIBONIG=1 \
 | fork (metal) 2차 (38506246088) | Metal GDN 자가 점검 통과(max rel 5.4e-7)했지만 **`gpu_matches_f64_reference` · `half_inputs` 실패**(2e-5 허용치, fast math) → `806aba6`으로 정밀화 |
 | fork (metal) 3차 (38508388995) | 정밀화 후 CPU 대비 0~1.2e-7. 같은 두 테스트가 conv 폭 1 케이스에서 `Err`로 끝남: 빈 conv 상태 텐서를 Metal로 보낼 때 길이 0 버퍼 생성 실패 → `e4a7314` |
 | **fork (metal) 4차 ([38508978460](https://github.com/sungu-che/logis-center/actions/runs/38508978460))** | **`delta_rule_tests` 7 pass** (Metal GPU 케이스 전부: dk 64/96/128/256, Tiled, conv 폭 1~5, dv 200, L2 없음, f16/bf16 입력, 디코드 체이닝, transformers 픽스처) |
+| **fork (metal) 5차 ([38513842101](https://github.com/sungu-che/logis-center/actions/runs/38513842101))** | `a633c43` 적용 후 **`delta_rule_tests` 7 pass**, Metal 스캔 자가 점검 max rel 3.3e-7 (conv 상태를 커널이 쓰는 경로) |
 | fork (vulkan, MoltenVK) 1차 | `vulkan_tests` 19/19, `fixed_exec_modes_are_batch_invariant`, `vulkan_accel_tests` 3/3, candle-nn `accel_vulkan` 4/4, `w8a16_generic_cuda::vulkan`. Gpu · Host · Auto M-불변성 불일치 0, digest `4bfc0461001d5039` |
 | fork (vulkan) 2차 (38506246088) | **전부 통과.** `[VK-HOST-SMALL-M]` 384×1152 · 384×384 · 384×3072 · 1536×384 모두 host == GPU → host 경로 사용. 그 상태로 M-불변성 불일치 0, `vulkan_tests` 19/19, **`delta_rule_tests`(Vulkan GPU 케이스) 7 pass** |
 
@@ -253,6 +262,17 @@ PKG_CONFIG_PATH=$P PKG_CONFIG_ALLOW_CROSS=1 RUSTONIG_SYSTEM_LIBONIG=1 \
 | suite | 194 pass |
 | SSD 오프로드 콜드 읽기 | std::fs 399 MB/s → 병렬 F_NOCACHE 10.1 GB/s, 캐시 증가 +0 MB |
 
+**개선 4건 (38513842101 · 38516449786 · 38520324489, 포크 master + `a633c43`)**
+
+| 항목 | 결과 |
+|---|---|
+| Metal GDN (`a633c43`) | 융합 프리필 23.5 ms · 디코드 1.15 ms/스텝, 같은 잡 텐서 경로 대비 7.15배 · 4.97배, 오차 ≤ 7.3e-7 |
+| MoltenVK GDN | 융합 프리필 18.9 ms · 디코드 0.95 ms/스텝, 텐서 경로 대비 38.78배 · 3.65배, CPU 커널과 오차 0 |
+| 앱 CPU 실모델 (병렬 원소 연산, 같은 비트) | 전체 0.94배 → 1.39배, 짧은 구 1.57배 → 3.00배, 단건 중앙값 87.9 / 76.8 ms(손해 없음), 비트 동일 320/320, 판정 150/150 |
+| 목업 Qwen3.5 KV (Metal · MoltenVK) | Ram↔Vram 차이 0, GDN 상태 장치 유지, SSD 계층 top-1 4/4, TurboQuant 압축 KV(MoltenVK) top-1 4/4 |
+| 모델 언로드 (Metal · MoltenVK) | 장치 free 시작 대비 +0 MB, RSS 둘째 사이클 +23 · +27 MB |
+| suite | Metal 196, MoltenVK 214, CPU 195 pass |
+
 ---
 
 ## 4. 리눅스 테스트 결과 (클라우드 VM)
@@ -275,4 +295,6 @@ PKG_CONFIG_PATH=$P PKG_CONFIG_ALLOW_CROSS=1 RUSTONIG_SYSTEM_LIBONIG=1 \
 - [x] Metal GDN 정밀화 · 빈 버퍼 수정: app Metal 통과(38508388995), fork Metal `delta_rule_tests` 7 pass(38508978460).
 - 이 브랜치의 수정은 모두 macOS에서 검증됐습니다.
 - 포크 master 반영(PR)은 저장소 관리자가 정합니다. 앱의 git 의존(Qntology master)에 들어가야 CI 밖 빌드에도 반영됩니다.
-- 측정만 하고 개선하지 않은 것: 가상 GPU에서는 GDN 디코드가 CPU 융합 커널보다 느린 경우가 있습니다(동기화 비용). 실제 Apple GPU 측정이 필요합니다.
+- [x] PR #11로 `c663a23`~`e4a7314`가 master에 반영됨. 남은 브랜치 커밋은 `a633c43` 하나(fork Metal 7 pass, 38513842101).
+- [x] 개선 4건 Mac 검증 완료(38513842101 · 38516449786 · 38520324489, 3-2절). FP8 강등 · VRAM 재압축 · kv_half는 CUDA/ROCm 전용이라 Mac · 리눅스 VM에서 실행할 수 없습니다.
+- GDN 디코드(가상 GPU): `a633c43`으로 스텝당 디스패치를 2개로 줄였습니다. 가상 GPU의 동기화 비용은 실제 Apple GPU와 다르므로, 속도 판단은 셀프호스티드 Apple Silicon 러너에서 합니다(logis-center `mac-verify.yml`의 `runner` 입력에 그 라벨).
