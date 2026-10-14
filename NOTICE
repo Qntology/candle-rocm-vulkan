@@ -33,7 +33,15 @@ texts are in the licenses/ directory.
    Applies to: hip-sys/, hip-runtime/, candle-backend/, kernels/, poc/,
                candle-core/src/rocm_backend/, candle-core/kernels/
 
-Modifications by Qntology (2026) include: the merge of the three code bases
+4. candle-kernels 0.11.0 (CUDA kernels for candle-core)
+   https://github.com/huggingface/candle (crate candle-kernels on crates.io)
+   Copyright Hugging Face, Inc. and the candle contributors.
+   Licensed under "MIT OR Apache-2.0"; used here under the Apache License 2.0.
+   License texts: licenses/LICENSE-APACHE-2.0.txt, licenses/LICENSE-MIT-candle.txt
+   Applies to: candle-kernels/ (a copy of the crates.io release; the changes made
+               to it are listed in candle-kernels/FORK-NOTES.md)
+
+Modifications by Qntology (2026) include: the merge of the first three code bases
 into one candle 0.11 workspace, GPU-resident Q8_0 weights and Q8 GEMV/GEMM
 kernels for Vulkan (candle-core/src/vulkan_backend/qgpu.rs), Vulkan device and
 queue selection, ROCm memory-pool and runtime-cache management, and related
