@@ -12,6 +12,37 @@
 
 ---
 
+## 0. 개발 진행 방식 — 개발은 리눅스에서, 실제 검증만 GitHub Mac에서
+
+Mac 러너 1회는 빌드 포함 1~4시간이 걸리고, 결과는 잡이 끝나야 보입니다. 그래서 **코드 작성 · 타입 검사 · 돌릴 수 있는 테스트는 전부 리눅스 VM에서 끝냅니다.** Mac에서만 확인할 수 있는 것(실제 Metal · MoltenVK 장치에서의 실행, 수치, 속도)만 GitHub macOS 러너로 보냅니다.
+
+| 단계 | 어디서 | 무엇을 |
+|---|---|---|
+| 1. 구현 | 리눅스 VM | 포크(`../candle-rocm-vulkan`)와 앱을 수정합니다. 앱은 로컬에서만 path 의존으로 포크를 봅니다(커밋 금지) |
+| 2. 타입 검사 | 리눅스 VM | 바뀐 모든 대상을 `cargo check`합니다. CPU: `-p candle-core` · `-p candle-nn`. Vulkan: `--features vulkan`. **Metal: `--target aarch64-apple-darwin --features metal`**(1-5절, 링크 없이 Rust 쪽 오류를 다 잡음). 앱: `--test it` + 필요한 feature |
+| 3. 리눅스 실행 검증 | 리눅스 VM | CPU 경로 테스트, lavapipe(`CANDLE_VULKAN_ALLOW_CPU=1`)로 Vulkan 경로의 **정확성**. lavapipe는 CPU 장치라 속도 · 메모리 반환은 대표하지 않습니다 |
+| 4. 커밋 · push | 리눅스 VM | 포크 `claude/mac-verify` push → logis-center `patches/` 재생성(`format-patch origin/master..claude/mac-verify`) → logis-center 커밋에 **`[skip ci]`** (push로 전체 런이 돌지 않게) |
+| 5. Mac 검증 1회 | GitHub macOS | **바뀐 경로만** dispatch합니다. 예: `gh api -X POST repos/sungu-che/logis-center/actions/workflows/mac-verify.yml/dispatches -f ref=claude/mac-verify -f 'inputs[phases]=accel' -f 'inputs[app]="metal"' -f 'inputs[fork]="metal"' -f 'inputs[accel_tests]=gdn,qwen4' -f 'inputs[full]=false'` |
+| 6. 결과 읽기 | 리눅스 VM | 잡이 끝날 때마다 `gh api repos/sungu-che/logis-center/check-runs/<job-id>/annotations`로 읽습니다(로그 · 아티팩트는 403). 오래 막아 두는 대기 대신 주기적으로 확인합니다 |
+| 7. 판단 | — | 통과하면 문서(logis-center `docs/mac-verify.md`, 이 파일)에 수치를 기록하고 끝냅니다. 실패하면 원인을 annotation에서 찾아 1단계로 돌아갑니다. 같은 테스트를 그대로 다시 돌리지 않습니다 |
+
+Mac에서만 확인할 수 있는 것과 리눅스에서 끝내는 것:
+
+| 리눅스 VM에서 끝냄 | GitHub Mac에서만 |
+|---|---|
+| Rust 컴파일 · 타입 오류 (macOS 대상 Metal 코드 포함) | MSL 소스 컴파일(런타임 `new_library_with_source`), GLSL → MoltenVK 변환 |
+| CPU 경로의 정확성 · 비트 동일성 (x86) | aarch64 NEON 결과, Apple Silicon digest |
+| Vulkan 경로의 정확성 (lavapipe) | MoltenVK · Metal 실제 실행 · 수치 · 속도 |
+| 테스트 · CI 스크립트 문법 (`bash -n`, `actionlint`) | 장치 메모리 반환(통합 메모리), 실모델 다운로드가 필요한 판정 일치 |
+
+이번 작업에서 이 원칙을 지키지 않아 생긴 문제와 그 교훈:
+- **Metal 코드를 Mac에서 처음 컴파일:** 리눅스에서 macOS 대상으로 타입 검사할 수 있었습니다(1-5절). 그전에는 Mac 런에서 처음 오류를 봐서 왕복이 늘었습니다.
+- **같은 테스트를 여러 번 돌림:** 전체 런을 반복해 Mac 러너 시간을 낭비했습니다. 이제 dispatch 입력으로 바뀐 백엔드 · 단계 · 항목만 고릅니다.
+- **debug 빌드 앱 테스트 시간으로 커널 속도를 판단:** 그 결과 macOS packed CPU 커널 기본 ON을 넣었다가 되돌렸습니다. 속도 판단은 release 벤치로 합니다.
+- **Mac에서만 보이는 수치 문제:** Metal fast math로 생긴 오차는 Mac에서만 보입니다. 새 Metal 커널은 처음부터 정밀 수학과 런타임 자가 점검을 같이 넣습니다.
+
+---
+
 ## 1. 개발 환경 — 알아두어야 할 것
 
 ### 1-1. 작업 구성
