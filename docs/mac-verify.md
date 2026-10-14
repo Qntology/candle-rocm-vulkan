@@ -133,12 +133,18 @@ PKG_CONFIG_PATH=$P PKG_CONFIG_ALLOW_CROSS=1 RUSTONIG_SYSTEM_LIBONIG=1 \
   - 장치 메모리가 곧 시스템 RAM이라 free 반환 측정이 의미가 없습니다.
 - 전역 상태를 바꾸는 테스트는 `#[ignore]`로 두고 `--test-threads 1`로 단독 실행합니다.
   - 해당 테스트: accel 설정, GDN override, 장치 전체 메모리 측정.
+- **가상 러너의 시간은 런마다 1.2~2배 흔들립니다.** 코드가 그대로인 CPU 융합 GDN이 21.0 → 25.3 · 40.0 ms, MoltenVK GDN 텐서 경로 디코드가 2.03 → 3.47 ms로 변했습니다.
+  - 런 사이 절대 시간 비교로 회귀를 판단하지 않습니다. 같은 잡 안의 비율과, 바뀌지 않은 경로의 기준 시간을 함께 봅니다.
+  - 두 경로의 단건 지연은 한쪽씩 몰아서 재지 않고 번갈아 재서 중앙값을 씁니다. 몰아서 잰 평균은 순간 지연이 한쪽에만 실려 57.0 / 97.6 ms처럼 뒤집힌 결과가 나왔습니다(같은 런 조건에서 번갈아 재면 87.9 / 76.8 ms).
+- **시드 없는 무작위 입력 + 경계에 가까운 기준은 가끔 실패합니다.** `half_kv_storage_error_is_small`(앱)은 약 0.5% 확률로 2e-3을 넘었습니다. 고정 시드로 바꿨습니다.
 
 ### 1-7. CI 운영 원칙 (사용자 합의)
 
 - 건너뛴 실행은 통과가 아닙니다. 측정 줄이 없으면 `require_measured`가 PASS를 NOT RUN으로 바꿉니다.
 - **중복 테스트를 하지 않습니다.**
-  - 바뀐 경로만 다시 돌립니다. dispatch 입력: `phases`, `app`, `fork`, `embed_backends`, `embed_compare`, `accel_tests`, `full`.
+  - 바뀐 경로만 다시 돌립니다. dispatch 입력: `phases`, `app`, `fork`, `fork_tests`, `embed_backends`, `real_backends`, `embed_compare`(1 · 0 · `speed`), `accel_tests`, `runner`, `full`.
+  - `embed_compare=speed`는 기본 정책의 속도 · 비트 동일 테스트만 돌립니다(판정 테스트 제외).
+- 포크 브랜치가 master에 병합되면 logis-center의 패치 시리즈 일부가 이미 master에 있게 됩니다. `apply-fork-patches.sh`는 patch-id가 master 커밋과 같은 패치를 건너뜁니다. 시리즈는 항상 `-o` 절대 경로로 다시 만듭니다.
   - CPU 측정은 Metal · Vulkan 잡 안에서 함께 하므로 CPU 잡의 accel 단계는 건너뜁니다.
   - 포크 GDN 테스트는 GPU 잡에서 GPU 케이스만 돌립니다. f64 기준과 호스트 에뮬레이션은 CPU 잡에서 돌립니다.
 - 앱 잡은 단계마다 별도 step과 timeout을 둡니다(build 70, suite 30, embed 75, bench 30, real 50, accel 90분). 늦은 단계가 앞 결과를 잃지 않게 하기 위해서입니다.
@@ -256,6 +262,17 @@ PKG_CONFIG_PATH=$P PKG_CONFIG_ALLOW_CROSS=1 RUSTONIG_SYSTEM_LIBONIG=1 \
 | suite | 194 pass |
 | SSD 오프로드 콜드 읽기 | std::fs 399 MB/s → 병렬 F_NOCACHE 10.1 GB/s, 캐시 증가 +0 MB |
 
+**개선 4건 (38513842101 · 38516449786 · 38520324489, 포크 master + `a633c43`)**
+
+| 항목 | 결과 |
+|---|---|
+| Metal GDN (`a633c43`) | 융합 프리필 23.5 ms · 디코드 1.15 ms/스텝, 같은 잡 텐서 경로 대비 7.15배 · 4.97배, 오차 ≤ 7.3e-7 |
+| MoltenVK GDN | 융합 프리필 18.9 ms · 디코드 0.95 ms/스텝, 텐서 경로 대비 38.78배 · 3.65배, CPU 커널과 오차 0 |
+| 앱 CPU 실모델 (병렬 원소 연산, 같은 비트) | 전체 0.94배 → 1.39배, 짧은 구 1.57배 → 3.00배, 단건 중앙값 87.9 / 76.8 ms(손해 없음), 비트 동일 320/320, 판정 150/150 |
+| 목업 Qwen3.5 KV (Metal · MoltenVK) | Ram↔Vram 차이 0, GDN 상태 장치 유지, SSD 계층 top-1 4/4, TurboQuant 압축 KV(MoltenVK) top-1 4/4 |
+| 모델 언로드 (Metal · MoltenVK) | 장치 free 시작 대비 +0 MB, RSS 둘째 사이클 +23 · +27 MB |
+| suite | Metal 196, MoltenVK 214, CPU 195 pass |
+
 ---
 
 ## 4. 리눅스 테스트 결과 (클라우드 VM)
@@ -279,4 +296,5 @@ PKG_CONFIG_PATH=$P PKG_CONFIG_ALLOW_CROSS=1 RUSTONIG_SYSTEM_LIBONIG=1 \
 - 이 브랜치의 수정은 모두 macOS에서 검증됐습니다.
 - 포크 master 반영(PR)은 저장소 관리자가 정합니다. 앱의 git 의존(Qntology master)에 들어가야 CI 밖 빌드에도 반영됩니다.
 - [x] PR #11로 `c663a23`~`e4a7314`가 master에 반영됨. 남은 브랜치 커밋은 `a633c43` 하나(fork Metal 7 pass, 38513842101).
+- [x] 개선 4건 Mac 검증 완료(38513842101 · 38516449786 · 38520324489, 3-2절). FP8 강등 · VRAM 재압축 · kv_half는 CUDA/ROCm 전용이라 Mac · 리눅스 VM에서 실행할 수 없습니다.
 - GDN 디코드(가상 GPU): `a633c43`으로 스텝당 디스패치를 2개로 줄였습니다. 가상 GPU의 동기화 비용은 실제 Apple GPU와 다르므로, 속도 판단은 셀프호스티드 Apple Silicon 러너에서 합니다(logis-center `mac-verify.yml`의 `runner` 입력에 그 라벨).
