@@ -1,22 +1,26 @@
-//! Metal Gated DeltaNet: the causal conv, SiLU, q / k L2 norms and the q scale run as tensor
-//! ops (parallel over the tokens), then one native kernel runs the sequential gated delta rule
-//! scan with the gates computed in place. Same semantics as the CPU kernel (the test oracle):
+//! Metal Gated DeltaNet: two native kernels, all math f32 with precise exp / log / divide / sqrt
+//! (the library is built without fast math; candle's own Metal kernels use fast math, whose `exp`
+//! error compounds through the per-token decay over a sequence):
+//!
+//! 1. `gdn_conv_f32`: causal depthwise conv over `[conv_state ; tokens]` (+ bias) and SiLU, one
+//!    thread per (channel, token, batch).
+//! 2. `gdn_scan_f32`: per (value head, batch), one thread per value column holding the `[dk]`
+//!    column of the recurrent state; the threadgroup stages q / k of the token, reduces their
+//!    squared norms (L2 norm, q scale), and every thread runs the CPU kernel's update order:
 //!
 //! ```text
-//! g = neg_a * softplus(a + dt_bias)   (torch threshold 20),  beta = sigmoid(b)
-//! S1 = exp(g) S;  delta = beta (v - S1^T k);  S' = S1 + k delta^T;  o = S'^T q
+//! g = neg_a * softplus(a + dt_bias) (torch threshold 20), beta = sigmoid(b)
+//! S *= exp(g);  m = S^T k;  d = beta (v - m);  S += k d^T;  o = S^T q
 //! ```
 //!
-//! Kernel layout: one thread per value column `j` of a (value head, batch), holding the
-//! `[dk]` column of the recurrent state; the threadgroup stages q / k of the token in
-//! threadgroup memory. A device enables the kernel only after [`self_check`] matched the CPU
-//! kernel; otherwise callers keep the tensor path.
+//! A device enables the kernels only after [`self_check`] matched the CPU kernel (the test
+//! oracle); otherwise callers keep the tensor path.
 
 use super::{cpu, GdnConfig, GdnHeadOrder, GdnInputs, GdnOutput};
 use crate::op::BackpropOp;
 use crate::{bail, DType, Device, Layout, MetalDevice, MetalError, MetalStorage, Result, Storage, Tensor};
 use candle_metal_kernels::metal::{Buffer, ComputeCommandEncoder, ComputePipeline};
-use objc2_metal::MTLSize;
+use objc2_metal::{MTLCompileOptions, MTLSize};
 use std::collections::HashMap;
 use std::sync::{Mutex, OnceLock};
 
@@ -24,70 +28,145 @@ const SRC: &str = r#"
 #include <metal_stdlib>
 using namespace metal;
 
+struct GdnConvParams {
+    uint t;
+    uint c;
+    uint kw;
+    uint has_cs;
+    uint has_bias;
+};
+
 struct GdnScanParams {
     uint t;
+    uint c;
     uint hk;
     uint hv;
     uint dk;
     uint dv;
     uint tiled;
+    uint l2;
+    float eps;
+    float scale;
 };
 
+inline float gdn_sigmoid(float x) {
+    return precise::divide(1.0f, 1.0f + precise::exp(-x));
+}
+
+// log(1 + y) without the cancellation of log(1 + y) for small y (Goldberg).
+inline float gdn_log1p(float y) {
+    const float u = 1.0f + y;
+    return u == 1.0f ? y : precise::log(u) * precise::divide(y, u - 1.0f);
+}
+
+inline float gdn_softplus(float x) {
+    return x > 20.0f ? x : gdn_log1p(precise::exp(x));
+}
+
+kernel void gdn_conv_f32(
+    device const float *x [[buffer(0)]],
+    device const float *cs [[buffer(1)]],
+    device const float *w [[buffer(2)]],
+    device const float *bias [[buffer(3)]],
+    device float *y [[buffer(4)]],
+    constant GdnConvParams &p [[buffer(5)]],
+    uint3 tg [[threadgroup_position_in_grid]],
+    uint3 tl [[thread_position_in_threadgroup]],
+    uint3 tpg [[threads_per_threadgroup]])
+{
+    const uint c = tg.x * tpg.x + tl.x;
+    const uint t = tg.y;
+    const uint b = tg.z;
+    if (c >= p.c) {
+        return;
+    }
+    const uint km1 = p.kw - 1u;
+    float acc = p.has_bias != 0u ? bias[c] : 0.0f;
+    for (uint j = 0u; j < p.kw; ++j) {
+        const uint i = t + j;
+        float xv;
+        if (i < km1) {
+            xv = p.has_cs != 0u ? cs[(ulong(b) * p.c + c) * km1 + i] : 0.0f;
+        } else {
+            xv = x[(ulong(b) * p.t + (i - km1)) * p.c + c];
+        }
+        acc += w[ulong(c) * p.kw + j] * xv;
+    }
+    y[(ulong(b) * p.t + t) * p.c + c] = acc * gdn_sigmoid(acc);
+}
+
 kernel void gdn_scan_f32(
-    device const float *q [[buffer(0)]],
-    device const float *k [[buffer(1)]],
-    device const float *v [[buffer(2)]],
-    device const float *a [[buffer(3)]],
-    device const float *bb [[buffer(4)]],
-    device const float *neg_a [[buffer(5)]],
-    device const float *dt_bias [[buffer(6)]],
-    device const float *s_in [[buffer(7)]],
-    device float *out [[buffer(8)]],
-    device float *s_out [[buffer(9)]],
-    constant GdnScanParams &p [[buffer(10)]],
+    device const float *y [[buffer(0)]],
+    device const float *a [[buffer(1)]],
+    device const float *bb [[buffer(2)]],
+    device const float *neg_a [[buffer(3)]],
+    device const float *dt_bias [[buffer(4)]],
+    device const float *s_in [[buffer(5)]],
+    device float *out [[buffer(6)]],
+    device float *s_out [[buffer(7)]],
+    constant GdnScanParams &p [[buffer(8)]],
     uint3 tg [[threadgroup_position_in_grid]],
     uint3 tl [[thread_position_in_threadgroup]],
     uint3 tpg [[threads_per_threadgroup]])
 {
     threadgroup float qs[GDN_DK_MAX];
     threadgroup float ks[GDN_DK_MAX];
+    threadgroup float red[2 * GDN_TPG_MAX];
     float s[GDN_DK_MAX];
     const uint j = tg.x * tpg.x + tl.x;
     const uint h = tg.y;
     const uint b = tg.z;
     const uint kh = p.tiled != 0u ? h % p.hk : h / (p.hv / p.hk);
     const bool col = j < p.dv;
+    const uint key_dim = p.hk * p.dk;
     const ulong sbase = (ulong(b) * p.hv + h) * p.dk * p.dv;
     for (uint i = 0u; i < p.dk; ++i) {
         s[i] = col ? s_in[sbase + ulong(i) * p.dv + j] : 0.0f;
     }
     for (uint t = 0u; t < p.t; ++t) {
-        const ulong qk = ((ulong(b) * p.t + t) * p.hk + kh) * p.dk;
+        const ulong row = (ulong(b) * p.t + t) * p.c;
+        float pq = 0.0f;
+        float pk = 0.0f;
         for (uint i = tl.x; i < p.dk; i += tpg.x) {
-            qs[i] = q[qk + i];
-            ks[i] = k[qk + i];
+            const float qv = y[row + kh * p.dk + i];
+            const float kv = y[row + key_dim + kh * p.dk + i];
+            qs[i] = qv;
+            ks[i] = kv;
+            pq += qv * qv;
+            pk += kv * kv;
         }
+        red[tl.x] = pq;
+        red[GDN_TPG_MAX + tl.x] = pk;
         threadgroup_barrier(mem_flags::mem_threadgroup);
-        const ulong gi = (ulong(b) * p.t + t) * p.hv + h;
-        const float x = a[gi] + dt_bias[h];
-        const float sp = x > 20.0f ? x : log(1.0f + exp(x));
-        const float eg = exp(neg_a[h] * sp);
-        const float beta = 1.0f / (1.0f + exp(-bb[gi]));
-        if (col) {
-            float kv = 0.0f;
+        float iq = 1.0f;
+        float ik = 1.0f;
+        if (p.l2 != 0u) {
             float sq = 0.0f;
-            float kq = 0.0f;
-            for (uint i = 0u; i < p.dk; ++i) {
-                kv += s[i] * ks[i];
-                sq += s[i] * qs[i];
-                kq += ks[i] * qs[i];
+            float sk = 0.0f;
+            for (uint u = 0u; u < tpg.x; ++u) {
+                sq += red[u];
+                sk += red[GDN_TPG_MAX + u];
             }
-            const ulong vi = gi * p.dv + j;
-            const float delta = beta * (v[vi] - eg * kv);
-            out[vi] = eg * sq + delta * kq;
+            iq = precise::divide(1.0f, precise::sqrt(sq + p.eps));
+            ik = precise::divide(1.0f, precise::sqrt(sk + p.eps));
+        }
+        const ulong gi = (ulong(b) * p.t + t) * p.hv + h;
+        const float g = neg_a[h] * gdn_softplus(a[gi] + dt_bias[h]);
+        const float eg = precise::exp(g);
+        const float beta = gdn_sigmoid(bb[gi]);
+        if (col) {
+            float m = 0.0f;
             for (uint i = 0u; i < p.dk; ++i) {
-                s[i] = eg * s[i] + ks[i] * delta;
+                s[i] *= eg;
+                m += s[i] * (ks[i] * ik);
             }
+            const float d = (y[row + 2u * key_dim + h * p.dv + j] - m) * beta;
+            float o = 0.0f;
+            for (uint i = 0u; i < p.dk; ++i) {
+                s[i] += (ks[i] * ik) * d;
+                o += s[i] * ((qs[i] * iq) * p.scale);
+            }
+            out[gi * p.dv + j] = o;
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }
@@ -99,40 +178,65 @@ kernel void gdn_scan_f32(
 }
 "#;
 
+/// Threads per threadgroup of the scan (value columns per group); also sizes `red`.
+const SCAN_TPG: usize = 64;
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct GdnConvParams {
+    t: u32,
+    c: u32,
+    kw: u32,
+    has_cs: u32,
+    has_bias: u32,
+}
+
 #[repr(C)]
 #[derive(Clone, Copy)]
 struct GdnScanParams {
     t: u32,
+    c: u32,
     hk: u32,
     hv: u32,
     dk: u32,
     dv: u32,
     tiled: u32,
+    l2: u32,
+    eps: f32,
+    scale: f32,
 }
 
-/// The scan pipeline for head_k_dim <= `dk_max` (the state column lives in thread memory).
-fn pipeline(m: &MetalDevice, dk_max: usize) -> Result<ComputePipeline> {
-    static PIPES: OnceLock<Mutex<HashMap<(crate::metal_backend::DeviceId, usize), ComputePipeline>>> =
-        OnceLock::new();
+/// The (conv, scan) pipelines for head_k_dim <= `dk_max` (the scan keeps the state column in
+/// thread memory). Built without fast math.
+fn pipelines(m: &MetalDevice, dk_max: usize) -> Result<(ComputePipeline, ComputePipeline)> {
+    type Key = (crate::metal_backend::DeviceId, usize);
+    static PIPES: OnceLock<Mutex<HashMap<Key, (ComputePipeline, ComputePipeline)>>> = OnceLock::new();
     let pipes = PIPES.get_or_init(|| Mutex::new(HashMap::new()));
     let key = (m.id(), dk_max);
     if let Some(p) = pipes.lock().ok().and_then(|g| g.get(&key).cloned()) {
         return Ok(p);
     }
-    let src = SRC.replace("GDN_DK_MAX", &dk_max.to_string());
+    let src = SRC
+        .replace("GDN_DK_MAX", &dk_max.to_string())
+        .replace("GDN_TPG_MAX", &SCAN_TPG.to_string());
+    let opts = MTLCompileOptions::new();
+    #[allow(deprecated)]
+    opts.setFastMathEnabled(false);
     let lib = m
         .device()
-        .new_library_with_source(&src, None)
+        .new_library_with_source(&src, Some(&*opts))
         .map_err(MetalError::from)?;
-    let func = lib.get_function("gdn_scan_f32", None).map_err(MetalError::from)?;
-    let pipe = m
-        .device()
-        .new_compute_pipeline_state_with_function(&func)
-        .map_err(MetalError::from)?;
+    let make = |name: &str| -> Result<ComputePipeline> {
+        let func = lib.get_function(name, None).map_err(MetalError::from)?;
+        Ok(m.device()
+            .new_compute_pipeline_state_with_function(&func)
+            .map_err(MetalError::from)?)
+    };
+    let p = (make("gdn_conv_f32")?, make("gdn_scan_f32")?);
     if let Ok(mut g) = pipes.lock() {
-        g.insert(key, pipe.clone());
+        g.insert(key, p.clone());
     }
-    Ok(pipe)
+    Ok(p)
 }
 
 fn metal_buffer<'a>(s: &'a Storage, l: &Layout) -> Result<(&'a Buffer, usize)> {
@@ -168,54 +272,27 @@ pub(super) fn gated_delta_rule(inp: &GdnInputs, cfg: &GdnConfig) -> Result<GdnOu
         _ => bail!("gated delta rule: head_k_dim {dk} > 256 has no Metal kernel"),
     };
     let km1 = kw - 1;
-    // Causal depthwise conv over [conv_state ; tokens]: out[t, c] = bias[c] + sum_j w[c, j] x[t + j, c].
-    let xf = x.to_dtype(DType::F32)?;
-    let xin = if km1 == 0 {
-        xf
-    } else {
-        let cs = match inp.conv_state.filter(|s| s.elem_count() > 0) {
-            Some(cs) => cs.to_dtype(DType::F32)?.transpose(1, 2)?,
-            None => Tensor::zeros((bsz, km1, c), DType::F32, &dev)?,
-        };
-        Tensor::cat(&[&cs, &xf], 1)?
-    };
-    let w = inp.conv_weight.to_dtype(DType::F32)?;
-    let mut conv = match inp.conv_bias {
-        Some(cb) => cb
-            .to_dtype(DType::F32)?
-            .reshape((1, 1, c))?
-            .broadcast_as((bsz, t, c))?
-            .contiguous()?,
-        None => Tensor::zeros((bsz, t, c), DType::F32, &dev)?,
-    };
-    for j in 0..kw {
-        let tap = w.narrow(1, j, 1)?.reshape((1, 1, c))?;
-        conv = (conv + xin.narrow(1, j, t)?.broadcast_mul(&tap)?)?;
-    }
-    let conv = conv.silu()?;
+    let xf = f32c(x)?;
+    let cs = inp
+        .conv_state
+        .filter(|s| s.elem_count() > 0)
+        .map(f32c)
+        .transpose()?;
+    // New conv state: the last K-1 entries of [conv_state ; tokens] (copies only, no arithmetic).
     let conv_state = if km1 == 0 {
         Tensor::zeros((bsz, c, 0), dtype, &dev)?
     } else {
-        xin.narrow(1, t, km1)?
-            .transpose(1, 2)?
+        let prev = match &cs {
+            Some(cs) => cs.clone(),
+            None => Tensor::zeros((bsz, c, km1), DType::F32, &dev)?,
+        };
+        Tensor::cat(&[&prev, &xf.transpose(1, 2)?], 2)?
+            .narrow(2, t, km1)?
             .to_dtype(dtype)?
             .contiguous()?
     };
-    let key_dim = hk * dk;
-    let mut q = conv.narrow(2, 0, key_dim)?.reshape((bsz, t, hk, dk))?;
-    let mut k = conv.narrow(2, key_dim, key_dim)?.reshape((bsz, t, hk, dk))?;
-    let v = conv.narrow(2, 2 * key_dim, hv * dv)?.contiguous()?;
-    if cfg.use_qk_l2norm {
-        let eps = cfg.l2norm_eps as f64;
-        let l2 = |u: &Tensor| -> Result<Tensor> {
-            let inv = (u.sqr()?.sum_keepdim(3)? + eps)?.sqrt()?.recip()?;
-            u.broadcast_mul(&inv)
-        };
-        q = l2(&q)?;
-        k = l2(&k)?;
-    }
-    let q = (q * (1.0 / (dk as f64).sqrt()))?.contiguous()?;
-    let k = k.contiguous()?;
+    let w = f32c(inp.conv_weight)?;
+    let bias = inp.conv_bias.map(f32c).transpose()?;
     let a = f32c(inp.a)?;
     let b = f32c(inp.b)?;
     let na = f32c(&inp.neg_a.flatten_all()?)?;
@@ -225,41 +302,81 @@ pub(super) fn gated_delta_rule(inp: &GdnInputs, cfg: &GdnConfig) -> Result<GdnOu
         None => Tensor::zeros((bsz, hv, dk, dv), DType::F32, &dev)?,
     };
 
-    let pipe = pipeline(m, dk_max)?;
+    let (conv_pipe, scan_pipe) = pipelines(m, dk_max)?;
+    let n_conv = bsz * t * c;
     let n_out = bsz * t * hv * dv;
     let n_state = bsz * hv * dk * dv;
+    let conv_buf = m.new_buffer(n_conv, DType::F32, "gdn_conv")?;
     let out_buf = m.new_buffer(n_out, DType::F32, "gdn_out")?;
     let s_buf = m.new_buffer(n_state, DType::F32, "gdn_state")?;
-    let params = GdnScanParams {
+    let conv_params = GdnConvParams {
         t: t as u32,
+        c: c as u32,
+        kw: kw as u32,
+        has_cs: cs.is_some() as u32,
+        has_bias: bias.is_some() as u32,
+    };
+    let scan_params = GdnScanParams {
+        t: t as u32,
+        c: c as u32,
         hk: hk as u32,
         hv: hv as u32,
         dk: dk as u32,
         dv: dv as u32,
         tiled: (cfg.v_head_order == GdnHeadOrder::Tiled) as u32,
+        l2: cfg.use_qk_l2norm as u32,
+        eps: cfg.l2norm_eps,
+        scale: (1.0 / (dk as f64).sqrt()) as f32,
     };
-    let tpg = dv.min(64).min(pipe.max_total_threads_per_threadgroup()).max(1);
+    let conv_tpg = c.min(64).min(conv_pipe.max_total_threads_per_threadgroup()).max(1);
+    let scan_tpg = SCAN_TPG.min(scan_pipe.max_total_threads_per_threadgroup()).max(1);
     {
-        let ins = [&q, &k, &v, &a, &b, &na, &dtb, &s_in];
-        let guards: Vec<_> = ins.iter().map(|t| t.storage_and_layout()).collect();
+        // Absent conv state / bias: bind x in their place (never read).
+        let ins = [Some(&xf), cs.as_ref(), Some(&w), bias.as_ref(), Some(&a), Some(&b), Some(&na), Some(&dtb), Some(&s_in)];
+        let guards: Vec<_> = ins
+            .iter()
+            .map(|t| t.unwrap_or(&xf).storage_and_layout())
+            .collect();
+        let bufs = guards
+            .iter()
+            .map(|(s, l)| metal_buffer(s, l))
+            .collect::<Result<Vec<_>>>()?;
         let enc = m.command_encoder()?;
         let e: &ComputeCommandEncoder = enc.as_ref();
-        e.set_compute_pipeline_state(&pipe);
-        for (i, (s, l)) in guards.iter().enumerate() {
-            let (buf, off) = metal_buffer(s, l)?;
-            e.set_input_buffer(i, Some(buf), off);
+        e.set_compute_pipeline_state(&conv_pipe);
+        for (i, (buf, off)) in bufs[..4].iter().enumerate() {
+            e.set_input_buffer(i, Some(buf), *off);
         }
-        e.set_output_buffer(8, Some(&out_buf), 0);
-        e.set_output_buffer(9, Some(&s_buf), 0);
-        e.set_bytes(10, &params);
+        e.set_output_buffer(4, Some(&conv_buf), 0);
+        e.set_bytes(5, &conv_params);
         e.dispatch_thread_groups(
             MTLSize {
-                width: dv.div_ceil(tpg),
+                width: c.div_ceil(conv_tpg),
+                height: t,
+                depth: bsz,
+            },
+            MTLSize {
+                width: conv_tpg,
+                height: 1,
+                depth: 1,
+            },
+        );
+        e.set_compute_pipeline_state(&scan_pipe);
+        e.set_input_buffer(0, Some(&conv_buf), 0);
+        for (i, (buf, off)) in bufs[4..].iter().enumerate() {
+            e.set_input_buffer(1 + i, Some(buf), *off);
+        }
+        e.set_output_buffer(6, Some(&out_buf), 0);
+        e.set_output_buffer(7, Some(&s_buf), 0);
+        e.set_bytes(8, &scan_params);
+        e.dispatch_thread_groups(
+            MTLSize {
+                width: dv.div_ceil(scan_tpg),
                 height: hv,
                 depth: bsz,
             },
             MTLSize {
-                width: tpg,
+                width: scan_tpg,
                 height: 1,
                 depth: 1,
             },
