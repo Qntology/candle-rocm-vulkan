@@ -154,14 +154,15 @@ PKG_CONFIG_PATH=$P PKG_CONFIG_ALLOW_CROSS=1 RUSTONIG_SYSTEM_LIBONIG=1 \
 | `d0121b1` | 행 불변성 테스트(M 1..300 · 위치 · 스레드) + `device_probe` 예제 | ✅ PR #10 |
 | `91a7ab2` | MoltenVK: portability enumeration · portability_subset · 로더 경로 | ✅ PR #10 |
 | `30e502f` | Metal `Device::mem_info` = recommendedMaxWorkingSetSize − currentAllocatedSize | ✅ PR #10 |
-| `c663a23` | GLSL `barrier()` → 워크그룹 배리어 | 브랜치만 |
-| `c1de501` | CPU f16 `forward_exact` 프리필 f32 누산 | 브랜치만 |
-| `a08ba34` | Vulkan tests: GPU 상주 Q8_0 = 정확한 W8A32, Vulkan f16 `forward_exact` f32 누산 | 브랜치만 |
-| `3ad5050` | **Metal FlashAttention → fused sdpa 커널** (MLX 포트, GQA, causal 오른쪽 아래 정렬, 디코드 vector / 1024키 초과 2-pass). `BackendSwitches.metal`. TurboQuant는 Metal에서 계속 꺼둠 | 브랜치만 |
-| `f947435` | **Gated DeltaNet 융합 경로**: Vulkan(`host_shared_memory()`)은 CPU 커널을 장치 텐서 위에서 실행, Metal은 네이티브 스캔(자가 점검 후 사용). `delta_rule_tests`의 GPU 케이스가 Metal · Vulkan에서도 돎 | 브랜치만 |
-| `51e2256` | **Vulkan 고정 GPU 모드: 작은 M(2..=32, `CANDLE_VULKAN_HOST_SMALL_M`) F32 가중치 matmul은 host로**. 장치 · 형태마다 host 결과 == GPU 결과(비트)일 때만 적용, `[VK-HOST-SMALL-M]` 로그 | 브랜치만 |
-| `806aba6` | **Metal GDN 정밀화**: conv · SiLU · L2 norm · 게이트를 fast math 없는 커널(`gdn_conv_f32`, `gdn_scan_f32`)에서 precise 수학으로, CPU 커널과 같은 갱신 순서 | 브랜치만 |
-| `e4a7314` | **Metal 빈 텐서**: `new_buffer_with_data`가 길이 0을 `newBufferWithBytes`(nil 반환)에 넘기던 것 → 풀 버퍼(`allocate_buffer(0)`) | 브랜치만 |
+| `c663a23` | GLSL `barrier()` → 워크그룹 배리어 | ✅ PR #11 |
+| `c1de501` | CPU f16 `forward_exact` 프리필 f32 누산 | ✅ PR #11 |
+| `a08ba34` | Vulkan tests: GPU 상주 Q8_0 = 정확한 W8A32, Vulkan f16 `forward_exact` f32 누산 | ✅ PR #11 |
+| `3ad5050` | **Metal FlashAttention → fused sdpa 커널** (MLX 포트, GQA, causal 오른쪽 아래 정렬, 디코드 vector / 1024키 초과 2-pass). `BackendSwitches.metal`. TurboQuant는 Metal에서 계속 꺼둠 | ✅ PR #11 |
+| `f947435` | **Gated DeltaNet 융합 경로**: Vulkan(`host_shared_memory()`)은 CPU 커널을 장치 텐서 위에서 실행, Metal은 네이티브 스캔(자가 점검 후 사용). `delta_rule_tests`의 GPU 케이스가 Metal · Vulkan에서도 돎 | ✅ PR #11 |
+| `51e2256` | **Vulkan 고정 GPU 모드: 작은 M(2..=32, `CANDLE_VULKAN_HOST_SMALL_M`) F32 가중치 matmul은 host로**. 장치 · 형태마다 host 결과 == GPU 결과(비트)일 때만 적용, `[VK-HOST-SMALL-M]` 로그 | ✅ PR #11 |
+| `806aba6` | **Metal GDN 정밀화**: conv · SiLU · L2 norm · 게이트를 fast math 없는 커널(`gdn_conv_f32`, `gdn_scan_f32`)에서 precise 수학으로, CPU 커널과 같은 갱신 순서 | ✅ PR #11 |
+| `e4a7314` | **Metal 빈 텐서**: `new_buffer_with_data`가 길이 0을 `newBufferWithBytes`(nil 반환)에 넘기던 것 → 풀 버퍼(`allocate_buffer(0)`) | ✅ PR #11 |
+| `a633c43` | **Metal GDN 디코드 디스패치 감소**: conv 커널(`gdn_conv_f32`)이 새 conv 상태도 직접 씀(buffer 6, t==0 스레드). 스텝당 디스패치 2개(conv · scan), conv 상태용 별도 cat/narrow 없음 | 브랜치만 |
 
 ---
 
@@ -171,6 +172,7 @@ PKG_CONFIG_PATH=$P PKG_CONFIG_ALLOW_CROSS=1 RUSTONIG_SYSTEM_LIBONIG=1 \
 |---|---|
 | [38499518771](https://github.com/sungu-che/logis-center/actions/runs/38499518771) | 전체 |
 | [38506246088](https://github.com/sungu-che/logis-center/actions/runs/38506246088) | 포크 개선(`3ad5050` · `f947435` · `51e2256`) 검증 |
+| [38513842101](https://github.com/sungu-che/logis-center/actions/runs/38513842101) | `a633c43`(Metal conv 상태) 검증: fork는 `delta-rule-metal`만 (`fork_tests`) |
 
 ### 3-1. 포크 잡
 
@@ -181,6 +183,7 @@ PKG_CONFIG_PATH=$P PKG_CONFIG_ALLOW_CROSS=1 RUSTONIG_SYSTEM_LIBONIG=1 \
 | fork (metal) 2차 (38506246088) | Metal GDN 자가 점검 통과(max rel 5.4e-7)했지만 **`gpu_matches_f64_reference` · `half_inputs` 실패**(2e-5 허용치, fast math) → `806aba6`으로 정밀화 |
 | fork (metal) 3차 (38508388995) | 정밀화 후 CPU 대비 0~1.2e-7. 같은 두 테스트가 conv 폭 1 케이스에서 `Err`로 끝남: 빈 conv 상태 텐서를 Metal로 보낼 때 길이 0 버퍼 생성 실패 → `e4a7314` |
 | **fork (metal) 4차 ([38508978460](https://github.com/sungu-che/logis-center/actions/runs/38508978460))** | **`delta_rule_tests` 7 pass** (Metal GPU 케이스 전부: dk 64/96/128/256, Tiled, conv 폭 1~5, dv 200, L2 없음, f16/bf16 입력, 디코드 체이닝, transformers 픽스처) |
+| **fork (metal) 5차 ([38513842101](https://github.com/sungu-che/logis-center/actions/runs/38513842101))** | `a633c43` 적용 후 **`delta_rule_tests` 7 pass**, Metal 스캔 자가 점검 max rel 3.3e-7 (conv 상태를 커널이 쓰는 경로) |
 | fork (vulkan, MoltenVK) 1차 | `vulkan_tests` 19/19, `fixed_exec_modes_are_batch_invariant`, `vulkan_accel_tests` 3/3, candle-nn `accel_vulkan` 4/4, `w8a16_generic_cuda::vulkan`. Gpu · Host · Auto M-불변성 불일치 0, digest `4bfc0461001d5039` |
 | fork (vulkan) 2차 (38506246088) | **전부 통과.** `[VK-HOST-SMALL-M]` 384×1152 · 384×384 · 384×3072 · 1536×384 모두 host == GPU → host 경로 사용. 그 상태로 M-불변성 불일치 0, `vulkan_tests` 19/19, **`delta_rule_tests`(Vulkan GPU 케이스) 7 pass** |
 
@@ -275,4 +278,5 @@ PKG_CONFIG_PATH=$P PKG_CONFIG_ALLOW_CROSS=1 RUSTONIG_SYSTEM_LIBONIG=1 \
 - [x] Metal GDN 정밀화 · 빈 버퍼 수정: app Metal 통과(38508388995), fork Metal `delta_rule_tests` 7 pass(38508978460).
 - 이 브랜치의 수정은 모두 macOS에서 검증됐습니다.
 - 포크 master 반영(PR)은 저장소 관리자가 정합니다. 앱의 git 의존(Qntology master)에 들어가야 CI 밖 빌드에도 반영됩니다.
-- 측정만 하고 개선하지 않은 것: 가상 GPU에서는 GDN 디코드가 CPU 융합 커널보다 느린 경우가 있습니다(동기화 비용). 실제 Apple GPU 측정이 필요합니다.
+- [x] PR #11로 `c663a23`~`e4a7314`가 master에 반영됨. 남은 브랜치 커밋은 `a633c43` 하나(fork Metal 7 pass, 38513842101).
+- GDN 디코드(가상 GPU): `a633c43`으로 스텝당 디스패치를 2개로 줄였습니다. 가상 GPU의 동기화 비용은 실제 Apple GPU와 다르므로, 속도 판단은 셀프호스티드 Apple Silicon 러너에서 합니다(logis-center `mac-verify.yml`의 `runner` 입력에 그 라벨).
