@@ -222,7 +222,6 @@ version = "1.4.3"
 
 [dependencies.candle-kernels]
 version = "0.11.0"
-path = "../candle-kernels"
 optional = true
 
 [dependencies.candle-metal-kernels]
