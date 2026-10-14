@@ -7,14 +7,28 @@
 
 // FIXME: the minimum compute capabilities are just guesses since the table is not specific enough
 
-#if __CUDA_ARCH__ < 800
-__device__ __forceinline__ __half __hmax_nan(__half a, __half b) {
+// NaN-propagating max / min of two __half values.
+//
+// candle-rocm-vulkan: CUDA 12 and older only declare __hmax_nan / __hmin_nan(__half) for sm_80 and newer, which is
+// why this file used to define them for `__CUDA_ARCH__ < 800`. CUDA 13 declares them for every architecture, so
+// that second definition is a redefinition error ("function __hmax_nan(__half, __half) has already been defined").
+// Whether a toolkit has them cannot be tested in the preprocessor, so the kernels call these helpers instead: under
+// a name no toolkit uses, with the toolkit's own function where it is known to exist (sm_80+) and the portable
+// form elsewhere. The bf16 versions (sm_80+ only) still call the toolkit's __hmax_nan / __hmin_nan directly.
+__device__ __forceinline__ __half candle_hmax_nan(__half a, __half b) {
+#if __CUDA_ARCH__ >= 800
+    return __hmax_nan(a, b);
+#else
     return __hisnan(a) ? a : (__hisnan(b) ? b : __hmax(a, b));
-}
-__device__ __forceinline__ __half __hmin_nan(__half a, __half b) {
-    return __hisnan(a) ? a : (__hisnan(b) ? b : __hmin(a, b));
-}
 #endif
+}
+__device__ __forceinline__ __half candle_hmin_nan(__half a, __half b) {
+#if __CUDA_ARCH__ >= 800
+    return __hmin_nan(a, b);
+#else
+    return __hisnan(a) ? a : (__hisnan(b) ? b : __hmin(a, b));
+#endif
+}
 
 #if __CUDA_ARCH__ < 600
 // Copied from https://docs.nvidia.com/cuda/cuda-c-programming-guide/#atomic-functions
@@ -71,7 +85,7 @@ __device__ __forceinline__ __half atomicMaxf(__half* address, __half val) {
         assumed = old;
         unsigned int hmax;
         hmax = unaligned ? (old >> 16) : (old & 0xffff);
-        hmax = __half_as_ushort(__hmax_nan(val, __ushort_as_half(hmax))); 
+        hmax = __half_as_ushort(candle_hmax_nan(val, __ushort_as_half(hmax))); 
         old = atomicCAS(address_as_ui, assumed,
             unaligned ? (old & 0xffff) | (hmax << 16) : (old & 0xffff0000) | hmax
         );
@@ -85,7 +99,7 @@ __device__ __forceinline__ __half atomicMaxf(__half* address, __half val) {
     unsigned short int assumed;
     do {
         assumed = old;
-        old = atomicCAS(casted_address, assumed, __half_as_ushort(__hmax_nan(val, __ushort_as_half(assumed))));
+        old = atomicCAS(casted_address, assumed, __half_as_ushort(candle_hmax_nan(val, __ushort_as_half(assumed))));
     // Note: uses integer comparison to avoid hang in case of NaN (since NaN != NaN)
     } while (assumed != old);
     return __ushort_as_half(old);
@@ -123,7 +137,7 @@ __device__ __forceinline__ __half atomicMinf(__half* address, __half val) {
         assumed = old;
         unsigned int hmin;
         hmin = unaligned ? (old >> 16) : (old & 0xffff);
-        hmin = __half_as_ushort(__hmin_nan(val, __ushort_as_half(hmin))); 
+        hmin = __half_as_ushort(candle_hmin_nan(val, __ushort_as_half(hmin))); 
         old = atomicCAS(address_as_ui, assumed,
             unaligned ? (old & 0xffff) | (hmin << 16) : (old & 0xffff0000) | hmin
         );
@@ -137,7 +151,7 @@ __device__ __forceinline__ __half atomicMinf(__half* address, __half val) {
     unsigned short int assumed;
     do {
         assumed = old;
-        old = atomicCAS(casted_address, assumed, __half_as_ushort(__hmin_nan(val, __ushort_as_half(assumed))));
+        old = atomicCAS(casted_address, assumed, __half_as_ushort(candle_hmin_nan(val, __ushort_as_half(assumed))));
     // Note: uses integer comparison to avoid hang in case of NaN (since NaN != NaN)
     } while (assumed != old);
     return __ushort_as_half(old);
