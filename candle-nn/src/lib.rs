@@ -37,6 +37,7 @@ pub mod rnn;
 pub mod rotary_emb;
 pub mod sampling;
 pub mod sequential;
+pub mod trimmed_head;
 pub mod turbo_quant;
 pub mod var_builder;
 pub mod var_map;

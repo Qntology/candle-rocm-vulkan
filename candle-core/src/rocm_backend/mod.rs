@@ -3,9 +3,11 @@
 //! Kernels are written in HIP (see `kernels/*.hip`), compiled by `build.rs` with `hipcc`
 //! and embedded in the binary. Matrix multiplications go through rocBLAS.
 mod accel;
+mod decoder_ops;
 mod delta_rule;
 mod device;
 pub mod kernels;
+mod lm_head;
 pub mod offload;
 mod storage;
 pub mod utils;

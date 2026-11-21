@@ -329,6 +329,28 @@ impl Tensor {
         if groups == 1 {
             self.conv2d_single_group(kernel, &params)
         } else {
+            #[cfg(feature = "rocm")]
+            if groups == c_in && c_out == c_in {
+                if let (crate::Storage::Rocm(s), crate::Storage::Rocm(k)) =
+                    (&*self.storage(), &*kernel.storage())
+                {
+                    if let Some(st) = s.depthwise_conv2d(
+                        self.layout(),
+                        k,
+                        kernel.layout(),
+                        &params,
+                        c_in,
+                    )? {
+                        let out_dims = vec![b_size, c_out, params.out_h(), params.out_w()];
+                        return Ok(crate::tensor::from_storage(
+                            crate::Storage::Rocm(st),
+                            out_dims,
+                            BackpropOp::none(),
+                            false,
+                        ));
+                    }
+                }
+            }
             let blocks = self.chunk(groups, 1)?;
             let kernel = kernel.chunk(groups, 0)?;
             let blocks = blocks

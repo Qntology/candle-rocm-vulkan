@@ -15,9 +15,11 @@ use std::sync::Arc;
 #[cfg(feature = "cudnn")]
 pub mod cudnn;
 mod accel;
+mod decoder_ops;
 mod delta_rule;
 mod device;
 mod error;
+mod lm_head;
 pub mod offload;
 mod utils;
 pub use device::{clear_cuda_graph_htod_cache, CudaDevice, CudaPoolStats, DeviceId};

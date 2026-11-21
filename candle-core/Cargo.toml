@@ -184,6 +184,11 @@ path = "tests/rocm_memory_tests.rs"
 required-features = ["rocm"]
 
 [[test]]
+name = "rocm_conv_tests"
+path = "tests/rocm_conv_tests.rs"
+required-features = ["rocm"]
+
+[[test]]
 name = "vulkan_tests"
 path = "tests/vulkan_tests.rs"
 
@@ -199,6 +204,10 @@ path = "tests/serialization_tests.rs"
 [[test]]
 name = "tensor_tests"
 path = "tests/tensor_tests.rs"
+
+[[test]]
+name = "decoder_ops_tests"
+path = "tests/decoder_ops_tests.rs"
 
 [[bench]]
 name = "bench_main"

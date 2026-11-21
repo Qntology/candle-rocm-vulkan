@@ -11,8 +11,22 @@ use std::ffi::c_void;
 
 /// Inputs with at most this many rows use the fused dequantize + mat-vec kernel.
 const QMV_MAX_ROWS: usize = 8;
-/// Upper bound for the temporary f32 weight tile used by the dequantize + gemm path.
-const MAX_DEQUANT_TILE_BYTES: usize = 128 << 20;
+/// Default upper bound for the temporary f32 weight tile used by the dequantize + gemm path.
+/// Can be overridden via `CANDLE_ROCM_DEQUANT_TILE_MB` (or `CANDLE_W8A16_DEQUANT_TILE_MB`).
+const DEFAULT_DEQUANT_TILE_BYTES: usize = 64 << 20;
+
+fn dequant_tile_bytes() -> usize {
+    static BYTES: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *BYTES.get_or_init(|| {
+        std::env::var("CANDLE_ROCM_DEQUANT_TILE_MB")
+            .or_else(|_| std::env::var("CANDLE_W8A16_DEQUANT_TILE_MB"))
+            .ok()
+            .and_then(|s| s.trim().parse::<usize>().ok())
+            .filter(|&mb| mb > 0)
+            .map(|mb| mb << 20)
+            .unwrap_or(DEFAULT_DEQUANT_TILE_BYTES)
+    })
+}
 
 pub struct QRocmStorage {
     data: DeviceBuffer<u8>,
@@ -104,6 +118,56 @@ impl QRocmStorage {
         let out = self.device.alloc(elem_count * 2)?;
         self.dequantize_ptr(self.data.as_ptr(), out.as_mut_ptr(), elem_count, true)?;
         Ok(RocmStorage::new(out, DType::F16, self.device.clone()))
+    }
+
+    /// Dequantizes a block-aligned element slice `[elem0..elem0 + elem_count]` directly on GPU
+    /// without allocating the full matrix (mirrors `QCudaStorage::dequantize_range_to`).
+    pub fn dequantize_range_to(
+        &self,
+        elem0: usize,
+        elem_count: usize,
+        dtype: DType,
+    ) -> Result<RocmStorage> {
+        let bs = self.dtype.block_size();
+        if elem0 % bs != 0 || elem_count % bs != 0 {
+            crate::bail!(
+                "rocm dequantize_range_to: range {elem0}..{} must align to block size {bs}",
+                elem0 + elem_count
+            );
+        }
+        let total = self.elem_count();
+        if elem0.saturating_add(elem_count) > total {
+            crate::bail!(
+                "rocm dequantize_range_to: range {elem0}..{} exceeds {total}",
+                elem0 + elem_count
+            );
+        }
+        let byte_off = (elem0 / bs) * self.dtype.type_size();
+        let src = unsafe { self.data.as_ptr().add(byte_off) };
+        match dtype {
+            DType::F32 => {
+                let out = self.device.alloc(elem_count.max(1) * 4)?;
+                if elem_count > 0 {
+                    self.dequantize_ptr(src, out.as_mut_ptr(), elem_count, false)?;
+                }
+                Ok(RocmStorage::new(out, DType::F32, self.device.clone()))
+            }
+            DType::F16 => {
+                let out = self.device.alloc(elem_count.max(1) * 2)?;
+                if elem_count > 0 {
+                    self.dequantize_ptr(src, out.as_mut_ptr(), elem_count, true)?;
+                }
+                Ok(RocmStorage::new(out, DType::F16, self.device.clone()))
+            }
+            other => {
+                let f32_out = self.device.alloc(elem_count.max(1) * 4)?;
+                if elem_count > 0 {
+                    self.dequantize_ptr(src, f32_out.as_mut_ptr(), elem_count, false)?;
+                }
+                let s = RocmStorage::new(f32_out, DType::F32, self.device.clone());
+                s.to_dtype(&Layout::contiguous((elem_count,)), other)
+            }
+        }
     }
 
     fn upload_quantized(&mut self, q: &dyn super::QuantizedType) -> Result<()> {
@@ -227,7 +291,7 @@ impl QRocmStorage {
                     .launch(func, (grid_x, rows as u32, 1), (block, 1, 1), block * 4, &mut args)?;
             } else {
                 let row_bytes = k / self.dtype.block_size() * self.dtype.type_size();
-                let tile_n = (MAX_DEQUANT_TILE_BYTES / (k * 4)).clamp(1, n);
+                let tile_n = (dequant_tile_bytes() / (k * 4)).clamp(1, n);
                 let tile = self.device.alloc(tile_n * k * 4)?;
                 let mut n0 = 0;
                 while n0 < n {

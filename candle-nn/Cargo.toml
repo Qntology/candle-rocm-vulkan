@@ -138,6 +138,10 @@ path = "tests/sdpa.rs"
 name = "varlen_flash_attention"
 path = "tests/varlen_flash_attention.rs"
 
+[[test]]
+name = "lm_head_argmax_tests"
+path = "tests/lm_head_argmax_tests.rs"
+
 [[bench]]
 name = "bench_main"
 path = "benches/bench_main.rs"

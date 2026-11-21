@@ -1500,3 +1500,11 @@ pub fn sdpa(
         },
     )
 }
+
+pub use candle::accel::decoder_ops::{HeadLayout, RopeMode};
+pub use candle::decoder_ops::{
+    residual_rmsnorm, residual_rmsnorm_inplace, rmsnorm_fused, rope_kv_write, silu_mul,
+};
+pub use candle::lm_head::{
+    fused_linear_argmax_cs, logits_argmax_cs, ArgmaxCsOutput, CsGuardParams,
+};

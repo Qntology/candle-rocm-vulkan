@@ -100,7 +100,9 @@ mod tensor;
 mod tensor_cat;
 pub mod test_utils;
 pub mod utils;
+pub mod decoder_ops;
 pub mod delta_rule;
+pub mod lm_head;
 mod variable;
 
 #[cfg(feature = "cudnn")]

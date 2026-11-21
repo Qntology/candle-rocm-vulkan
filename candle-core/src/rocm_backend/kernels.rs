@@ -18,6 +18,10 @@ pub enum Module {
     TurboQuant,
     /// Fused Gated DeltaNet (`delta_rule.hip`).
     DeltaRule,
+    /// Fused decoder ops (`decoder_ops.hip`: ResidualRmsNorm, SiluMul, RopeKvWrite).
+    DecoderOps,
+    /// Fused lm_head tile argmax + CS guard (`lm_head_argmax.hip`).
+    LmHeadArgmax,
 }
 
 pub const UNARY: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/unary.co"));
@@ -33,6 +37,8 @@ pub const GEMM: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/gemm.co"));
 pub const FLASH_ATTN: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/flash_attn.co"));
 pub const TURBO_QUANT: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/turbo_quant.co"));
 pub const DELTA_RULE: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/delta_rule.co"));
+pub const DECODER_OPS: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/decoder_ops.co"));
+pub const LM_HEAD_ARGMAX: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/lm_head_argmax.co"));
 
 /// GPU architectures the embedded code objects were built for.
 pub const COMPILED_ARCHS: &str = env!("CANDLE_ROCM_ARCHS");
@@ -51,7 +57,7 @@ pub fn compiled_for(arch: &str) -> bool {
 }
 
 impl Module {
-    pub const ALL: [Module; 13] = [
+    pub const ALL: [Module; 15] = [
         Module::Unary,
         Module::Binary,
         Module::Cast,
@@ -65,6 +71,8 @@ impl Module {
         Module::FlashAttn,
         Module::TurboQuant,
         Module::DeltaRule,
+        Module::DecoderOps,
+        Module::LmHeadArgmax,
     ];
 
     pub fn index(self) -> usize {
@@ -86,6 +94,8 @@ impl Module {
             Module::FlashAttn => "flash_attn",
             Module::TurboQuant => "turbo_quant",
             Module::DeltaRule => "delta_rule",
+            Module::DecoderOps => "decoder_ops",
+            Module::LmHeadArgmax => "lm_head_argmax",
         }
     }
 
@@ -104,6 +114,8 @@ impl Module {
             Module::FlashAttn => FLASH_ATTN,
             Module::TurboQuant => TURBO_QUANT,
             Module::DeltaRule => DELTA_RULE,
+            Module::DecoderOps => DECODER_OPS,
+            Module::LmHeadArgmax => LM_HEAD_ARGMAX,
         }
     }
 }

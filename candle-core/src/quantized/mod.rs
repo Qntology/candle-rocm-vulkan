@@ -908,6 +908,13 @@ impl QTensor {
                 crate::tensor::from_storage(Storage::Cuda(st), (nrows, k), none, false)
                     .to_device(device)
             }
+            #[cfg(feature = "rocm")]
+            QStorage::Rocm(s) => {
+                let st = s.dequantize_range_to(row0 * k, nrows * k, dtype)?;
+                let none = crate::op::BackpropOp::none();
+                crate::tensor::from_storage(Storage::Rocm(st), (nrows, k), none, false)
+                    .to_device(device)
+            }
             _ => self.dequantize_to(dtype, device)?.narrow(0, row0, nrows),
         }
     }
@@ -976,6 +983,12 @@ impl QTensor {
                 xs.unsqueeze(0)?.apply_op1_no_bwd(self)?.squeeze(0)
             }
             QStorage::Rocm(_) => xs.apply_op1_no_bwd(self),
+            // Metal's native quantized matmul/matvec accepts F32 activations directly without
+            // activation quantization, avoiding materializing a full F32 weight buffer every call.
+            QStorage::Metal(_) if dtype == DType::F32 && dims.len() == 1 => {
+                xs.unsqueeze(0)?.apply_op1_no_bwd(self)?.squeeze(0)
+            }
+            QStorage::Metal(_) if dtype == DType::F32 => xs.apply_op1_no_bwd(self),
             _ => {
                 // The CPU backend has no bf16 matmul: bf16 prefill runs in f32 there.
                 let cpu_bf16 = dtype == DType::BF16 && xs.device().is_cpu();

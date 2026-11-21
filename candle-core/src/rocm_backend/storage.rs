@@ -202,6 +202,71 @@ impl RocmStorage {
         Ok(Self::new(buf, storage.dtype(), device.clone()))
     }
 
+    /// Fused depthwise 2D convolution (`groups == c_in == c_out`) on ROCm GPU.
+    /// Returns `Ok(None)` if dtype or kernel module is unsupported, letting caller fall back.
+    pub(crate) fn depthwise_conv2d(
+        &self,
+        l: &Layout,
+        kernel: &Self,
+        kernel_l: &Layout,
+        params: &crate::conv::ParamsConv2D,
+        channels: usize,
+    ) -> Result<Option<Self>> {
+        let Some(sfx) = dtype_suffix(self.dtype) else {
+            return Ok(None);
+        };
+        if !is_float(self.dtype) || self.dtype != kernel.dtype {
+            return Ok(None);
+        }
+        let name = format!("depthwise_conv2d_{sfx}");
+        let Ok(func) = self.device.get_func(Module::Nn, &name) else {
+            return Ok(None);
+        };
+        let b = params.b_size;
+        let (i_h, i_w, k_h, k_w) = (params.i_h, params.i_w, params.k_h, params.k_w);
+        let o_h = params.out_h();
+        let o_w = params.out_w();
+        let out_elems = b * channels * o_h * o_w;
+        if out_elems == 0 {
+            let out = self.device.alloc(0)?;
+            return Ok(Some(Self::new(out, self.dtype, self.device.clone())));
+        }
+        let src_owned;
+        let src = if l.is_contiguous() && l.start_offset() == 0 {
+            self
+        } else {
+            src_owned = self.contiguous_copy(l)?;
+            &src_owned
+        };
+        let k_owned;
+        let w = if kernel_l.is_contiguous() && kernel_l.start_offset() == 0 {
+            kernel
+        } else {
+            k_owned = kernel.contiguous_copy(kernel_l)?;
+            &k_owned
+        };
+        let out_buf = self.device.alloc(out_elems * self.esz())?;
+        let mut args = LaunchArgs::new();
+        args.ptr(src.buf.as_ptr())
+            .ptr(w.buf.as_ptr())
+            .ptr(out_buf.as_ptr())
+            .usize(b)
+            .usize(channels)
+            .usize(i_h)
+            .usize(i_w)
+            .usize(k_h)
+            .usize(k_w)
+            .usize(o_h)
+            .usize(o_w)
+            .usize(params.padding)
+            .usize(params.stride)
+            .usize(params.dilation);
+        let block = 256u32;
+        self.device
+            .launch(func, (grid_1d(out_elems, block), 1, 1), (block, 1, 1), 0, &mut args)?;
+        Ok(Some(Self::new(out_buf, self.dtype, self.device.clone())))
+    }
+
     pub(crate) fn to_cpu(&self) -> Result<CpuStorage> {
         let src = self.buf.as_ptr();
         let bytes = self.buf.byte_size();
@@ -879,7 +944,193 @@ impl BackendStorage for RocmStorage {
         kernel_l: &Layout,
         params: &crate::conv::ParamsConv2D,
     ) -> Result<Self> {
-        self.fallback2_wide(l, kernel, kernel_l, |a, la, b, lb| a.conv2d(la, b, lb, params))
+        let Some(sfx) = dtype_suffix(self.dtype) else {
+            return self.fallback2_wide(l, kernel, kernel_l, |a, la, b, lb| a.conv2d(la, b, lb, params));
+        };
+        if !is_float(self.dtype) || self.dtype != kernel.dtype {
+            return self.fallback2_wide(l, kernel, kernel_l, |a, la, b, lb| a.conv2d(la, b, lb, params));
+        }
+        let ty = match self.dtype {
+            DType::F32 => GemmType::F32,
+            DType::F64 => GemmType::F64,
+            DType::F16 => GemmType::F16,
+            DType::BF16 => GemmType::BF16,
+            _ => {
+                return self.fallback2_wide(l, kernel, kernel_l, |a, la, b, lb| a.conv2d(la, b, lb, params));
+            }
+        };
+        let (b, c_in, i_h, i_w) = (params.b_size, params.c_in, params.i_h, params.i_w);
+        let (c_out, k_h, k_w) = (params.c_out, params.k_h, params.k_w);
+        let o_h = params.out_h();
+        let o_w = params.out_w();
+        let hw_out = o_h * o_w;
+        let out_elems = b * c_out * hw_out;
+        let esz = self.esz();
+        if out_elems == 0 {
+            let out = self.device.alloc(0)?;
+            return Ok(Self::new(out, self.dtype, self.device.clone()));
+        }
+
+        let src_owned;
+        let src = if l.is_contiguous() && l.start_offset() == 0 {
+            self
+        } else {
+            src_owned = self.contiguous_copy(l)?;
+            &src_owned
+        };
+        let k_owned;
+        let w = if kernel_l.is_contiguous() && kernel_l.start_offset() == 0 {
+            kernel
+        } else {
+            k_owned = kernel.contiguous_copy(kernel_l)?;
+            &k_owned
+        };
+
+        let col_rows = c_in * k_h * k_w;
+        if col_rows == 0 {
+            let out = self.device.alloc_zeros(out_elems * esz)?;
+            return Ok(Self::new(out, self.dtype, self.device.clone()));
+        }
+
+        // 1x1 stride-1 pad-0 conv: `src` [b, c_in, hw_out] is already the im2col matrix.
+        if k_h == 1 && k_w == 1 && params.padding == 0 && params.stride == 1 {
+            let w_l = Layout::new((b, c_out, c_in).into(), vec![0, c_in, 1], 0);
+            let s_l = Layout::contiguous((b, c_in, hw_out));
+            return w.matmul(src, (b, c_out, hw_out, c_in), &w_l, &s_l);
+        }
+
+        let im2col_name = format!("im2col_2d_{sfx}");
+        let Ok(im2col_fn) = self.device.get_func(Module::Nn, &im2col_name) else {
+            return self.fallback2_wide(l, kernel, kernel_l, |a, la, b, lb| a.conv2d(la, b, lb, params));
+        };
+
+        const TILE_BUDGET: usize = 64 * 1024 * 1024;
+        let bytes_per_row_1b = col_rows.saturating_mul(o_w).saturating_mul(esz).max(1);
+        let bytes_per_row_all_b = bytes_per_row_1b.saturating_mul(b);
+
+        // Single-shot path when the entire batch's im2col fits within the 64 MiB tile budget.
+        if bytes_per_row_all_b.saturating_mul(o_h) <= TILE_BUDGET {
+            let col_elems = b * col_rows * hw_out;
+            let col_buf = self.device.alloc(col_elems * esz)?;
+            let mut args = LaunchArgs::new();
+            args.ptr(src.buf.as_ptr())
+                .ptr(col_buf.as_ptr())
+                .usize(b)
+                .usize(c_in)
+                .usize(i_h)
+                .usize(i_w)
+                .usize(k_h)
+                .usize(k_w)
+                .usize(o_h)
+                .usize(o_w)
+                .usize(0)
+                .usize(o_h)
+                .usize(params.padding)
+                .usize(params.stride)
+                .usize(params.dilation);
+            let block = 256u32;
+            self.device
+                .launch(im2col_fn, (grid_1d(col_elems, block), 1, 1), (block, 1, 1), 0, &mut args)?;
+            let col = Self::new(col_buf, self.dtype, self.device.clone());
+            let w_l = Layout::new((b, c_out, col_rows).into(), vec![0, col_rows, 1], 0);
+            let c_l = Layout::contiguous((b, col_rows, hw_out));
+            return w.matmul(&col, (b, c_out, hw_out, col_rows), &w_l, &c_l);
+        }
+
+        // Tiled path: chunk `o_h` (and batch if even 1 row across `b` exceeds budget) so workspace <= 64 MiB.
+        let batch_chunk = if bytes_per_row_all_b <= TILE_BUDGET { b } else { 1 };
+        let tile_h = (TILE_BUDGET / (bytes_per_row_1b * batch_chunk)).clamp(1, o_h);
+        let out_buf = self.device.alloc(out_elems * esz)?;
+        let col_buf = self.device.alloc(batch_chunk * col_rows * tile_h * o_w * esz)?;
+        let block = 256u32;
+        let in_frame_elems = c_in * i_h * i_w;
+        let out_frame_elems = c_out * hw_out;
+
+        for bi in (0..b).step_by(batch_chunk) {
+            let cur_b = (b - bi).min(batch_chunk);
+            let src_ptr = unsafe { src.buf.as_ptr().add(bi * in_frame_elems * esz) };
+            for oh_start in (0..o_h).step_by(tile_h) {
+                let cur_h = (o_h - oh_start).min(tile_h);
+                let cur_hw = cur_h * o_w;
+                let col_elems = cur_b * col_rows * cur_hw;
+                let mut args = LaunchArgs::new();
+                args.ptr(src_ptr)
+                    .ptr(col_buf.as_ptr())
+                    .usize(cur_b)
+                    .usize(c_in)
+                    .usize(i_h)
+                    .usize(i_w)
+                    .usize(k_h)
+                    .usize(k_w)
+                    .usize(o_h)
+                    .usize(o_w)
+                    .usize(oh_start)
+                    .usize(cur_h)
+                    .usize(params.padding)
+                    .usize(params.stride)
+                    .usize(params.dilation);
+                self.device.launch(
+                    im2col_fn,
+                    (grid_1d(col_elems, block), 1, 1),
+                    (block, 1, 1),
+                    0,
+                    &mut args,
+                )?;
+
+                let out_ptr = unsafe {
+                    out_buf
+                        .as_ptr()
+                        .add((bi * out_frame_elems + oh_start * o_w) * esz)
+                        as *mut c_void
+                };
+                let status = self.device.gemm(&GemmCall {
+                    ty,
+                    transa: false,
+                    transb: false,
+                    m: cur_hw,
+                    n: c_out,
+                    k: col_rows,
+                    a: col_buf.as_ptr() as *const c_void,
+                    lda: cur_hw.max(1),
+                    stride_a: (col_rows * cur_hw) as i64,
+                    b: w.buf.as_ptr() as *const c_void,
+                    ldb: col_rows.max(1),
+                    stride_b: 0,
+                    c: out_ptr,
+                    ldc: hw_out.max(1),
+                    stride_c: out_frame_elems as i64,
+                    batch: cur_b,
+                    batched: true,
+                })?;
+                match status {
+                    GemmOutcome::Done => {}
+                    GemmOutcome::Rocblas(hip_runtime::error::HipError::RocblasError {
+                        code: 2 | 14 | 15,
+                    }) if matches!(ty, GemmType::F16 | GemmType::BF16) => {
+                        drop(col_buf);
+                        drop(out_buf);
+                        let src_f32 = src.to_dtype(&Layout::contiguous((b, c_in, i_h, i_w)), DType::F32)?;
+                        let w_f32 = w.to_dtype(&Layout::contiguous((c_out, c_in, k_h, k_w)), DType::F32)?;
+                        let out_f32 = src_f32.conv2d(
+                            &Layout::contiguous((b, c_in, i_h, i_w)),
+                            &w_f32,
+                            &Layout::contiguous((c_out, c_in, k_h, k_w)),
+                            params,
+                        )?;
+                        return out_f32.to_dtype(&Layout::contiguous((b, c_out, o_h, o_w)), self.dtype);
+                    }
+                    GemmOutcome::Rocblas(e) => return Err::<Self, _>(e).w(),
+                    GemmOutcome::NoKernel(_) => {
+                        drop(col_buf);
+                        drop(out_buf);
+                        return self.fallback2_wide(l, kernel, kernel_l, |a, la, b, lb| {
+                            a.conv2d(la, b, lb, params)
+                        });
+                    }
+                }
+            }
+        }
+        Ok(Self::new(out_buf, self.dtype, self.device.clone()))
     }
 
     fn conv_transpose2d(
@@ -889,7 +1140,117 @@ impl BackendStorage for RocmStorage {
         kernel_l: &Layout,
         params: &crate::conv::ParamsConvTranspose2D,
     ) -> Result<Self> {
-        self.fallback2_wide(l, kernel, kernel_l, |a, la, b, lb| a.conv_transpose2d(la, b, lb, params))
+        let Some(sfx) = dtype_suffix(self.dtype) else {
+            return self.fallback2_wide(l, kernel, kernel_l, |a, la, b, lb| {
+                a.conv_transpose2d(la, b, lb, params)
+            });
+        };
+        if !is_float(self.dtype) || self.dtype != kernel.dtype {
+            return self.fallback2_wide(l, kernel, kernel_l, |a, la, b, lb| {
+                a.conv_transpose2d(la, b, lb, params)
+            });
+        }
+        let (b, c_in, i_h, i_w) = (params.b_size, params.c_in, params.i_h, params.i_w);
+        let (c_out, k_h, k_w) = (params.c_out, params.k_h, params.k_w);
+        let o_h = params.out_h();
+        let o_w = params.out_w();
+        let out_elems = b * c_out * o_h * o_w;
+        let esz = self.esz();
+        if out_elems == 0 {
+            let out = self.device.alloc(0)?;
+            return Ok(Self::new(out, self.dtype, self.device.clone()));
+        }
+
+        let col2im_name = format!("col2im_2d_{sfx}");
+        let Ok(col2im_fn) = self.device.get_func(Module::Nn, &col2im_name) else {
+            return self.fallback2_wide(l, kernel, kernel_l, |a, la, b, lb| {
+                a.conv_transpose2d(la, b, lb, params)
+            });
+        };
+
+        let src_owned;
+        let src = if l.is_contiguous() && l.start_offset() == 0 {
+            self
+        } else {
+            src_owned = self.contiguous_copy(l)?;
+            &src_owned
+        };
+        let k_owned;
+        let w = if kernel_l.is_contiguous() && kernel_l.start_offset() == 0 {
+            kernel
+        } else {
+            k_owned = kernel.contiguous_copy(kernel_l)?;
+            &k_owned
+        };
+
+        let hw_in = i_h * i_w;
+        let col_rows = c_out * k_h * k_w;
+        let col_frame_bytes = col_rows.saturating_mul(hw_in).saturating_mul(esz);
+        const TILE_BUDGET: usize = 64 * 1024 * 1024;
+        let out_buf = self.device.alloc(out_elems * esz)?;
+        let block = 256u32;
+
+        if b == 1 || b.saturating_mul(col_frame_bytes) <= TILE_BUDGET {
+            let w_l = Layout::new((b, col_rows, c_in).into(), vec![0, 1, col_rows], 0);
+            let s_l = Layout::contiguous((b, c_in, hw_in));
+            let col = w.matmul(src, (b, col_rows, hw_in, c_in), &w_l, &s_l)?;
+            let mut args = LaunchArgs::new();
+            args.ptr(col.buf.as_ptr())
+                .ptr(out_buf.as_ptr())
+                .usize(b)
+                .usize(c_out)
+                .usize(i_h)
+                .usize(i_w)
+                .usize(k_h)
+                .usize(k_w)
+                .usize(o_h)
+                .usize(o_w)
+                .usize(params.padding)
+                .usize(params.stride)
+                .usize(params.dilation);
+            self.device.launch(
+                col2im_fn,
+                (grid_1d(out_elems, block), 1, 1),
+                (block, 1, 1),
+                0,
+                &mut args,
+            )?;
+        } else {
+            let in_frame_elems = c_in * hw_in;
+            let out_frame_elems = c_out * o_h * o_w;
+            let w_l = Layout::new((1, col_rows, c_in).into(), vec![0, 1, col_rows], 0);
+            for bi in 0..b {
+                let s_l = Layout::new(
+                    (1, c_in, hw_in).into(),
+                    vec![in_frame_elems, hw_in, 1],
+                    bi * in_frame_elems,
+                );
+                let col = w.matmul(src, (1, col_rows, hw_in, c_in), &w_l, &s_l)?;
+                let out_ptr = unsafe { out_buf.as_ptr().add(bi * out_frame_elems * esz) };
+                let mut args = LaunchArgs::new();
+                args.ptr(col.buf.as_ptr())
+                    .ptr(out_ptr)
+                    .usize(1)
+                    .usize(c_out)
+                    .usize(i_h)
+                    .usize(i_w)
+                    .usize(k_h)
+                    .usize(k_w)
+                    .usize(o_h)
+                    .usize(o_w)
+                    .usize(params.padding)
+                    .usize(params.stride)
+                    .usize(params.dilation);
+                self.device.launch(
+                    col2im_fn,
+                    (grid_1d(out_frame_elems, block), 1, 1),
+                    (block, 1, 1),
+                    0,
+                    &mut args,
+                )?;
+            }
+        }
+        Ok(Self::new(out_buf, self.dtype, self.device.clone()))
     }
 
     fn avg_pool2d(&self, l: &Layout, k: (usize, usize), s: (usize, usize)) -> Result<Self> {
@@ -905,7 +1266,43 @@ impl BackendStorage for RocmStorage {
     }
 
     fn upsample_nearest2d(&self, l: &Layout, h: usize, w: usize) -> Result<Self> {
-        self.fallback1(|c| c.upsample_nearest2d(l, h, w))
+        let Some(sfx) = dtype_suffix(self.dtype) else {
+            return self.fallback1(|c| c.upsample_nearest2d(l, h, w));
+        };
+        if !is_float(self.dtype) {
+            return self.fallback1(|c| c.upsample_nearest2d(l, h, w));
+        }
+        let (b, c, i_h, i_w) = l.shape().dims4()?;
+        let n = b * c * h * w;
+        if n == 0 {
+            let out = self.device.alloc(0)?;
+            return Ok(Self::new(out, self.dtype, self.device.clone()));
+        }
+        let name = format!("upsample_nearest2d_{sfx}");
+        let Ok(func) = self.device.get_func(Module::Nn, &name) else {
+            return self.fallback1(|c| c.upsample_nearest2d(l, h, w));
+        };
+        let src_owned;
+        let src = if l.is_contiguous() && l.start_offset() == 0 {
+            self
+        } else {
+            src_owned = self.contiguous_copy(l)?;
+            &src_owned
+        };
+        let out = self.device.alloc(n * self.esz())?;
+        let mut args = LaunchArgs::new();
+        args.ptr(src.buf.as_ptr())
+            .ptr(out.as_ptr())
+            .usize(b)
+            .usize(c)
+            .usize(i_h)
+            .usize(i_w)
+            .usize(h)
+            .usize(w);
+        let block = 256u32;
+        self.device
+            .launch(func, (grid_1d(n, block), 1, 1), (block, 1, 1), 0, &mut args)?;
+        Ok(Self::new(out, self.dtype, self.device.clone()))
     }
 
     fn upsample_bilinear2d(
@@ -917,7 +1314,71 @@ impl BackendStorage for RocmStorage {
         scale_h: Option<f64>,
         scale_w: Option<f64>,
     ) -> Result<Self> {
-        self.fallback1(|c| c.upsample_bilinear2d(l, h, w, align_corners, scale_h, scale_w))
+        let Some(sfx) = dtype_suffix(self.dtype) else {
+            return self.fallback1(|c| c.upsample_bilinear2d(l, h, w, align_corners, scale_h, scale_w));
+        };
+        if !is_float(self.dtype) {
+            return self.fallback1(|c| c.upsample_bilinear2d(l, h, w, align_corners, scale_h, scale_w));
+        }
+        let (b, c, i_h, i_w) = l.shape().dims4()?;
+        if i_h == h && i_w == w {
+            return self.contiguous_copy(l);
+        }
+        let n = b * c * h * w;
+        if n == 0 {
+            let out = self.device.alloc(0)?;
+            return Ok(Self::new(out, self.dtype, self.device.clone()));
+        }
+        let name = format!("upsample_bilinear2d_{sfx}");
+        let Ok(func) = self.device.get_func(Module::Nn, &name) else {
+            return self.fallback1(|c| c.upsample_bilinear2d(l, h, w, align_corners, scale_h, scale_w));
+        };
+        let sh = if align_corners {
+            if h > 1 {
+                (i_h - 1) as f64 / (h - 1) as f64
+            } else {
+                0.0
+            }
+        } else if let Some(sf) = scale_h {
+            1.0 / sf
+        } else {
+            i_h as f64 / h as f64
+        };
+        let sw = if align_corners {
+            if w > 1 {
+                (i_w - 1) as f64 / (w - 1) as f64
+            } else {
+                0.0
+            }
+        } else if let Some(sf) = scale_w {
+            1.0 / sf
+        } else {
+            i_w as f64 / w as f64
+        };
+        let src_owned;
+        let src = if l.is_contiguous() && l.start_offset() == 0 {
+            self
+        } else {
+            src_owned = self.contiguous_copy(l)?;
+            &src_owned
+        };
+        let out = self.device.alloc(n * self.esz())?;
+        let mut args = LaunchArgs::new();
+        args.ptr(src.buf.as_ptr())
+            .ptr(out.as_ptr())
+            .usize(b)
+            .usize(c)
+            .usize(i_h)
+            .usize(i_w)
+            .usize(h)
+            .usize(w)
+            .f64(sh)
+            .f64(sw)
+            .u32(if align_corners { 1 } else { 0 });
+        let block = 256u32;
+        self.device
+            .launch(func, (grid_1d(n, block), 1, 1), (block, 1, 1), 0, &mut args)?;
+        Ok(Self::new(out, self.dtype, self.device.clone()))
     }
 
     fn gather(&self, l: &Layout, ids: &Self, ids_l: &Layout, dim: usize) -> Result<Self> {
