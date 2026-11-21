@@ -415,3 +415,61 @@ impl RocmDevice {
         })
     }
 }
+
+/// Reusable page-locked staging slot for overlapping host-to-device DMA uploads (such as
+/// layer weight streaming or next-crop vision inputs) with compute kernels on `RocmDevice`.
+pub struct AsyncPrefetchSlot {
+    buf: PinnedHostBuffer,
+    stream: CopyStream,
+    inflight: Option<CopyEvent>,
+}
+
+impl AsyncPrefetchSlot {
+    pub fn new(device: &RocmDevice, capacity_bytes: usize) -> Result<Self> {
+        Ok(Self {
+            buf: device.alloc_pinned(capacity_bytes)?,
+            stream: device.copy_stream()?,
+            inflight: None,
+        })
+    }
+
+    pub fn capacity_bytes(&self) -> usize {
+        self.buf.len()
+    }
+
+    /// Waits for any prior DMA from this slot to finish, copies `src` into the pinned buffer,
+    /// and queues an asynchronous H2D upload into `dst` at `dst_off`.
+    pub fn prefetch_bytes(&mut self, src: &[u8], dst: &RocmStorage, dst_off: usize) -> Result<()> {
+        if let Some(ev) = self.inflight.take() {
+            ev.synchronize()?;
+        }
+        if src.len() > self.buf.len() {
+            bail!(
+                "AsyncPrefetchSlot: payload {} bytes exceeds capacity {} bytes",
+                src.len(),
+                self.buf.len()
+            );
+        }
+        self.buf.as_mut_slice()[..src.len()].copy_from_slice(src);
+        let ev = self.stream.upload(&self.buf, 0, dst, dst_off, src.len())?;
+        self.inflight = Some(ev);
+        Ok(())
+    }
+
+    /// Makes the compute stream wait (on GPU, without blocking the host thread) until the
+    /// queued upload completes.
+    pub fn wait_on_compute(&mut self, dev: &RocmDevice) -> Result<()> {
+        if let Some(ev) = self.inflight.take() {
+            ev.wait_on_compute(dev)?;
+        }
+        Ok(())
+    }
+
+    /// Blocks the host until the queued upload completes.
+    pub fn synchronize(&mut self) -> Result<()> {
+        if let Some(ev) = self.inflight.take() {
+            ev.synchronize()?;
+        }
+        Ok(())
+    }
+}

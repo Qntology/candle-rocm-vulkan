@@ -14,6 +14,10 @@ pub const ACCEL_COMMON_H: &str = include_str!("../../kernels/accel_common.h");
 pub const FLASH_ATTN_IMPL_H: &str = include_str!("../../kernels/flash_attn_impl.h");
 pub const TURBO_QUANT_IMPL_H: &str = include_str!("../../kernels/turbo_quant_impl.h");
 
+pub(crate) fn strip_includes(src: &str) -> String {
+    strip(src)
+}
+
 fn strip(src: &str) -> String {
     src.lines()
         .filter(|l| {
@@ -102,6 +106,16 @@ pub fn turbo_quant_cuda_source() -> String {
         strip(ACCEL_COMMON_H),
         strip(TURBO_QUANT_IMPL_H)
     )
+}
+
+/// NVRTC source of the fused decoder kernels (`ResidualRmsNorm`, `SiluMul`, `RopeKvWrite`).
+pub fn decoder_ops_cuda_source() -> String {
+    super::decoder_ops::decoder_ops_cuda_source()
+}
+
+/// NVRTC source of the fused `lm_head` tile argmax + CS guard kernels.
+pub fn lm_head_argmax_cuda_source() -> String {
+    super::lm_head::lm_head_argmax_cuda_source()
 }
 
 #[cfg(test)]

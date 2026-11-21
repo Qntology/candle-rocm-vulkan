@@ -10,7 +10,7 @@ use crate::{bail, DType, Result};
 use cudarc::driver::{DevicePtr, DevicePtrMut, LaunchConfig, PushKernelArg, SyncOnDrop};
 
 /// NVRTC `--gpu-architecture` of the device (interned: NVRTC options take `&'static str`).
-fn arch(dev: &CudaDevice) -> &'static str {
+pub(super) fn arch(dev: &CudaDevice) -> &'static str {
     use cudarc::driver::sys::CUdevice_attribute as A;
     use std::collections::HashMap;
     use std::sync::Mutex;

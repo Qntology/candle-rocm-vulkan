@@ -10,8 +10,10 @@
 
 pub mod attention;
 pub mod config;
+pub mod decoder_ops;
 pub mod delta;
 pub mod formats;
+pub mod lm_head;
 pub mod profile;
 pub mod sources;
 pub mod turbo;

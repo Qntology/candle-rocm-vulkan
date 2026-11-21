@@ -216,6 +216,21 @@ impl Tensor {
         self.const_set(crate::scalar::Scalar::one(self.dtype()))
     }
 
+    /// True iff both this `Tensor` handle (`Arc<Tensor_>`) and its backing storage
+    /// (`Arc<RwLock<Storage>>`) have strong reference count 1 and the layout is contiguous
+    /// starting at offset 0. Guarantees safe in-place mutation without aliasing any other view.
+    pub fn is_sole_owner_contiguous(&self) -> bool {
+        Arc::strong_count(&self.0) == 1
+            && Arc::strong_count(&self.0.storage) == 1
+            && self.layout().is_contiguous()
+            && self.layout().start_offset() == 0
+    }
+
+    /// True iff `self` and `other` share the same underlying storage allocation.
+    pub fn shares_storage(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0.storage, &other.0.storage)
+    }
+
     /// Creates a new tensor filled with ones with same shape, dtype, and device as the other tensor.
     ///
     /// ```rust

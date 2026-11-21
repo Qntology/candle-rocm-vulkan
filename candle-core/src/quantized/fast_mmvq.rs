@@ -143,6 +143,9 @@ pub fn try_fwd(
     if ncols != k {
         return Ok(None);
     }
+    if k % w_dtype.block_size() != 0 {
+        return Ok(None);
+    }
     if b_size == 0 || b_size > MMVQ_MAX_BATCH {
         return Ok(None);
     }
