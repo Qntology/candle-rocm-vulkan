@@ -151,17 +151,135 @@ pub fn moe_gemm(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
+fn generic_moe_gemm_dense(
+    input: &Tensor,
+    weights: &Tensor,
+    topk_weights: &Option<Tensor>,
+    sorted_token_ids: &Tensor,
+    experts_ids: &Tensor,
+    topk: usize,
+) -> Result<Tensor> {
+    use candle::{DType, Device};
+    let (in_rows, k) = input.dims2()?;
+    let (_num_experts, n, k_w) = weights.dims3()?;
+    if k != k_w {
+        candle::bail!("moe_gemm: input k {k} != weight k {k_w}");
+    }
+    let size_m = if topk_weights.is_none() {
+        in_rows * topk
+    } else {
+        in_rows
+    };
+    let s_ids = sorted_token_ids
+        .to_device(&Device::Cpu)?
+        .to_dtype(DType::U32)?
+        .flatten_all()?
+        .to_vec1::<u32>()?;
+    let e_ids = experts_ids
+        .to_device(&Device::Cpu)?
+        .to_dtype(DType::U32)?
+        .flatten_all()?
+        .to_vec1::<u32>()?;
+    let mut slot_expert = vec![0usize; size_m];
+    for (&slot, &exp) in s_ids.iter().zip(e_ids.iter()) {
+        if (slot as usize) < size_m {
+            slot_expert[slot as usize] = exp as usize;
+        }
+    }
+    let in_dtype = input.dtype();
+    let compute = if input.device().is_cpu() && in_dtype == DType::BF16 {
+        DType::F32
+    } else {
+        in_dtype
+    };
+    let x = input.to_dtype(compute)?;
+    let w = weights.to_dtype(compute)?;
+    let mut rows_out = Vec::with_capacity(size_m);
+    for (slot, &exp) in slot_expert.iter().enumerate() {
+        let xr = if topk_weights.is_none() {
+            slot / topk
+        } else {
+            slot
+        };
+        let x_row = x.narrow(0, xr, 1)?;
+        let w_e = w.narrow(0, exp, 1)?.squeeze(0)?;
+        rows_out.push(x_row.matmul(&w_e.t()?)?);
+    }
+    let mut out = Tensor::cat(&rows_out, 0)?.reshape((size_m, n))?;
+    if let Some(tw) = topk_weights {
+        let tw_col = tw.reshape((size_m, 1))?.to_dtype(out.dtype())?;
+        out = out.broadcast_mul(&tw_col)?;
+    }
+    if out.dtype() == in_dtype {
+        Ok(out)
+    } else {
+        out.to_dtype(in_dtype)
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn generic_moe_gemm_gguf(
+    input: &Tensor,
+    weights: &QTensor,
+    topk_weights: &Option<Tensor>,
+    sorted_token_ids: &Tensor,
+    experts_ids: &Tensor,
+    topk: usize,
+) -> Result<Tensor> {
+    use candle::{DType, Device};
+    let (in_rows, k) = input.dims2()?;
+    let (_num_experts, n, k_w) = weights.shape().dims3()?;
+    if k != k_w {
+        candle::bail!("moe_gemm_gguf: input k {k} != weight k {k_w}");
+    }
+    let batch = if topk_weights.is_none() {
+        in_rows
+    } else {
+        in_rows / topk.max(1)
+    };
+    let size_m = batch * topk;
+    let s_ids = sorted_token_ids
+        .to_device(&Device::Cpu)?
+        .to_dtype(DType::U32)?
+        .flatten_all()?
+        .to_vec1::<u32>()?;
+    let e_ids = experts_ids
+        .to_device(&Device::Cpu)?
+        .to_dtype(DType::U32)?
+        .flatten_all()?
+        .to_vec1::<u32>()?;
+    let mut slot_expert = vec![0u32; size_m];
+    for (&slot, &exp) in s_ids.iter().zip(e_ids.iter()) {
+        if (slot as usize) < size_m {
+            slot_expert[slot as usize] = exp;
+        }
+    }
+    let ids = Tensor::from_vec(slot_expert, (batch, topk), input.device())?;
+    let x_in = if topk_weights.is_none() {
+        input.clone()
+    } else {
+        input.reshape((batch, topk, k))?
+    };
+    let mut out = weights.indexed_moe_forward(&x_in, &ids)?.reshape((size_m, n))?;
+    if let Some(tw) = topk_weights {
+        let tw_col = tw.reshape((size_m, 1))?.to_dtype(out.dtype())?;
+        out = out.broadcast_mul(&tw_col)?;
+    }
+    Ok(out)
+}
+
 #[cfg(not(feature = "cuda"))]
 pub fn moe_gemm(
-    _: &Tensor,
-    _: &Tensor,
-    _: &Option<Tensor>,
-    _: &Tensor,
-    _: &Tensor,
-    _: usize,
-    _: bool,
+    input: &Tensor,
+    weights: &Tensor,
+    topk_weights: &Option<Tensor>,
+    sorted_token_ids: &Tensor,
+    experts_ids: &Tensor,
+    topk: usize,
+    _is_prefill: bool,
 ) -> Result<Tensor> {
-    candle::bail!("moe_gemm is only implemented for the cuda backend")
+    generic_moe_gemm_dense(input, weights, topk_weights, sorted_token_ids, experts_ids, topk)
 }
 
 #[cfg(feature = "cuda")]
@@ -339,14 +457,14 @@ pub fn moe_gemm_gguf(
 #[cfg(not(feature = "cuda"))]
 #[allow(clippy::too_many_arguments)]
 pub fn moe_gemm_gguf(
-    _: &Tensor,
-    _: &QTensor,
-    _: &Option<Tensor>,
-    _: &Tensor,
-    _: &Tensor,
-    _: usize,
-    _: bool,
-    _: candle::DType,
+    input: &Tensor,
+    weights: &QTensor,
+    topk_weights: &Option<Tensor>,
+    sorted_token_ids: &Tensor,
+    experts_ids: &Tensor,
+    topk: usize,
+    _is_prefill: bool,
+    _dtype: candle::DType,
 ) -> Result<Tensor> {
-    candle::bail!("moe_gemm_gguf is only implemented for the cuda backend")
+    generic_moe_gemm_gguf(input, weights, topk_weights, sorted_token_ids, experts_ids, topk)
 }

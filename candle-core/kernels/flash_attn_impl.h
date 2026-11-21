@@ -327,8 +327,23 @@ AX_DEV void fa_rowg_core(FA_PARAMS(TQ, TKV), const ax_pages *pg) {
     }
 }
 
-template <typename TQ, typename TKV, int BR, int BC, int DMAX>
-AX_DEV void fa_tile_impl(FA_PARAMS(TQ, TKV)) {
+template <typename TKV>
+AX_DEV float fa_load_paged(const ax_pages *pg, ax_u32 bi_start, long long j0_start, long long j,
+                           ax_u32 d, ax_u64 bh, ax_u64 row_stride, bool is_v) {
+    ax_u32 bi = bi_start;
+    long long j0 = j0_start;
+    while (bi + 1u < pg->n && j >= j0 + (long long)pg->rows[bi]) {
+        j0 += (long long)pg->rows[bi];
+        ++bi;
+    }
+    const ax_u64 cap = is_v ? (ax_u64)pg->v_cap[bi] : (ax_u64)pg->k_cap[bi];
+    const ax_u64 ptr = is_v ? pg->v[bi] : pg->k[bi];
+    const TKV *base = reinterpret_cast<const TKV *>(ptr) + bh * (cap * row_stride);
+    return ax_load(base, (ax_u64)(j - j0) * row_stride + d);
+}
+
+template <typename TQ, typename TKV, bool PAGED, int BR, int BC, int DMAX>
+AX_DEV void fa_tile_core(FA_PARAMS(TQ, TKV), const ax_pages *pg) {
     const int TPR = FA_NT / BR;
     const int NACC = DMAX / TPR;
     const ax_u32 DP = D + 1; // padded row stride against bank conflicts
@@ -343,16 +358,17 @@ AX_DEV void fa_tile_impl(FA_PARAMS(TQ, TKV)) {
     const ax_u32 b = AX_BID_Z;
     ax_u32 lq = Lq, lk = Lk;
     ax_u64 q0 = (ax_u64)b * Lq, k0 = 0;
-    if (varlen) {
+    if (!PAGED && varlen) {
         q0 = cu_q[b];
         lq = cu_q[b + 1] - cu_q[b];
         k0 = cu_k[b];
         lk = cu_k[b + 1] - cu_k[b];
     }
     const ax_u32 hk = h / (Hq / Hkv);
-    const TQ *qb = varlen ? q + q0 * q_ss + h * q_sh : q + b * q_sb + h * q_sh;
-    const TKV *kb_ = varlen ? k + k0 * k_ss + hk * k_sh : k + b * k_sb + hk * k_sh;
-    const TKV *vb_ = varlen ? v + k0 * v_ss + hk * v_sh : v + b * v_sb + hk * v_sh;
+    const ax_u64 bh = (ax_u64)b * Hkv + hk;
+    const TQ *qb = (!PAGED && varlen) ? q + q0 * q_ss + h * q_sh : q + b * q_sb + h * q_sh;
+    const TKV *kb_ = PAGED ? nullptr : (varlen ? k + k0 * k_ss + hk * k_sh : k + b * k_sb + hk * k_sh);
+    const TKV *vb_ = PAGED ? nullptr : (varlen ? v + k0 * v_ss + hk * v_sh : v + b * v_sb + hk * v_sh);
     const long long off = (long long)lk - (long long)lq;
     const float slope = alibi ? alibi[(ax_u64)b * alibi_bs + h] : 0.0f;
     for (ax_u64 tile = AX_BID_X; (long long)(tile * BR) < (long long)lq; tile += AX_NBLK_X) {
@@ -373,12 +389,26 @@ AX_DEV void fa_tile_impl(FA_PARAMS(TQ, TKV)) {
         float acc[NACC];
         AX_UNROLL
         for (int c = 0; c < NACC; ++c) acc[c] = 0.0f;
+        ax_u32 bi_start = 0;
+        long long j0_start = 0;
         for (long long kt = lo; kt < hi; kt += BC) {
+            if (PAGED) {
+                while (bi_start + 1u < pg->n && j0_start + (long long)pg->rows[bi_start] <= kt) {
+                    j0_start += (long long)pg->rows[bi_start];
+                    ++bi_start;
+                }
+            }
             AX_SYNC();
             for (ax_u32 idx = t; idx < BC * D; idx += FA_NT) {
                 const ax_u32 c = idx / D, d = idx % D;
                 const long long j = kt + c;
-                KVs[c * DP + d] = j < hi ? kd * ax_load(kb_, (ax_u64)j * k_ss + d) : 0.0f;
+                float kv = 0.0f;
+                if (j < hi) {
+                    kv = PAGED ? fa_load_paged<TKV>(pg, bi_start, j0_start, j, d, bh, k_ss, false)
+                               : ax_load(kb_, (ax_u64)j * k_ss + d);
+                    kv *= kd;
+                }
+                KVs[c * DP + d] = kv;
             }
             AX_SYNC();
             for (ax_u32 idx = t; idx < BR * BC; idx += FA_NT) {
@@ -400,7 +430,12 @@ AX_DEV void fa_tile_impl(FA_PARAMS(TQ, TKV)) {
             for (ax_u32 idx = t; idx < BC * D; idx += FA_NT) {
                 const ax_u32 c = idx / D, d = idx % D;
                 const long long j = kt + c;
-                KVs[c * DP + d] = j < hi ? ax_load(vb_, (ax_u64)j * v_ss + d) : 0.0f;
+                float vv = 0.0f;
+                if (j < hi) {
+                    vv = PAGED ? fa_load_paged<TKV>(pg, bi_start, j0_start, j, d, bh, v_ss, true)
+                               : ax_load(vb_, (ax_u64)j * v_ss + d);
+                }
+                KVs[c * DP + d] = vv;
             }
             float mt = -AX_INF;
             for (int c = 0; c < BC; ++c) mt = fmaxf(mt, S[r * BC + c]);
@@ -440,6 +475,16 @@ AX_DEV void fa_tile_impl(FA_PARAMS(TQ, TKV)) {
             }
         }
     }
+}
+
+template <typename TQ, typename TKV, int BR, int BC, int DMAX>
+AX_DEV void fa_tile_impl(FA_PARAMS(TQ, TKV)) {
+    fa_tile_core<TQ, TKV, false, BR, BC, DMAX>(FA_ARGS, nullptr);
+}
+
+template <typename TQ, typename TKV, int BR, int BC, int DMAX>
+AX_DEV void fa_tilep_impl(FA_PARAMS(TQ, TKV), const ax_pages &pg) {
+    fa_tile_core<TQ, TKV, true, BR, BC, DMAX>(FA_ARGS, &pg);
 }
 
 // Merges the normalized partial outputs of n_splits key splits with their log-sum-exp. The
@@ -506,6 +551,11 @@ AX_DEV void fa_combine_impl(const float *part_o, const float *part_lse, TO *o, a
         fa_tile_impl<TQ, TKV, BR, BC, DMAX>(FA_ARGS);                                              \
     }
 
+#define FA_TILEP_KERNEL(NAME, TQ, TKV, BR, BC, DMAX)                                               \
+    AX_KERNEL void AX_BOUNDS(FA_NT) NAME(FA_PARAMS(TQ, TKV), const ax_pages pg) {                  \
+        fa_tilep_impl<TQ, TKV, BR, BC, DMAX>(FA_ARGS, pg);                                         \
+    }
+
 #define FA_COMBINE_KERNEL(NAME, TO)                                                                \
     AX_KERNEL void AX_BOUNDS(FA_NT) NAME(const float *part_o, const float *part_lse, TO *o,        \
                                          ax_u64 rows, ax_u32 D, ax_u32 n_splits) {                 \
@@ -518,14 +568,26 @@ AX_DEV void fa_combine_impl(const float *part_o, const float *part_lse, TO *o, a
     FA_TILE_KERNEL(fa2_d128_##Q##_##KV, TQ, TKV, 16, 32, 128)                                      \
     FA_TILE_KERNEL(fa2_d256_##Q##_##KV, TQ, TKV, 8, 16, 256)
 
+#define FA2_TILESP(Q, KV, TQ, TKV)                                                                 \
+    FA_TILEP_KERNEL(fa2p_d64_##Q##_##KV, TQ, TKV, 32, 32, 64)                                      \
+    FA_TILEP_KERNEL(fa2p_d128_##Q##_##KV, TQ, TKV, 16, 32, 128)                                    \
+    FA_TILEP_KERNEL(fa2p_d256_##Q##_##KV, TQ, TKV, 8, 16, 256)
+
 #define FA3_TILES(Q, KV, TQ, TKV)                                                                  \
     FA_TILE_KERNEL(fa3_d64_##Q##_##KV, TQ, TKV, 64, 64, 64)                                        \
     FA_TILE_KERNEL(fa3_d128_##Q##_##KV, TQ, TKV, 32, 64, 128)                                      \
     FA_TILE_KERNEL(fa3_d256_##Q##_##KV, TQ, TKV, 16, 32, 256)
+
+#define FA3_TILESP(Q, KV, TQ, TKV)                                                                 \
+    FA_TILEP_KERNEL(fa3p_d64_##Q##_##KV, TQ, TKV, 64, 64, 64)                                      \
+    FA_TILEP_KERNEL(fa3p_d128_##Q##_##KV, TQ, TKV, 32, 64, 128)                                    \
+    FA_TILEP_KERNEL(fa3p_d256_##Q##_##KV, TQ, TKV, 16, 32, 256)
 
 #define FA_ALL_FOR(Q, KV, TQ, TKV)                                                                 \
     FA_ROW_KERNEL(fa_row_##Q##_##KV, TQ, TKV)                                                      \
     FA_ROWP_KERNEL(fa_rowp_##Q##_##KV, TQ, TKV)                                                    \
     FA_ROWG_ALL(Q, KV, TQ, TKV)                                                                    \
     FA2_TILES(Q, KV, TQ, TKV)                                                                      \
-    FA3_TILES(Q, KV, TQ, TKV)
+    FA2_TILESP(Q, KV, TQ, TKV)                                                                     \
+    FA3_TILES(Q, KV, TQ, TKV)                                                                      \
+    FA3_TILESP(Q, KV, TQ, TKV)

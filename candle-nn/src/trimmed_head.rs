@@ -5,10 +5,169 @@
 //! equivalence with full-vocabulary `argmax(hidden @ W^T + b)`.
 
 use candle::{DType, Result, Tensor};
+use std::sync::Arc;
 
 pub use candle::lm_head::{
-    fused_linear_argmax_cs, logits_argmax_cs, ArgmaxCsOutput, CsGuardParams,
+    fused_linear_argmax_cs, fused_quant_argmax_cs, logits_argmax_cs, ArgmaxCsOutput, CsGuardParams,
 };
+
+/// Weight representation for a guarded `lm_head` (dense float or block-quantized [`QTensor`]).
+#[derive(Clone)]
+pub enum LmWeight {
+    Dense(Tensor),
+    Quantized(Arc<candle::quantized::QTensor>),
+}
+
+impl std::fmt::Debug for LmWeight {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Dense(t) => f.debug_tuple("Dense").field(t).finish(),
+            Self::Quantized(q) => f
+                .debug_tuple("Quantized")
+                .field(q.shape())
+                .field(&q.dtype())
+                .finish(),
+        }
+    }
+}
+
+impl LmWeight {
+    pub fn forward_argmax_cs(
+        &self,
+        hidden: &Tensor,
+        bias: Option<&Tensor>,
+        core_ids: Option<&Tensor>,
+        cs_guard: Option<&CsGuardParams>,
+    ) -> Result<ArgmaxCsOutput> {
+        match self {
+            Self::Dense(w) => fused_linear_argmax_cs(hidden, w, bias, core_ids, cs_guard),
+            Self::Quantized(q) => fused_quant_argmax_cs(hidden, q, bias, core_ids, cs_guard),
+        }
+    }
+}
+
+/// Two-tier lossless greedy `lm_head` accepting dense or quantized CORE/REST weights.
+///
+/// Uses Mode A (`fused_linear_argmax_cs` / `fused_quant_argmax_cs`) for zero-materialization
+/// decoding where supported and guarantees 100% greedy token agreement with full-vocabulary argmax.
+#[derive(Clone, Debug)]
+pub struct GuardedQuantLmHead {
+    pub w_core: LmWeight,
+    pub b_core: Option<Tensor>,
+    pub core_ids: Tensor,
+    pub w_rest: Option<LmWeight>,
+    pub b_rest: Option<Tensor>,
+    pub rest_ids: Option<Tensor>,
+    pub cs_guard: Option<CsGuardParams>,
+}
+
+impl GuardedQuantLmHead {
+    /// Builds a two-tier head from pre-split quantized or dense CORE/REST weights and computes
+    /// [`CsGuardParams`] over the exact dequantized REST weights.
+    pub fn from_split_weights(
+        w_core: LmWeight,
+        b_core: Option<Tensor>,
+        core_ids: Tensor,
+        w_rest: Option<(LmWeight, Option<Tensor>, Tensor)>,
+        safety_margin: f32,
+        device: &candle::Device,
+    ) -> Result<Self> {
+        let (w_rest_out, b_rest_out, rest_ids_out, cs_guard) = match w_rest {
+            None => (None, None, None, None),
+            Some((wr, br, rids)) => {
+                let guard = match &wr {
+                    LmWeight::Dense(t) => {
+                        CsGuardParams::from_rest_weight(t, br.as_ref(), safety_margin)?
+                    }
+                    LmWeight::Quantized(q) => CsGuardParams::from_quant_rest_weight(
+                        q,
+                        br.as_ref(),
+                        safety_margin,
+                        device,
+                    )?,
+                };
+                (Some(wr), br, Some(rids), Some(guard))
+            }
+        };
+        Ok(Self {
+            w_core,
+            b_core,
+            core_ids,
+            w_rest: w_rest_out,
+            b_rest: b_rest_out,
+            rest_ids: rest_ids_out,
+            cs_guard,
+        })
+    }
+
+    /// Runs lossless greedy token selection for `hidden [..., K]`.
+    /// Returns `(token_ids [M] u32, rescued_row_count)`.
+    pub fn forward_greedy(&self, hidden: &Tensor) -> Result<(Tensor, usize)> {
+        let dev = hidden.device();
+        let k = *hidden.dims().last().unwrap_or(&0);
+        let m = hidden.elem_count() / k.max(1);
+        let h_2d = hidden.reshape((m, k))?;
+
+        let core_out = self.w_core.forward_argmax_cs(
+            &h_2d,
+            self.b_core.as_ref(),
+            Some(&self.core_ids),
+            self.cs_guard.as_ref(),
+        )?;
+
+        let (Some(w_rest), Some(rest_ids), Some(mask_t), Some(core_vals_t)) = (
+            self.w_rest.as_ref(),
+            self.rest_ids.as_ref(),
+            core_out.rescue_mask.as_ref(),
+            core_out.max_vals.as_ref(),
+        ) else {
+            return Ok((core_out.ids, 0));
+        };
+
+        let masks = mask_t.to_vec1::<u8>()?;
+        let rescue_rows: Vec<u32> = masks
+            .iter()
+            .enumerate()
+            .filter_map(|(i, &flag)| (flag != 0).then_some(i as u32))
+            .collect();
+        if rescue_rows.is_empty() {
+            return Ok((core_out.ids, 0));
+        }
+
+        let r_count = rescue_rows.len();
+        let row_idx = Tensor::from_vec(rescue_rows.clone(), (r_count,), dev)?;
+        let h_sub = h_2d.index_select(&row_idx, 0)?.contiguous()?;
+
+        let rest_out = w_rest.forward_argmax_cs(
+            &h_sub,
+            self.b_rest.as_ref(),
+            Some(rest_ids),
+            None,
+        )?;
+
+        let mut ids = core_out.ids.to_vec1::<u32>()?;
+        let core_vals = core_vals_t.to_vec1::<f32>()?;
+        let rest_best_ids = rest_out.ids.to_vec1::<u32>()?;
+        let rest_best_vals = rest_out
+            .max_vals
+            .expect("forward_argmax_cs always returns max_vals")
+            .to_vec1::<f32>()?;
+
+        for (k_i, &orig_row) in rescue_rows.iter().enumerate() {
+            let r = orig_row as usize;
+            let rv = rest_best_vals[k_i];
+            let ri = rest_best_ids[k_i];
+            let cv = core_vals[r];
+            let ci = ids[r];
+            if rv > cv || (rv == cv && ri < ci) {
+                ids[r] = ri;
+            }
+        }
+
+        let merged = Tensor::from_vec(ids, (m,), dev)?.to_dtype(DType::U32)?;
+        Ok((merged, r_count))
+    }
+}
 
 /// Two-tier lossless greedy `lm_head` holding a small CORE vocabulary weight (`w_core`) plus
 /// optional VRAM-resident REST weight (`w_rest`) guarded by [`CsGuardParams`].

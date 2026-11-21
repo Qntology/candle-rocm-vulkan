@@ -498,7 +498,16 @@ pub fn split_count_grouped(
             let workgroups = (rows / group).max(1);
             let by_occupancy =
                 (SPLIT_WORKGROUPS_PER_CU * compute_units.max(1)).div_ceil(workgroups);
-            let keys = if group > 1 { FA_THREADS / 2 } else { FA_THREADS };
+            // High-SM GPUs (>= 64 CUs, e.g., Ada/Hopper/Blackwell/CDNA) would otherwise saturate
+            // FA_MAX_SPLITS on short contexts where launch_combine dominates; keep a 256-key
+            // floor per split there.
+            let keys = if compute_units >= 64 {
+                256
+            } else if group > 1 {
+                FA_THREADS / 2
+            } else {
+                FA_THREADS
+            };
             let by_keys = lk.div_ceil(keys).max(1);
             by_occupancy.min(by_keys).clamp(1, FA_MAX_SPLITS)
         }
@@ -579,6 +588,18 @@ pub fn kv_dtype_supported(q: DType, kv: DType) -> bool {
 pub fn paged_kernel_name(q: DType, kv: DType) -> Result<String> {
     let name = kernel_name(&FaPlan::Row { splits: 1 }, q, kv)?;
     Ok(name.replacen("fa_row_", "fa_rowp_", 1))
+}
+
+/// Kernel name of the paged tile kernel (`fa2p_d*` / `fa3p_d*`) for a tile plan and query / KV dtypes.
+pub fn paged_tile_kernel_name(plan: &FaPlan, q: DType, kv: DType) -> Result<String> {
+    let name = kernel_name(plan, q, kv)?;
+    if let Some(rest) = name.strip_prefix("fa2_") {
+        Ok(format!("fa2p_{rest}"))
+    } else if let Some(rest) = name.strip_prefix("fa3_") {
+        Ok(format!("fa3p_{rest}"))
+    } else {
+        bail!("flash-attn: expected tile plan for paged_tile_kernel_name, got {name}")
+    }
 }
 
 /// Query heads per workgroup of the GQA-packed row kernels for `hq` query and `hkv` kv heads:

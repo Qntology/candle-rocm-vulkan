@@ -57,6 +57,10 @@ fn gpu_device() -> Option<Device> {
     if let Ok(d) = Device::new_rocm(0) {
         return Some(d);
     }
+    #[cfg(feature = "vulkan")]
+    if let Ok(d) = Device::new_vulkan(0) {
+        return Some(d);
+    }
     None
 }
 

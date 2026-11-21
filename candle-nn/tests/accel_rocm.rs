@@ -1457,4 +1457,122 @@ mod turbo {
         }
         println!("TurboKvCache fused vs unfused: worst max rel err {worst:.3e}");
     }
+
+    /// Paged tile prefill (`lq = 16 > FA_DECODE_MAX_Q`, `fa2p`/`fa3p`) matches concatenated
+    /// attention without calling `cat_blocks`.
+    #[test]
+    fn paged_tile_prefill_matches_concatenated() {
+        let _s = serial();
+        let dev = gpu();
+        for d in [64usize, 128] {
+            let (hq, hkv, lq, lk) = (8usize, 2usize, 16usize, 192usize);
+            let scale = 1.0 / (d as f32).sqrt();
+            let host_blocks = make_blocks(3, 64, 64, hkv, d, 9100 + d as u64, DType::F16);
+            let (k_cat, v_cat) = cat_valid(&host_blocks, &dev);
+            let blocks = upload_blocks(&host_blocks, &dev);
+            let q = up(&randn(&[1, hq, lq, d], 9200 + d as u64).to_dtype(DType::F16).unwrap(), &dev);
+            let cfg = strict(scale);
+            let paged = flash_attn_blocks(&q, &refs(&blocks), &cfg).unwrap();
+            let dense = flash_attn_bhsd(&q, &k_cat, &v_cat, &cfg).unwrap();
+            let e = rel(&paged, &dense);
+            println!("paged tile prefill d={d} lq={lq} lk={lk}: max rel err {e:.3e}");
+            assert!(e <= 2e-3, "paged tile prefill d={d}: {e}");
+        }
+    }
+
+    /// Bit-exact `tq_attn*_nvfp4` fast path + FWHT + single-pass `tq_quant_prod_fused` +
+    /// `OffloadedTurboKvEngine` + `GuardedQuantLmHead` on live ROCm GPU.
+    #[test]
+    fn tq_nvfp4_fast_fwht_offload_and_quant_lm_head() {
+        let _s = serial();
+        let dev = gpu();
+        let (hq, hkv, d, lk) = (8usize, 2usize, 128usize, 256usize);
+        let scale = 1.0 / (d as f32).sqrt();
+        let kq = TurboQuantizer::new(QuantFormat::Nvfp4, d, RotationKind::Hadamard, 19, &dev).unwrap();
+        let vq = TurboQuantizer::new(QuantFormat::Fp8, d, RotationKind::Hadamard, 21, &dev).unwrap();
+        let k = up(&randn(&[1, hkv, lk, d], 9301), &dev);
+        let v = up(&randn(&[1, hkv, lk, d], 9302), &dev);
+        let (kr, vr) = (pack(&kq, &k), pack(&vq, &v));
+        let q = up(&randn(&[1, hq, 1, d], 9303), &dev);
+        let cfg = strict(scale);
+        set_fp8_fast(false);
+        let slow = attention_packed(&q, &kr, &vr, lk, &kq, &vq, &cfg).unwrap();
+        set_fp8_fast(true);
+        let fast = attention_packed(&q, &kr, &vr, lk, &kq, &vq, &cfg).unwrap();
+        assert_bits_eq(&fast, &slow, "tq_attn NVFP4/FP8 fast path vs generic");
+
+        // Single-pass TurboProd QJL quantize matches CPU codec.
+        let pq = TurboQuantizer::new(
+            QuantFormat::TurboProd { bits: 4 },
+            64,
+            RotationKind::Hadamard,
+            31,
+            &dev,
+        )
+        .unwrap();
+        let pq_cpu = TurboQuantizer::new(
+            QuantFormat::TurboProd { bits: 4 },
+            64,
+            RotationKind::Hadamard,
+            31,
+            &Device::Cpu,
+        )
+        .unwrap();
+        let x_cpu = randn(&[16, 64], 9401);
+        let p_gpu = pq.quantize_rows(&up(&x_cpu, &dev)).unwrap();
+        let d_gpu = pq.dequantize_rows(&p_gpu).unwrap();
+        let d_cpu = pq_cpu.dequantize_rows(&pq_cpu.quantize_rows(&x_cpu).unwrap()).unwrap();
+        let prod_err = rel(&d_gpu, &d_cpu);
+        println!("tq_quant_prod_fused GPU vs CPU dequant rel err: {prod_err:.3e}");
+        assert!(prod_err <= 2e-2, "tq_quant_prod_fused err {prod_err}");
+
+        // OffloadedTurboKvEngine ping-pong staging on ROCm (exercising both direct & async DMA).
+        let slab = candle_nn::kv_offload::PinnedKvSlab::from_packed_tensors(&kr, &vr, &dev).unwrap();
+        let mut eng = candle_nn::kv_offload::OffloadedTurboKvEngine::new(
+            &dev,
+            1,
+            hkv,
+            lk,
+            kq.row_words(),
+            vq.row_words(),
+        )
+        .unwrap()
+        .with_async_min_bytes(0);
+        eng.prefetch_slab(0, &slab).unwrap();
+        let off_out = eng.attend_slot(0, &q, &kq, &vq, &cfg).unwrap();
+        assert_bits_eq(&off_out, &fast, "OffloadedTurboKvEngine ROCm vs direct");
+
+        // GuardedQuantLmHead lossless 2-tier rescue on ROCm.
+        let (v_core, v_rest, kdim) = (64usize, 64usize, 256usize);
+        let w_core = randn(&[v_core, kdim], 9501);
+        let w_rest = randn(&[v_rest, kdim], 9502);
+        let qc = std::sync::Arc::new(
+            candle::quantized::QTensor::quantize_onto(&w_core, candle::quantized::GgmlDType::Q8_0, &dev)
+                .unwrap(),
+        );
+        let qr = std::sync::Arc::new(
+            candle::quantized::QTensor::quantize_onto(&w_rest, candle::quantized::GgmlDType::Q4K, &dev)
+                .unwrap(),
+        );
+        let core_ids = Tensor::arange(0u32, v_core as u32, &dev).unwrap();
+        let rest_ids = Tensor::arange(v_core as u32, (v_core + v_rest) as u32, &dev).unwrap();
+        let head = candle_nn::trimmed_head::GuardedQuantLmHead::from_split_weights(
+            candle_nn::trimmed_head::LmWeight::Quantized(qc.clone()),
+            None,
+            core_ids,
+            Some((candle_nn::trimmed_head::LmWeight::Quantized(qr.clone()), None, rest_ids)),
+            1e-3,
+            &dev,
+        )
+        .unwrap();
+        let h = up(&randn(&[4, kdim], 9503), &dev);
+        let (got_ids, _rescued) = head.forward_greedy(&h).unwrap();
+        let full_logits = Tensor::cat(
+            &[&qc.forward_exact(&h).unwrap(), &qr.forward_exact(&h).unwrap()],
+            1,
+        )
+        .unwrap();
+        let want_ids = full_logits.argmax(1).unwrap().to_vec1::<u32>().unwrap();
+        assert_eq!(got_ids.to_vec1::<u32>().unwrap(), want_ids);
+    }
 }

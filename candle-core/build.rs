@@ -15,6 +15,8 @@ const KERNELS: &[&str] = &[
     "delta_rule",
     "decoder_ops",
     "lm_head_argmax",
+    "w8a16",
+    "sort",
 ];
 
 /// Kernels behind Cargo features: (file stem, `CARGO_FEATURE_*` variable). A disabled one is
@@ -33,6 +35,7 @@ const HEADERS: &[&str] = &[
     "delta_rule_impl.h",
     "decoder_ops_impl.h",
     "lm_head_argmax_impl.h",
+    "w8a16_impl.h",
 ];
 
 /// Targets used when no GPU is detected, per ROCm track (see `hip-sys/build.rs`).

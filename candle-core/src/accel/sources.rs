@@ -71,9 +71,11 @@ pub fn flash_attn_instantiation(name: &str) -> Option<String> {
     }
     let rest = name.strip_prefix("fa")?;
     let (v, rest) = rest.split_once("_d")?;
-    let version = match v {
-        "2" => FlashAttnVersion::V2,
-        "3" => FlashAttnVersion::V3,
+    let (version, paged) = match v {
+        "2" => (FlashAttnVersion::V2, false),
+        "3" => (FlashAttnVersion::V3, false),
+        "2p" => (FlashAttnVersion::V2, true),
+        "3p" => (FlashAttnVersion::V3, true),
         _ => return None,
     };
     let mut parts = rest.split('_');
@@ -84,9 +86,12 @@ pub fn flash_attn_instantiation(name: &str) -> Option<String> {
     if dm != dmax {
         return None;
     }
-    Some(format!(
-        "FA_TILE_KERNEL({name}, {q}, {kv}, {br}, {bc}, {dmax})"
-    ))
+    let mac = if paged {
+        "FA_TILEP_KERNEL"
+    } else {
+        "FA_TILE_KERNEL"
+    };
+    Some(format!("{mac}({name}, {q}, {kv}, {br}, {bc}, {dmax})"))
 }
 
 /// NVRTC source of one fused attention kernel.

@@ -924,7 +924,109 @@ impl BackendStorage for RocmStorage {
         kernel_l: &Layout,
         params: &crate::conv::ParamsConv1D,
     ) -> Result<Self> {
-        self.fallback2_wide(l, kernel, kernel_l, |a, la, b, lb| a.conv1d(la, b, lb, params))
+        let Some(sfx) = dtype_suffix(self.dtype) else {
+            return self.fallback2_wide(l, kernel, kernel_l, |a, la, b, lb| a.conv1d(la, b, lb, params));
+        };
+        if !is_float(self.dtype) || self.dtype != kernel.dtype {
+            return self.fallback2_wide(l, kernel, kernel_l, |a, la, b, lb| a.conv1d(la, b, lb, params));
+        }
+        let ty = match self.dtype {
+            DType::F32 => GemmType::F32,
+            DType::F64 => GemmType::F64,
+            DType::F16 => GemmType::F16,
+            DType::BF16 => GemmType::BF16,
+            _ => {
+                return self.fallback2_wide(l, kernel, kernel_l, |a, la, b, lb| a.conv1d(la, b, lb, params));
+            }
+        };
+        let l_out = params.l_out();
+        let out_elems = params.b_size * params.c_out * l_out;
+        if out_elems == 0 {
+            let out = self.device.alloc(0)?;
+            return Ok(Self::new(out, self.dtype, self.device.clone()));
+        }
+        let Ok(im2col_fn) = self.device.get_func(Module::Nn, &format!("im2col_1d_{sfx}")) else {
+            return self.fallback2_wide(l, kernel, kernel_l, |a, la, b, lb| a.conv1d(la, b, lb, params));
+        };
+        let src_owned;
+        let src = if l.is_contiguous() && l.start_offset() == 0 {
+            self
+        } else {
+            src_owned = self.contiguous_copy(l)?;
+            &src_owned
+        };
+        let ker_owned;
+        let ker = if kernel_l.is_contiguous() && kernel_l.start_offset() == 0 {
+            kernel
+        } else {
+            ker_owned = kernel.contiguous_copy(kernel_l)?;
+            &ker_owned
+        };
+        let esz = self.esz();
+        let ck = params.c_in * params.k_size;
+        let col_elems = params.b_size * ck * l_out;
+        let col = self.device.alloc(col_elems * esz)?;
+        let block = 256u32;
+        let mut args = LaunchArgs::new();
+        args.ptr(src.buf.as_ptr())
+            .ptr(col.as_ptr())
+            .usize(params.b_size)
+            .usize(params.c_in)
+            .usize(params.l_in)
+            .usize(params.k_size)
+            .usize(l_out)
+            .usize(params.padding)
+            .usize(params.stride)
+            .usize(params.dilation);
+        self.device
+            .launch(im2col_fn, (grid_1d(col_elems, block), 1, 1), (block, 1, 1), 0, &mut args)?;
+
+        // Out[b, c_out, l_out] = W[c_out, c_in*k] @ Col[b, c_in*k, l_out]
+        // Column-major: C(l_out, c_out) = A(l_out, ck) * B(ck, c_out)
+        let out_buf = self.device.alloc(out_elems * esz)?;
+        let call = GemmCall {
+            ty,
+            transa: false,
+            transb: false,
+            m: l_out,
+            n: params.c_out,
+            k: ck,
+            a: col.as_void_ptr(),
+            lda: l_out,
+            stride_a: (ck * l_out) as i64,
+            b: ker.buf.as_void_ptr(),
+            ldb: ck,
+            stride_b: 0,
+            c: out_buf.as_void_ptr() as *mut c_void,
+            ldc: l_out,
+            stride_c: (params.c_out * l_out) as i64,
+            batch: params.b_size,
+            batched: params.b_size > 1,
+        };
+        match self.device.gemm(&call)? {
+            GemmOutcome::Done => Ok(Self::new(out_buf, self.dtype, self.device.clone())),
+            GemmOutcome::Rocblas(_) | GemmOutcome::NoKernel(_) => {
+                // Retry via F32 GEMM if half GEMM unsupported
+                if matches!(self.dtype, DType::F16 | DType::BF16) {
+                    let col32 = Self::new(col, self.dtype, self.device.clone())
+                        .to_dtype(&Layout::contiguous((col_elems,)), DType::F32)?;
+                    let ker32 = ker.to_dtype(&Layout::contiguous((params.c_out * ck,)), DType::F32)?;
+                    let out32 = self.device.alloc(out_elems * 4)?;
+                    let call32 = GemmCall {
+                        ty: GemmType::F32,
+                        a: col32.buf.as_void_ptr(),
+                        b: ker32.buf.as_void_ptr(),
+                        c: out32.as_void_ptr() as *mut c_void,
+                        ..call
+                    };
+                    if let GemmOutcome::Done = self.device.gemm(&call32)? {
+                        return Self::new(out32, DType::F32, self.device.clone())
+                            .to_dtype(&Layout::contiguous((out_elems,)), self.dtype);
+                    }
+                }
+                self.fallback2_wide(l, kernel, kernel_l, |a, la, b, lb| a.conv1d(la, b, lb, params))
+            }
+        }
     }
 
     fn conv_transpose1d(
@@ -934,7 +1036,123 @@ impl BackendStorage for RocmStorage {
         kernel_l: &Layout,
         params: &crate::conv::ParamsConvTranspose1D,
     ) -> Result<Self> {
-        self.fallback2_wide(l, kernel, kernel_l, |a, la, b, lb| a.conv_transpose1d(la, b, lb, params))
+        let Some(sfx) = dtype_suffix(self.dtype) else {
+            return self.fallback2_wide(l, kernel, kernel_l, |a, la, b, lb| {
+                a.conv_transpose1d(la, b, lb, params)
+            });
+        };
+        if !is_float(self.dtype) || self.dtype != kernel.dtype {
+            return self.fallback2_wide(l, kernel, kernel_l, |a, la, b, lb| {
+                a.conv_transpose1d(la, b, lb, params)
+            });
+        }
+        let ty = match self.dtype {
+            DType::F32 => GemmType::F32,
+            DType::F64 => GemmType::F64,
+            DType::F16 => GemmType::F16,
+            DType::BF16 => GemmType::BF16,
+            _ => {
+                return self.fallback2_wide(l, kernel, kernel_l, |a, la, b, lb| {
+                    a.conv_transpose1d(la, b, lb, params)
+                });
+            }
+        };
+        let l_out = params.l_out();
+        let out_elems = params.b_size * params.c_out * l_out;
+        if out_elems == 0 {
+            let out = self.device.alloc(0)?;
+            return Ok(Self::new(out, self.dtype, self.device.clone()));
+        }
+        let Ok(col2im_fn) = self.device.get_func(Module::Nn, &format!("col2im_1d_{sfx}")) else {
+            return self.fallback2_wide(l, kernel, kernel_l, |a, la, b, lb| {
+                a.conv_transpose1d(la, b, lb, params)
+            });
+        };
+        let src_owned;
+        let src = if l.is_contiguous() && l.start_offset() == 0 {
+            self
+        } else {
+            src_owned = self.contiguous_copy(l)?;
+            &src_owned
+        };
+        let ker_owned;
+        let ker = if kernel_l.is_contiguous() && kernel_l.start_offset() == 0 {
+            kernel
+        } else {
+            ker_owned = kernel.contiguous_copy(kernel_l)?;
+            &ker_owned
+        };
+        let esz = self.esz();
+        let ck_out = params.c_out * params.k_size;
+        let col_elems = params.b_size * ck_out * params.l_in;
+        let col = self.device.alloc(col_elems * esz)?;
+        // Col[b, c_out*k, l_in] = W^T[c_out*k, c_in] @ X[b, c_in, l_in]
+        // Column-major: C(l_in, ck_out) = A(l_in, c_in) * B^T(c_in, ck_out)
+        let call = GemmCall {
+            ty,
+            transa: false,
+            transb: true,
+            m: params.l_in,
+            n: ck_out,
+            k: params.c_in,
+            a: src.buf.as_void_ptr(),
+            lda: params.l_in,
+            stride_a: (params.c_in * params.l_in) as i64,
+            b: ker.buf.as_void_ptr(),
+            ldb: ck_out,
+            stride_b: 0,
+            c: col.as_void_ptr() as *mut c_void,
+            ldc: params.l_in,
+            stride_c: (ck_out * params.l_in) as i64,
+            batch: params.b_size,
+            batched: params.b_size > 1,
+        };
+        let col_ready = match self.device.gemm(&call)? {
+            GemmOutcome::Done => col,
+            GemmOutcome::Rocblas(_) | GemmOutcome::NoKernel(_) => {
+                if matches!(self.dtype, DType::F16 | DType::BF16) {
+                    let src32 = src.to_dtype(&Layout::contiguous((params.b_size * params.c_in * params.l_in,)), DType::F32)?;
+                    let ker32 = ker.to_dtype(&Layout::contiguous((params.c_in * ck_out,)), DType::F32)?;
+                    let col32 = self.device.alloc(col_elems * 4)?;
+                    let call32 = GemmCall {
+                        ty: GemmType::F32,
+                        a: src32.buf.as_void_ptr(),
+                        b: ker32.buf.as_void_ptr(),
+                        c: col32.as_void_ptr() as *mut c_void,
+                        ..call
+                    };
+                    if let GemmOutcome::Done = self.device.gemm(&call32)? {
+                        Self::new(col32, DType::F32, self.device.clone())
+                            .to_dtype(&Layout::contiguous((col_elems,)), self.dtype)?
+                            .buf
+                    } else {
+                        return self.fallback2_wide(l, kernel, kernel_l, |a, la, b, lb| {
+                            a.conv_transpose1d(la, b, lb, params)
+                        });
+                    }
+                } else {
+                    return self.fallback2_wide(l, kernel, kernel_l, |a, la, b, lb| {
+                        a.conv_transpose1d(la, b, lb, params)
+                    });
+                }
+            }
+        };
+        let out_buf = self.device.alloc(out_elems * esz)?;
+        let block = 256u32;
+        let mut args = LaunchArgs::new();
+        args.ptr(col_ready.as_ptr())
+            .ptr(out_buf.as_ptr())
+            .usize(params.b_size)
+            .usize(params.c_out)
+            .usize(params.l_in)
+            .usize(params.k_size)
+            .usize(l_out)
+            .usize(params.padding)
+            .usize(params.stride)
+            .usize(params.dilation);
+        self.device
+            .launch(col2im_fn, (grid_1d(out_elems, block), 1, 1), (block, 1, 1), 0, &mut args)?;
+        Ok(Self::new(out_buf, self.dtype, self.device.clone()))
     }
 
     fn conv2d(
@@ -1254,15 +1472,130 @@ impl BackendStorage for RocmStorage {
     }
 
     fn avg_pool2d(&self, l: &Layout, k: (usize, usize), s: (usize, usize)) -> Result<Self> {
-        self.fallback1(|c| c.avg_pool2d(l, k, s))
+        let Some(sfx) = dtype_suffix(self.dtype) else {
+            return self.fallback1(|c| c.avg_pool2d(l, k, s));
+        };
+        if !is_float(self.dtype) {
+            return self.fallback1(|c| c.avg_pool2d(l, k, s));
+        }
+        let (b, c, i_h, i_w) = l.shape().dims4()?;
+        let o_h = (i_h - k.0) / s.0 + 1;
+        let o_w = (i_w - k.1) / s.1 + 1;
+        let n = b * c * o_h * o_w;
+        if n == 0 {
+            return Ok(Self::new(self.device.alloc(0)?, self.dtype, self.device.clone()));
+        }
+        let Ok(func) = self.device.get_func(Module::Nn, &format!("avg_pool2d_{sfx}")) else {
+            return self.fallback1(|c| c.avg_pool2d(l, k, s));
+        };
+        let src_owned;
+        let src = if l.is_contiguous() && l.start_offset() == 0 {
+            self
+        } else {
+            src_owned = self.contiguous_copy(l)?;
+            &src_owned
+        };
+        let out = self.device.alloc(n * self.esz())?;
+        let mut args = LaunchArgs::new();
+        args.ptr(src.buf.as_ptr())
+            .ptr(out.as_ptr())
+            .usize(b)
+            .usize(c)
+            .usize(i_h)
+            .usize(i_w)
+            .usize(o_h)
+            .usize(o_w)
+            .usize(k.0)
+            .usize(k.1)
+            .usize(s.0)
+            .usize(s.1);
+        let block = 256u32;
+        self.device
+            .launch(func, (grid_1d(n, block), 1, 1), (block, 1, 1), 0, &mut args)?;
+        Ok(Self::new(out, self.dtype, self.device.clone()))
     }
 
     fn max_pool2d(&self, l: &Layout, k: (usize, usize), s: (usize, usize)) -> Result<Self> {
-        self.fallback1(|c| c.max_pool2d(l, k, s))
+        let Some(sfx) = dtype_suffix(self.dtype) else {
+            return self.fallback1(|c| c.max_pool2d(l, k, s));
+        };
+        if !is_float(self.dtype) {
+            return self.fallback1(|c| c.max_pool2d(l, k, s));
+        }
+        let (b, c, i_h, i_w) = l.shape().dims4()?;
+        let o_h = (i_h - k.0) / s.0 + 1;
+        let o_w = (i_w - k.1) / s.1 + 1;
+        let n = b * c * o_h * o_w;
+        if n == 0 {
+            return Ok(Self::new(self.device.alloc(0)?, self.dtype, self.device.clone()));
+        }
+        let Ok(func) = self.device.get_func(Module::Nn, &format!("max_pool2d_{sfx}")) else {
+            return self.fallback1(|c| c.max_pool2d(l, k, s));
+        };
+        let src_owned;
+        let src = if l.is_contiguous() && l.start_offset() == 0 {
+            self
+        } else {
+            src_owned = self.contiguous_copy(l)?;
+            &src_owned
+        };
+        let out = self.device.alloc(n * self.esz())?;
+        let mut args = LaunchArgs::new();
+        args.ptr(src.buf.as_ptr())
+            .ptr(out.as_ptr())
+            .usize(b)
+            .usize(c)
+            .usize(i_h)
+            .usize(i_w)
+            .usize(o_h)
+            .usize(o_w)
+            .usize(k.0)
+            .usize(k.1)
+            .usize(s.0)
+            .usize(s.1);
+        let block = 256u32;
+        self.device
+            .launch(func, (grid_1d(n, block), 1, 1), (block, 1, 1), 0, &mut args)?;
+        Ok(Self::new(out, self.dtype, self.device.clone()))
     }
 
     fn upsample_nearest1d(&self, l: &Layout, sz: usize) -> Result<Self> {
-        self.fallback1(|c| c.upsample_nearest1d(l, sz))
+        let Some(sfx) = dtype_suffix(self.dtype) else {
+            return self.fallback1(|c| c.upsample_nearest1d(l, sz));
+        };
+        if !is_float(self.dtype) {
+            return self.fallback1(|c| c.upsample_nearest1d(l, sz));
+        }
+        let (b, c, l_in) = l.shape().dims3()?;
+        let n = b * c * sz;
+        if n == 0 {
+            return Ok(Self::new(self.device.alloc(0)?, self.dtype, self.device.clone()));
+        }
+        let Ok(func) = self
+            .device
+            .get_func(Module::Nn, &format!("upsample_nearest1d_{sfx}"))
+        else {
+            return self.fallback1(|c| c.upsample_nearest1d(l, sz));
+        };
+        let src_owned;
+        let src = if l.is_contiguous() && l.start_offset() == 0 {
+            self
+        } else {
+            src_owned = self.contiguous_copy(l)?;
+            &src_owned
+        };
+        let out = self.device.alloc(n * self.esz())?;
+        let mut args = LaunchArgs::new();
+        args.ptr(src.buf.as_ptr())
+            .ptr(out.as_ptr())
+            .usize(b)
+            .usize(c)
+            .usize(l_in)
+            .usize(sz);
+        let block = 256u32;
+        self.device
+            .launch(func, (grid_1d(n, block), 1, 1), (block, 1, 1), 0, &mut args)?;
+        Ok(Self::new(out, self.dtype, self.device.clone()))
     }
 
     fn upsample_nearest2d(&self, l: &Layout, h: usize, w: usize) -> Result<Self> {

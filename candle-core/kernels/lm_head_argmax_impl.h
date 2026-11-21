@@ -23,7 +23,8 @@ AX_DEV bool lm_better(float v_cand, ax_u32 i_cand, float v_curr, ax_u32 i_curr) 
     return (v_cand > v_curr) || (v_cand == v_curr && i_cand < i_curr);
 }
 
-// Unified 4 KiB shared-memory tree reduction for (val, idx) argmax + (xx, xm) CS stats.
+// Unified 4 KiB shared-memory + warp-32 shuffle tree reduction for (val, idx) argmax + (xx, xm).
+// Preserves the exact binary-tree pairing order of the host emulator (deterministic tie-break).
 AX_DEV void lm_reduce_argmax_and_cs(
     float my_val,
     ax_u32 my_idx,
@@ -44,6 +45,43 @@ AX_DEV void lm_reduce_argmax_and_cs(
     }
     AX_SYNC();
 
+#if AX_HAS_WARP32_SHFL
+    for (ax_u32 s = LM_NT >> 1; s >= 64u; s >>= 1) {
+        if (tid < s) {
+            if (lm_better(s_val[tid + s], s_idx[tid + s], s_val[tid], s_idx[tid])) {
+                s_val[tid] = s_val[tid + s];
+                s_idx[tid] = s_idx[tid + s];
+            }
+            if (check_cs) {
+                s_xx[tid] += s_xx[tid + s];
+                s_xm[tid] += s_xm[tid + s];
+            }
+        }
+        AX_SYNC();
+    }
+    if (tid < 32u) {
+        float v = s_val[tid];
+        ax_u32 idx = s_idx[tid];
+        if (lm_better(s_val[tid + 32u], s_idx[tid + 32u], v, idx)) {
+            v = s_val[tid + 32u];
+            idx = s_idx[tid + 32u];
+        }
+        ax_warp32_argmax(v, idx);
+        if (tid == 0u) {
+            s_val[0] = v;
+            s_idx[0] = idx;
+        }
+        if (check_cs) {
+            float xx = ax_warp32_sum(s_xx[tid] + s_xx[tid + 32u]);
+            float xm = ax_warp32_sum(s_xm[tid] + s_xm[tid + 32u]);
+            if (tid == 0u) {
+                s_xx[0] = xx;
+                s_xm[0] = xm;
+            }
+        }
+    }
+    AX_SYNC();
+#else
     for (ax_u32 s = LM_NT >> 1; s > 0u; s >>= 1) {
         if (tid < s) {
             if (lm_better(s_val[tid + s], s_idx[tid + s], s_val[tid], s_idx[tid])) {
@@ -57,6 +95,7 @@ AX_DEV void lm_reduce_argmax_and_cs(
         }
         AX_SYNC();
     }
+#endif
 }
 
 // ---------------------------------------------------------------------------
@@ -113,6 +152,27 @@ AX_DEV void lm_stage1_decode_impl(
     float *smem = ax_smem();
     float *col_logits = smem + LM_NT * 4u;
 
+#if AX_HAS_WARP32_SHFL
+    for (ax_u32 m = 0u; m < M; ++m) {
+        AX_UNROLL
+        for (ax_u32 c = 0u; c < 4u; ++c) {
+            const float sum = ax_warp32_sum(acc[m][c]);
+            if (lane == 0u) {
+                const ax_u32 local_col = grp * 4u + c;
+                const ax_u32 global_col = col0 + c;
+                float v = -AX_INF;
+                if (global_col < V_valid) {
+                    v = sum;
+                    if (bias != nullptr) {
+                        v += bias[global_col];
+                    }
+                }
+                col_logits[m * LM_DECODE_BN + local_col] = v;
+            }
+        }
+    }
+    AX_SYNC();
+#else
     for (ax_u32 m = 0u; m < M; ++m) {
         AX_UNROLL
         for (ax_u32 c = 0u; c < 4u; ++c) {
@@ -149,6 +209,7 @@ AX_DEV void lm_stage1_decode_impl(
         }
         AX_SYNC();
     }
+#endif
 
     if (tid < M) {
         float best_v = -AX_INF;

@@ -19,7 +19,7 @@ use crate::cuda_backend::{CudaDevice, CudaStorage, CudaStorageSlice, WrapErr};
 use crate::{bail, DType, Result};
 use cudarc::driver::{CudaFunction, CudaSlice, CudaView, LaunchConfig, PushKernelArg};
 
-const SOURCE: &str = include_str!("w8a16.cu");
+const SOURCE: &str = include_str!("../../kernels/w8a16_impl.h");
 
 /// Largest number of input rows (product of the leading dims) handled by [`matvec`].
 pub const MV_MAX_ROWS: usize = 8;
@@ -158,7 +158,10 @@ fn arch(dev: &CudaDevice) -> &'static str {
 fn func(dev: &CudaDevice, name: &str, inst: String) -> Result<CudaFunction> {
     let module = format!("candle_{name}");
     let f = dev.get_or_compile_func(name, &module, || {
-        let src = format!("{SOURCE}\n{inst}\n");
+        let src = format!(
+            "{}\n{inst}\n",
+            crate::accel::sources::strip_includes(SOURCE)
+        );
         let opts = |arch: Option<&'static str>| cudarc::nvrtc::CompileOptions {
             arch,
             options: vec!["--std=c++17".into()],

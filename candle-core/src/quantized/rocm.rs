@@ -54,6 +54,26 @@ fn type_suffix(dtype: GgmlDType) -> &'static str {
     }
 }
 
+fn w8a16_q_suffix(dtype: GgmlDType) -> Option<&'static str> {
+    match dtype {
+        GgmlDType::Q8_0 => Some("q8_0"),
+        GgmlDType::Q4_0 => Some("q4_0"),
+        GgmlDType::Q4K => Some("q4k"),
+        GgmlDType::Q5K => Some("q5k"),
+        GgmlDType::Q6K => Some("q6k"),
+        _ => None,
+    }
+}
+
+fn w8a16_x_suffix(dtype: DType) -> Option<&'static str> {
+    match dtype {
+        DType::F32 => Some("f32"),
+        DType::F16 => Some("f16"),
+        DType::BF16 => Some("bf16"),
+        _ => None,
+    }
+}
+
 impl QRocmStorage {
     pub fn zeros(device: &RocmDevice, elem_count: usize, dtype: GgmlDType) -> Result<Self> {
         let bytes = elem_count / dtype.block_size() * dtype.type_size();
@@ -144,6 +164,33 @@ impl QRocmStorage {
         }
         let byte_off = (elem0 / bs) * self.dtype.type_size();
         let src = unsafe { self.data.as_ptr().add(byte_off) };
+        if let (Some(q_sfx), Some(x_sfx)) = (w8a16_q_suffix(self.dtype), w8a16_x_suffix(dtype)) {
+            let esz = dtype.size_in_bytes();
+            let out = self.device.alloc(elem_count.max(1) * esz)?;
+            if elem_count > 0 {
+                let nblocks = (elem_count / bs) as i64;
+                let fname = format!("w8a16_dq_{q_sfx}_{x_sfx}");
+                if let Ok(func) = self.device.get_func(Module::W8A16, &fname) {
+                    let tasks_per_blk: usize = match self.dtype {
+                        GgmlDType::Q8_0 => 4,
+                        GgmlDType::Q4_0 => 2,
+                        GgmlDType::Q4K | GgmlDType::Q5K => 16,
+                        GgmlDType::Q6K => 8,
+                        _ => unreachable!(),
+                    };
+                    let ntasks = (elem_count / bs) * tasks_per_blk;
+                    let block = 256u32;
+                    let grid = ntasks.div_ceil(block as usize).clamp(1, 65535) as u32;
+                    let mut args = LaunchArgs::new();
+                    args.ptr(src).ptr(out.as_mut_ptr()).bits(nblocks as u64);
+                    self.device
+                        .launch(func, (grid, 1, 1), (block, 1, 1), 0, &mut args)?;
+                    return Ok(RocmStorage::new(out, dtype, self.device.clone()));
+                }
+            } else {
+                return Ok(RocmStorage::new(out, dtype, self.device.clone()));
+            }
+        }
         match dtype {
             DType::F32 => {
                 let out = self.device.alloc(elem_count.max(1) * 4)?;
@@ -246,7 +293,46 @@ impl QRocmStorage {
         Ok(RocmStorage::new(out, DType::F32, self.device.clone()))
     }
 
-    pub fn fwd(
+    fn w8a16_dequant_ptr(
+        &self,
+        src: *const u8,
+        out: *mut u8,
+        elem_count: usize,
+        dtype: DType,
+    ) -> Result<bool> {
+        let (Some(q_sfx), Some(x_sfx)) = (w8a16_q_suffix(self.dtype), w8a16_x_suffix(dtype)) else {
+            return Ok(false);
+        };
+        let bs = self.dtype.block_size();
+        if !elem_count.is_multiple_of(bs) {
+            return Ok(false);
+        }
+        let fname = format!("w8a16_dq_{q_sfx}_{x_sfx}");
+        let Ok(func) = self.device.get_func(Module::W8A16, &fname) else {
+            return Ok(false);
+        };
+        let tasks_per_blk: usize = match self.dtype {
+            GgmlDType::Q8_0 => 4,
+            GgmlDType::Q4_0 => 2,
+            GgmlDType::Q4K | GgmlDType::Q5K => 16,
+            GgmlDType::Q6K => 8,
+            _ => return Ok(false),
+        };
+        let nblocks = (elem_count / bs) as i64;
+        let ntasks = (elem_count / bs) * tasks_per_blk;
+        let block = 256u32;
+        let grid = ntasks.div_ceil(block as usize).clamp(1, 65535) as u32;
+        let mut args = LaunchArgs::new();
+        args.ptr(src).ptr(out).bits(nblocks as u64);
+        self.device
+            .launch(func, (grid, 1, 1), (block, 1, 1), 0, &mut args)?;
+        Ok(true)
+    }
+
+    /// Exact weight-only quantized forward (`y = x · dequant(W)ᵀ`) using single-source W8A16
+    /// HIP kernels: direct F32/F16/BF16 matvec for `rows <= 8` (zero activation quantization and
+    /// zero F32 round-trip casts), and direct tile dequantization + GEMM for `rows > 8`.
+    pub fn fwd_exact(
         &self,
         self_shape: &Shape,
         storage: &RocmStorage,
@@ -254,8 +340,142 @@ impl QRocmStorage {
     ) -> Result<(RocmStorage, Shape)> {
         let (n, k) = self_shape.dims2()?;
         let src_shape = layout.shape();
-        if src_shape.rank() < 2 {
-            crate::bail!("input tensor has only one dimension {layout:?}")
+        if src_shape.rank() < 1 {
+            crate::bail!("input tensor has rank 0: {layout:?}")
+        }
+        let mut dst_dims = src_shape.dims().to_vec();
+        let last_k = dst_dims.pop().unwrap();
+        if last_k != k {
+            crate::bail!("input tensor {layout:?} incompatible with {:?}", self_shape)
+        }
+        dst_dims.push(n);
+        let dst_shape = Shape::from(dst_dims);
+        let in_dtype = storage.dtype();
+        let rows = src_shape.elem_count() / k.max(1);
+
+        if let (Some(q_sfx), Some(x_sfx)) = (w8a16_q_suffix(self.dtype), w8a16_x_suffix(in_dtype)) {
+            let bs = self.dtype.block_size();
+            if k.is_multiple_of(bs) && n > 0 && rows > 0 {
+                let esz = in_dtype.size_in_bytes();
+                let x_owned;
+                let align_req = if in_dtype == DType::F32 { 32 } else { 16 };
+                let x_ptr: *const u8 = if layout.is_contiguous()
+                    && (layout.start_offset() * esz).is_multiple_of(align_req)
+                {
+                    unsafe { storage.device_ptr().add(layout.start_offset() * esz) }
+                } else {
+                    x_owned = storage.contiguous_copy(layout)?;
+                    x_owned.device_ptr()
+                };
+
+                if rows <= QMV_MAX_ROWS {
+                    let m_tag = if rows == 1 { "1" } else { "8" };
+                    let fname = format!("w8a16_mv{m_tag}_{q_sfx}_{x_sfx}");
+                    if let Ok(func) = self.device.get_func(Module::W8A16, &fname) {
+                        let out = self.device.alloc(rows * n * esz)?;
+                        let row_bytes = (k / bs * self.dtype.type_size()) as i64;
+                        let rpb = 2usize;
+                        let wpr = 2usize;
+                        let grid_x = n.div_ceil(rpb) as u32;
+                        let mut args = LaunchArgs::new();
+                        args.ptr(self.data.as_ptr())
+                            .ptr(x_ptr)
+                            .ptr(out.as_mut_ptr())
+                            .u32(k as u32)
+                            .u32(n as u32)
+                            .u32(rows as u32)
+                            .bits(row_bytes as u64);
+                        self.device.launch(
+                            func,
+                            (grid_x, 1, 1),
+                            (32, wpr as u32, rpb as u32),
+                            0,
+                            &mut args,
+                        )?;
+                        return Ok((RocmStorage::new(out, in_dtype, self.device.clone()), dst_shape));
+                    }
+                } else {
+                    // Prefill (rows > 8): dequantize tiles directly to in_dtype into reusable
+                    // workspace and run GemmType::{F32,F16,BF16} (F32 compute in rocBLAS/HIP).
+                    let gemm_ty = match in_dtype {
+                        DType::F32 => GemmType::F32,
+                        DType::F16 => GemmType::F16,
+                        DType::BF16 => GemmType::BF16,
+                        _ => unreachable!(),
+                    };
+                    let row_bytes = k / bs * self.dtype.type_size();
+                    let tile_n = (dequant_tile_bytes() / (k * esz).max(1)).clamp(1, n);
+                    let tile_ptr = self
+                        .device
+                        .workspace_ensure("rocm_w8a16_tile", tile_n * k * esz)?;
+                    let out = self.device.alloc(rows * n * esz)?;
+                    let mut n0 = 0;
+                    let mut half_gemm_ok = true;
+                    while n0 < n {
+                        let tn = tile_n.min(n - n0);
+                        let src = unsafe { self.data.as_ptr().add(n0 * row_bytes) };
+                        if !self.w8a16_dequant_ptr(src, tile_ptr, tn * k, in_dtype)? {
+                            half_gemm_ok = false;
+                            break;
+                        }
+                        let c = unsafe { out.as_mut_ptr().add(n0 * esz) } as *mut c_void;
+                        let call = GemmCall {
+                            ty: gemm_ty,
+                            transa: true,
+                            transb: false,
+                            m: tn,
+                            n: rows,
+                            k,
+                            a: tile_ptr as *const c_void,
+                            lda: k,
+                            stride_a: 0,
+                            b: x_ptr as *const c_void,
+                            ldb: k,
+                            stride_b: 0,
+                            c,
+                            ldc: n,
+                            stride_c: 0,
+                            batch: 1,
+                            batched: false,
+                        };
+                        match self.device.gemm(&call)? {
+                            GemmOutcome::Done => {}
+                            GemmOutcome::Rocblas(_) | GemmOutcome::NoKernel(_) => {
+                                half_gemm_ok = false;
+                                break;
+                            }
+                        }
+                        n0 += tn;
+                    }
+                    if half_gemm_ok {
+                        return Ok((RocmStorage::new(out, in_dtype, self.device.clone()), dst_shape));
+                    }
+                }
+            }
+        }
+
+        self.fwd_legacy(self_shape, storage, layout)
+    }
+
+    pub fn fwd(
+        &self,
+        self_shape: &Shape,
+        storage: &RocmStorage,
+        layout: &Layout,
+    ) -> Result<(RocmStorage, Shape)> {
+        self.fwd_exact(self_shape, storage, layout)
+    }
+
+    fn fwd_legacy(
+        &self,
+        self_shape: &Shape,
+        storage: &RocmStorage,
+        layout: &Layout,
+    ) -> Result<(RocmStorage, Shape)> {
+        let (n, k) = self_shape.dims2()?;
+        let src_shape = layout.shape();
+        if src_shape.rank() < 1 {
+            crate::bail!("input tensor has rank 0 {layout:?}")
         }
         let mut dst_dims = src_shape.dims().to_vec();
         let last_k = dst_dims.pop().unwrap();
@@ -292,12 +512,14 @@ impl QRocmStorage {
             } else {
                 let row_bytes = k / self.dtype.block_size() * self.dtype.type_size();
                 let tile_n = (dequant_tile_bytes() / (k * 4)).clamp(1, n);
-                let tile = self.device.alloc(tile_n * k * 4)?;
+                let tile_ptr = self
+                    .device
+                    .workspace_ensure("rocm_dq_tile_f32", tile_n * k * 4)?;
                 let mut n0 = 0;
                 while n0 < n {
                     let tn = tile_n.min(n - n0);
                     let src = unsafe { self.data.as_ptr().add(n0 * row_bytes) };
-                    self.dequantize_ptr(src, tile.as_mut_ptr(), tn * k, false)?;
+                    self.dequantize_ptr(src, tile_ptr, tn * k, false)?;
                     let c = unsafe { out.as_mut_ptr().add(n0 * 4) } as *mut c_void;
                     let call = GemmCall {
                         ty: GemmType::F32,
@@ -306,7 +528,7 @@ impl QRocmStorage {
                         m: tn,
                         n: rows,
                         k,
-                        a: tile.as_void_ptr(),
+                        a: tile_ptr as *const c_void,
                         lda: k,
                         stride_a: 0,
                         b: x_ptr as *const c_void,
@@ -338,13 +560,126 @@ impl QRocmStorage {
 
     pub fn indexed_moe_forward(
         &self,
-        _: &Shape,
-        _: &RocmStorage,
-        _: &Layout,
-        _: &RocmStorage,
-        _: &Layout,
+        self_shape: &Shape,
+        x: &RocmStorage,
+        x_l: &Layout,
+        ids: &RocmStorage,
+        ids_l: &Layout,
     ) -> Result<(RocmStorage, Shape)> {
-        crate::bail!("indexed_moe_forward is not implemented on the ROCm backend")
+        let (_n_experts, n, k) = self_shape.dims3()?;
+        let (batch, topk) = ids_l.shape().dims2()?;
+        if ids.dtype() != DType::U32 {
+            crate::bail!("rocm indexed_moe_forward: ids must be U32, got {:?}", ids.dtype())
+        }
+        let x_dims = x_l.shape().dims();
+        let x_has_topk = match x_dims {
+            [b, k_in] if *b == batch && *k_in == k => false,
+            [b, tk, k_in] if *b == batch && (*tk == 1 || *tk == topk) && *k_in == k => *tk == topk,
+            _ => crate::bail!(
+                "rocm indexed_moe_forward: incompatible x shape {:?} for batch={batch}, topk={topk}, k={k}",
+                x_dims
+            ),
+        };
+        let in_dtype = x.dtype();
+        let out_shape = Shape::from((batch, topk, n));
+        let slots = batch * topk;
+        if slots == 0 || n == 0 {
+            let out = self.device.alloc(0)?;
+            return Ok((RocmStorage::new(out, in_dtype, self.device.clone()), out_shape));
+        }
+
+        let ids_owned;
+        let ids_ptr = if ids_l.is_contiguous() {
+            unsafe { ids.device_ptr().add(ids_l.start_offset() * 4) }
+        } else {
+            ids_owned = ids.contiguous_copy(ids_l)?;
+            ids_owned.device_ptr()
+        };
+
+        if let (Some(q_sfx), Some(x_sfx)) = (w8a16_q_suffix(self.dtype), w8a16_x_suffix(in_dtype)) {
+            let bs = self.dtype.block_size();
+            if k.is_multiple_of(bs) {
+                let fname = format!("w8a16_moe_{q_sfx}_{x_sfx}");
+                if let Ok(func) = self.device.get_func(Module::W8A16, &fname) {
+                    let esz = in_dtype.size_in_bytes();
+                    let align_req = if in_dtype == DType::F32 { 32 } else { 16 };
+                    let x_owned;
+                    let x_ptr = if x_l.is_contiguous()
+                        && (x_l.start_offset() * esz).is_multiple_of(align_req)
+                    {
+                        unsafe { x.device_ptr().add(x_l.start_offset() * esz) }
+                    } else {
+                        x_owned = x.contiguous_copy(x_l)?;
+                        x_owned.device_ptr()
+                    };
+                    let out = self.device.alloc(slots * n * esz)?;
+                    let row_bytes = (k / bs * self.dtype.type_size()) as i64;
+                    let expert_bytes = (n as i64) * row_bytes;
+                    let mut args = LaunchArgs::new();
+                    args.ptr(self.data.as_ptr())
+                        .ptr(x_ptr)
+                        .ptr(ids_ptr)
+                        .ptr(out.as_mut_ptr())
+                        .u32(k as u32)
+                        .u32(n as u32)
+                        .u32(topk as u32)
+                        .u32(u32::from(x_has_topk))
+                        .bits(row_bytes as u64)
+                        .bits(expert_bytes as u64);
+                    let grid_x = n.div_ceil(4) as u32;
+                    let grid_y = slots as u32;
+                    self.device
+                        .launch(func, (grid_x, grid_y, 1), (32, 4, 1), 0, &mut args)?;
+                    return Ok((RocmStorage::new(out, in_dtype, self.device.clone()), out_shape));
+                }
+            }
+        }
+
+        // General fallback for remaining GgmlDTypes (Q2K, Q3K, Q8K, etc.): dequantize per unique
+        // expert row slice on GPU and multiply via qmv/gemm without CPU round-trip.
+        let ids_host = ids.to_cpu_storage()?;
+        let ids_u32 = match &ids_host {
+            CpuStorage::U32(v) => v,
+            _ => unreachable!(),
+        };
+        let x_f32 = if in_dtype == DType::F32 && x_l.is_contiguous() {
+            None
+        } else {
+            Some(x.to_dtype(x_l, DType::F32)?)
+        };
+        let x_base = match &x_f32 {
+            Some(s) => s.device_ptr(),
+            None => unsafe { x.device_ptr().add(x_l.start_offset() * 4) },
+        };
+        let bs = self.dtype.block_size();
+        let row_bytes = k / bs * self.dtype.type_size();
+        let expert_bytes = n * row_bytes;
+        let out_f32 = self.device.alloc(slots * n * 4)?;
+        let qmv_name = format!("qmv_{}", type_suffix(self.dtype));
+        let qmv_fn = self.device.get_func(Module::Quantized, &qmv_name)?;
+        let block = k.next_power_of_two().clamp(32, 256) as u32;
+        for slot in 0..slots {
+            let e_idx = ids_u32[ids_l.start_offset() + slot] as usize;
+            let x_row = if x_has_topk { slot } else { slot / topk };
+            let w_ptr = unsafe { self.data.as_ptr().add(e_idx * expert_bytes) };
+            let xp = unsafe { x_base.add(x_row * k * 4) };
+            let yp = unsafe { out_f32.as_mut_ptr().add(slot * n * 4) };
+            let mut args = LaunchArgs::new();
+            args.ptr(w_ptr).ptr(xp).ptr(yp).usize(k).usize(n).usize(1);
+            self.device.launch(
+                qmv_fn,
+                (n.min(1 << 30) as u32, 1, 1),
+                (block, 1, 1),
+                block * 4,
+                &mut args,
+            )?;
+        }
+        let out = RocmStorage::new(out_f32, DType::F32, self.device.clone());
+        if in_dtype == DType::F32 {
+            Ok((out, out_shape))
+        } else {
+            Ok((out.to_dtype(&Layout::contiguous(&out_shape), in_dtype)?, out_shape))
+        }
     }
 }
 

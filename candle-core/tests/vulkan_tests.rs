@@ -785,12 +785,18 @@ fn quantized_dequantize_and_matmul() -> Result<()> {
 
             let mm_cpu = QMatMul::from_qtensor(QTensor::quantize(&w, dtype)?)?;
             let mm_gpu = QMatMul::from_qtensor(QTensor::quantize_onto(&w, dtype, dev)?)?;
-            // Q8_0 weights resident on the GPU (GpuQ8: unified-memory devices such as MoltenVK from
-            // the first use, discrete ones once mirrored) multiply the f32 activations exactly,
-            // x · dequant(W)ᵀ. The host path, like the CPU backend, first quantizes the activations
-            // to Q8_0 (llama.cpp vec_dot), which is 0.2-0.6 away at k = 512. Both are correct; the
-            // Vulkan result has to match one of them.
-            let q8 = dtype == GgmlDType::Q8_0;
+            // Quantized weights resident on the GPU (GpuQuant: Q8_0, Q4_0, Q4K, Q5K, Q6K)
+            // multiply the f32 activations exactly, x · dequant(W)ᵀ. The host path, like the CPU
+            // backend, first quantizes the activations to Q8_0/Q8K (llama.cpp vec_dot), which is
+            // 0.2-0.6 away at k = 512. Both are correct; the Vulkan result has to match one of them.
+            let gpu_exact = matches!(
+                dtype,
+                GgmlDType::Q8_0
+                    | GgmlDType::Q4_0
+                    | GgmlDType::Q4K
+                    | GgmlDType::Q5K
+                    | GgmlDType::Q6K
+            );
             let max_diff = |a: &Tensor, b: &Tensor| -> Result<f32> {
                 (a.to_device(&Device::Cpu)?.to_dtype(DType::F32)? - b.to_dtype(DType::F32)?)?
                     .abs()?
@@ -802,7 +808,7 @@ fn quantized_dequantize_and_matmul() -> Result<()> {
             };
             let diff_q = |r_gpu: &Tensor, x: &Tensor, r_ref: &Tensor| -> Result<f32> {
                 let d = max_diff(r_gpu, r_ref)?;
-                if q8 {
+                if gpu_exact {
                     Ok(d.min(max_diff(r_gpu, &exact_ref(x)?)?))
                 } else {
                     Ok(d)
@@ -843,7 +849,7 @@ fn quantized_dequantize_and_matmul() -> Result<()> {
                 let mut r16_ref = mm_cpu
                     .forward(&x16.to_dtype(DType::F32)?)?
                     .to_dtype(DType::F16)?;
-                if q8 {
+                if gpu_exact {
                     let exact = exact_ref(&x16)?.to_dtype(DType::F16)?;
                     if max_diff(&r16, &exact)? < max_diff(&r16, &r16_ref)? {
                         r16_ref = exact;
@@ -893,12 +899,18 @@ fn gguf_load_on_device() -> Result<()> {
     assert!(matches!(mm, QMatMul::QTensor(_)));
     let x = randn(&[2, 256], DType::F32)?;
     let r = mm.forward(&x.to_device(&dev)?)?;
+    let r_exact = x.matmul(&q1.dequantize(&Device::Cpu)?.t()?)?;
     let r_ref = QMatMul::from_qtensor(q1)?.forward(&x)?;
-    let diff = (r.to_device(&Device::Cpu)? - r_ref)?
+    let d_ref = (r.to_device(&Device::Cpu)? - r_ref)?
         .abs()?
         .max_all()?
         .to_scalar::<f32>()?;
-    assert!(diff < 1e-4, "gguf qmatmul diff {diff}");
+    let d_exact = (r.to_device(&Device::Cpu)? - r_exact)?
+        .abs()?
+        .max_all()?
+        .to_scalar::<f32>()?;
+    let diff = d_ref.min(d_exact);
+    assert!(diff < 1e-4, "gguf qmatmul diff {diff} (ref={d_ref}, exact={d_exact})");
     let b = t2.dequantize(&dev)?;
     assert!(b.device().is_vulkan());
     assert_close(&b, &w2, "f32 gguf tensor")?;
@@ -1175,5 +1187,164 @@ fn fixed_exec_modes_are_batch_invariant() -> Result<()> {
         shaders::ExecMode::Auto,
         "the guard did not restore the thread's mode"
     );
+    Ok(())
+}
+
+#[test]
+fn vulkan_async_batching_reduces_submits() -> Result<()> {
+    let _guard = MODE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let dev = vulkan();
+    let x = randn(&[4, 256], DType::F32)?.to_device(&dev)?;
+    let w = randn(&[256], DType::F32)?.to_device(&dev)?;
+    let up = randn(&[4, 256], DType::F32)?.to_device(&dev)?;
+    // Warm up pipeline cache and flush any prior state.
+    let (_, warm) = candle_core::decoder_ops::residual_rmsnorm(&x, None, &w, 1e-5, false)?;
+    let _ = candle_core::decoder_ops::silu_mul(&warm, &up)?.to_device(&Device::Cpu)?;
+
+    let exec_before = shaders::native_exec_count();
+    let sub_before = shaders::submit_count();
+    let mut cur = x.clone();
+    for _ in 0..6 {
+        let (r, y) = candle_core::decoder_ops::residual_rmsnorm(&cur, Some(&x), &w, 1e-5, true)?;
+        let z = candle_core::decoder_ops::silu_mul(&y, &up)?;
+        cur = r;
+        let _ = z;
+    }
+    let _host = cur.to_device(&Device::Cpu)?;
+    let exec_delta = shaders::native_exec_count() - exec_before;
+    let sub_delta = shaders::submit_count() - sub_before;
+    assert!(
+        exec_delta >= 12,
+        "expected >= 12 fused GPU dispatches, got {exec_delta}"
+    );
+    assert!(
+        sub_delta <= 2,
+        "expected async batching to coalesce 12 dispatches into <= 2 submits, got {sub_delta}"
+    );
+    Ok(())
+}
+
+#[test]
+fn vulkan_kquant_gpu_moe_forward() -> Result<()> {
+    let _guard = MODE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let dev = vulkan();
+    let (n_exp, n, k, bsz, topk) = (4usize, 64usize, 256usize, 2usize, 2usize);
+    let w_cpu = randn(&[n_exp, n, k], DType::F32)?;
+    let x_cpu = randn(&[bsz, 1, k], DType::F32)?;
+    let ids_cpu = Tensor::from_vec(vec![0u32, 2, 3, 1], (bsz, topk), &Device::Cpu)?;
+
+    for dtype in [
+        GgmlDType::Q8_0,
+        GgmlDType::Q4_0,
+        GgmlDType::Q4K,
+        GgmlDType::Q5K,
+        GgmlDType::Q6K,
+    ] {
+        let q_cpu = QTensor::quantize(&w_cpu, dtype)?;
+        let deq = q_cpu.dequantize(&Device::Cpu)?;
+        let q_vk = QTensor::quantize_onto(&w_cpu, dtype, &dev)?;
+        let out_vk = q_vk
+            .indexed_moe_forward(&x_cpu.to_device(&dev)?, &ids_cpu.to_device(&dev)?)?
+            .to_device(&Device::Cpu)?;
+        assert_eq!(out_vk.dims(), &[bsz, topk, n]);
+
+        let mut expected = Vec::with_capacity(bsz * topk * n);
+        let ids_v = ids_cpu.flatten_all()?.to_vec1::<u32>()?;
+        for bi in 0..bsz {
+            let xr = x_cpu.narrow(0, bi, 1)?.squeeze(1)?;
+            for ti in 0..topk {
+                let eid = ids_v[bi * topk + ti] as usize;
+                let we = deq.narrow(0, eid, 1)?.squeeze(0)?;
+                let y = xr.matmul(&we.t()?)?.flatten_all()?.to_vec1::<f32>()?;
+                expected.extend_from_slice(&y);
+            }
+        }
+        let exp_t = Tensor::from_vec(expected, (bsz, topk, n), &Device::Cpu)?;
+        let max_err = (&out_vk - &exp_t)?.abs()?.max_all()?.to_scalar::<f32>()?;
+        assert!(
+            max_err < 1e-3,
+            "vulkan indexed_moe_forward {dtype:?} max_err={max_err}"
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn vulkan_gdn_2stage_and_gated_rmsnorm() -> Result<()> {
+    let _guard = MODE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let dev = vulkan();
+    assert!(
+        candle_core::delta_rule::fused_gdn_supported(&dev),
+        "expected fused_gdn_supported to be true on Vulkan GPU"
+    );
+    let cfg = candle_core::delta_rule::GdnConfig::new(2, 4, 64, 64);
+    let (bsz, t, c, k) = (1, 6, cfg.conv_dim(), cfg.conv_kernel);
+    let hv = cfg.num_v_heads;
+
+    for dtype in [DType::F32, DType::F16] {
+        let x = randn(&[bsz, t, c], dtype)?;
+        let cw = randn(&[c, k], dtype)?;
+        let cb = randn(&[c], dtype)?;
+        let cs = randn(&[bsz, c, k - 1], dtype)?;
+        let a = randn(&[bsz, t, hv], dtype)?;
+        let b = randn(&[bsz, t, hv], dtype)?;
+        let na = Tensor::from_vec(vec![-0.35f32; hv], hv, &Device::Cpu)?.to_dtype(dtype)?;
+        let dtb = Tensor::from_vec(vec![0.1f32; hv], hv, &Device::Cpu)?.to_dtype(dtype)?;
+        let st = randn(&[bsz, hv, cfg.head_k_dim, cfg.head_v_dim], DType::F32)?;
+
+        let ref_out = candle_core::delta_rule::fused_gated_delta_rule(
+            &x,
+            &cw,
+            Some(&cb),
+            Some(&cs),
+            &a,
+            &b,
+            &na,
+            &dtb,
+            Some(&st),
+            &cfg,
+        )?;
+        let vk_out = candle_core::delta_rule::fused_gated_delta_rule(
+            &x.to_device(&dev)?,
+            &cw.to_device(&dev)?,
+            Some(&cb.to_device(&dev)?),
+            Some(&cs.to_device(&dev)?),
+            &a.to_device(&dev)?,
+            &b.to_device(&dev)?,
+            &na.to_device(&dev)?,
+            &dtb.to_device(&dev)?,
+            Some(&st.to_device(&dev)?),
+            &cfg,
+        )?;
+        let tol = if dtype == DType::F32 { 1e-3 } else { 2e-2 };
+        let o_err = (vk_out.out.to_device(&Device::Cpu)?.to_dtype(DType::F32)?
+            - ref_out.out.to_dtype(DType::F32)?)?
+            .abs()?
+            .max_all()?
+            .to_scalar::<f32>()?;
+        let s_err = (vk_out.recurrent_state.to_device(&Device::Cpu)? - &ref_out.recurrent_state)?
+            .abs()?
+            .max_all()?
+            .to_scalar::<f32>()?;
+        assert!(o_err < tol, "vulkan GDN {dtype:?} out err={o_err}");
+        assert!(s_err < tol, "vulkan GDN {dtype:?} state err={s_err}");
+
+        // Also test fused_gated_rms_norm
+        let z = randn(&[bsz, t, hv, cfg.head_v_dim], dtype)?;
+        let nw = randn(&[cfg.head_v_dim], dtype)?;
+        let g_ref = candle_core::delta_rule::fused_gated_rms_norm(&ref_out.out, &z, &nw, 1e-6)?;
+        let g_vk = candle_core::delta_rule::fused_gated_rms_norm(
+            &vk_out.out,
+            &z.to_device(&dev)?,
+            &nw.to_device(&dev)?,
+            1e-6,
+        )?;
+        let g_err = (g_vk.to_device(&Device::Cpu)?.to_dtype(DType::F32)?
+            - g_ref.to_dtype(DType::F32)?)?
+            .abs()?
+            .max_all()?
+            .to_scalar::<f32>()?;
+        assert!(g_err < tol, "vulkan gated_rms_norm {dtype:?} err={g_err}");
+    }
     Ok(())
 }

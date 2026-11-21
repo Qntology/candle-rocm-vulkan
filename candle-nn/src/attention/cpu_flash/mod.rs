@@ -31,16 +31,11 @@ use super::AttnMask;
 #[inline]
 pub(crate) fn dot_f32<T: WithDType>(a: &[T], b: &[T]) -> f32 {
     debug_assert_eq!(a.len(), b.len());
-    if matches!(T::DTYPE, DType::F16 | DType::BF16) {
-        let mut acc = 0f32;
-        for (&x, &y) in a.iter().zip(b.iter()) {
-            acc += (x.to_f64() as f32) * (y.to_f64() as f32);
-        }
-        return acc;
+    if matches!(T::DTYPE, DType::F32 | DType::F16 | DType::BF16 | DType::F64) {
+        // SAFETY: `a` and `b` have equal length `a.len()`.
+        return unsafe { T::vec_dot_f32(a.as_ptr(), b.as_ptr(), a.len()) };
     }
     let mut res = T::zero();
-    // SAFETY: `a` and `b` are both at least `a.len()` long and `res` is a valid
-    // out pointer, pre-zeroed for the scalar fallback that accumulates into it.
     unsafe { T::vec_dot(a.as_ptr(), b.as_ptr(), &mut res, a.len()) };
     res.to_f64() as f32
 }
@@ -176,4 +171,61 @@ fn flash_attn_via_varlen(
     )?;
 
     ctx.reshape((b, s_q, h_q, d))?.transpose(1, 2)?.contiguous()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use candle::Device;
+
+    #[test]
+    fn cpu_flash_half_gqa4_decode_matches_f32() -> Result<()> {
+        let dev = Device::Cpu;
+        let (b, s_q, s_kv, h_q, h_kv, d) = (1, 1, 48, 8, 2, 64);
+        let q32 = Tensor::randn(0f32, 0.5, (b, s_q, h_q, d), &dev)?;
+        let k32 = Tensor::randn(0f32, 0.5, (b, s_kv, h_kv, d), &dev)?;
+        let v32 = Tensor::randn(0f32, 0.5, (b, s_kv, h_kv, d), &dev)?;
+        let scale = 1.0 / (d as f32).sqrt();
+        let ref_out = flash_attn::<f32>(
+            &q32,
+            &k32,
+            &v32,
+            scale,
+            AttnMask::Causal { kv_offset: s_kv - 1 },
+            None,
+            None,
+        )?;
+        for (dt, tol) in [(DType::F16, 3e-3f32), (DType::BF16, 2e-2f32)] {
+            let qh = q32.to_dtype(dt)?;
+            let kh = k32.to_dtype(dt)?;
+            let vh = v32.to_dtype(dt)?;
+            let out = match dt {
+                DType::F16 => flash_attn::<half::f16>(
+                    &qh,
+                    &kh,
+                    &vh,
+                    scale,
+                    AttnMask::Causal { kv_offset: s_kv - 1 },
+                    None,
+                    None,
+                )?,
+                DType::BF16 => flash_attn::<half::bf16>(
+                    &qh,
+                    &kh,
+                    &vh,
+                    scale,
+                    AttnMask::Causal { kv_offset: s_kv - 1 },
+                    None,
+                    None,
+                )?,
+                _ => unreachable!(),
+            };
+            let diff = (&out.to_dtype(DType::F32)? - &ref_out)?
+                .abs()?
+                .max_all()?
+                .to_scalar::<f32>()?;
+            assert!(diff <= tol, "{dt:?} GQA=4 decode diff {diff} > {tol}");
+        }
+        Ok(())
+    }
 }

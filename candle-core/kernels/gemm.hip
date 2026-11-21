@@ -105,6 +105,43 @@ DEVFN void gemm_impl(const T *A, const T *B, T *C, const uint32_t transa, const 
     }
 }
 
+// Skinny-M / Skinny-N GEMM (min(m, n) <= 8 && k >= 256): one 256-thread workgroup per output
+// element C[i, j, b] reduces across K with coalesced reads instead of wasting 98% of a 64x64 tile.
+template <typename T>
+DEVFN void gemm_skinny_impl(const T *A, const T *B, T *C, const uint32_t transa, const uint32_t transb,
+                            const size_t m, const size_t n, const size_t k, const size_t lda, const size_t ldb,
+                            const size_t ldc, const int64_t stride_a, const int64_t stride_b,
+                            const int64_t stride_c, const size_t batch) {
+    typedef typename Ty<T>::acc Acc;
+    __shared__ Acc red[256];
+    const size_t tid = threadIdx.x;
+    for (size_t bz = blockIdx.z; bz < batch; bz += gridDim.z) {
+        const T *a = A + (int64_t)bz * stride_a;
+        const T *b = B + (int64_t)bz * stride_b;
+        T *c = C + (int64_t)bz * stride_c;
+        for (size_t j = blockIdx.y; j < n; j += gridDim.y) {
+            for (size_t i = blockIdx.x; i < m; i += gridDim.x) {
+                Acc acc = (Acc)0;
+                for (size_t p = tid; p < k; p += 256) {
+                    const Acc av = (Acc)Ty<T>::to(transa ? a[p + i * lda] : a[i + p * lda]);
+                    const Acc bv = (Acc)Ty<T>::to(transb ? b[j + p * ldb] : b[p + j * ldb]);
+                    acc += av * bv;
+                }
+                red[tid] = acc;
+                __syncthreads();
+                for (size_t s = 128; s > 0; s >>= 1) {
+                    if (tid < s) red[tid] += red[tid + s];
+                    __syncthreads();
+                }
+                if (tid == 0) {
+                    c[i + j * ldc] = Ty<T>::from(red[0]);
+                }
+                __syncthreads();
+            }
+        }
+    }
+}
+
 #define GEMM_FNS(T, SFX)                                                                                       \
     extern "C" __global__ void __launch_bounds__(GEMM_THREADS)                                                 \
         gemm_##SFX(const T *A, const T *B, T *C, const uint32_t transa, const uint32_t transb, const size_t m, \
@@ -113,7 +150,16 @@ DEVFN void gemm_impl(const T *A, const T *B, T *C, const uint32_t transa, const 
                    const size_t batch) {                                                                       \
         gemm_impl<T>(A, B, C, transa, transb, m, n, k, lda, ldb, ldc, stride_a, stride_b, stride_c, batch);   \
     }                                                                                                          \
-    CANDLE_REGISTER(gemm_##SFX)
+    CANDLE_REGISTER(gemm_##SFX)                                                                                \
+    extern "C" __global__ void __launch_bounds__(256)                                                          \
+        gemm_skinny_##SFX(const T *A, const T *B, T *C, const uint32_t transa, const uint32_t transb,          \
+                          const size_t m, const size_t n, const size_t k, const size_t lda, const size_t ldb,  \
+                          const size_t ldc, const int64_t stride_a, const int64_t stride_b,                    \
+                          const int64_t stride_c, const size_t batch) {                                        \
+        gemm_skinny_impl<T>(A, B, C, transa, transb, m, n, k, lda, ldb, ldc, stride_a, stride_b, stride_c,     \
+                            batch);                                                                            \
+    }                                                                                                          \
+    CANDLE_REGISTER(gemm_skinny_##SFX)
 
 GEMM_FNS(float, f32)
 GEMM_FNS(double, f64)

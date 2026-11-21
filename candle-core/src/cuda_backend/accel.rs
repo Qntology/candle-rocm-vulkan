@@ -11,7 +11,9 @@ use crate::accel::attention::{
 };
 use crate::accel::profile::AccelProfile;
 use crate::accel::sources;
-use crate::accel::turbo::{tq_attn_group, tq_attn_kernel, TqAttnArgs, TqRowArgs, TQ_THREADS};
+use crate::accel::turbo::{
+    tq_attn_group, tq_attn_kernel, tq_tile_launch, TqAttnArgs, TqRowArgs, TQ_THREADS,
+};
 use crate::{bail, DType, Result};
 use cudarc::driver::{DevicePtr, DevicePtrMut, LaunchConfig, PushKernelArg, SyncOnDrop};
 use std::collections::HashMap;
@@ -184,37 +186,39 @@ fn grid_elems(n: usize) -> u32 {
 // SAFETY: plain repr(C) data with the layout of `struct ax_pages` (kernels/accel_common.h).
 unsafe impl cudarc::driver::DeviceRepr for PageTable {}
 
-/// Partial outputs and log-sum-exps of a split-KV launch.
-type Parts = Option<(CudaStorageSlice, CudaStorageSlice)>;
+/// Partial outputs and log-sum-exps of a split-KV launch, backed by the per-device `"fa_split_kv"`
+/// workspace (zero per-call stream allocations).
+type Parts = Option<(u64, u64)>;
 
 fn alloc_parts(dev: &CudaDevice, splits: usize, rows: usize, d: usize) -> Result<Parts> {
-    Ok(if splits > 1 {
-        Some((
-            alloc(dev, DType::F32, splits * rows * d)?,
-            alloc(dev, DType::F32, splits * rows)?,
-        ))
-    } else {
-        None
-    })
+    if splits <= 1 || rows == 0 || d == 0 {
+        return Ok(None);
+    }
+    let po_bytes = (splits * rows * d * 4).div_ceil(256) * 256;
+    let pl_bytes = splits * rows * 4;
+    let base = dev
+        .workspaces
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .ensure(dev, "fa_split_kv", po_bytes + pl_bytes)?;
+    Ok(Some((base, base + po_bytes as u64)))
 }
 
 /// Merges the key splits in `part` into `out` with the combine kernel `name`.
 fn launch_combine(
     dev: &CudaDevice,
     name: &str,
-    part: &mut Parts,
+    part: Parts,
     out: &mut CudaStorageSlice,
     rows: usize,
     d: usize,
     splits: usize,
 ) -> Result<()> {
-    let Some((po, pl)) = part.as_mut() else {
+    let Some((po_p, pl_p)) = part else {
         return Ok(());
     };
     let stream = dev.cuda_stream();
     let comb = dev.accel_func(name)?;
-    let (po_p, _ga) = dptr_mut(po, &stream);
-    let (pl_p, _gb) = dptr_mut(pl, &stream);
     let (o_p, _go) = dptr_mut(out, &stream);
     let ptrs: [u64; 3] = [po_p, pl_p, o_p];
     let rows64 = rows as u64;
@@ -298,20 +302,13 @@ impl CudaStorage {
                 func.set_max_dynamic_shared_memory(smem)?;
             }
             let stream = dev.cuda_stream();
-            let mut part = alloc_parts(dev, splits, rows, d)?;
+            let part = alloc_parts(dev, splits, rows, d)?;
             {
                 let (q_p, _gq) = dptr(self, geom.q_offset, &stream);
                 let (k_p, _gk) = dptr(k, geom.k_offset, &stream);
                 let (v_p, _gv) = dptr(v, geom.v_offset, &stream);
                 let (o_p, _go) = dptr_mut(&mut out, &stream);
-                let (po_p, pl_p, _gp) = match part.as_mut() {
-                    Some((po, pl)) => {
-                        let (a, ga) = dptr_mut(po, &stream);
-                        let (b, gb) = dptr_mut(pl, &stream);
-                        (a, b, Some((ga, gb)))
-                    }
-                    None => (0, 0, None),
-                };
+                let (po_p, pl_p) = part.unwrap_or((0, 0));
                 let (al_p, alibi_bs, _ga) = match extra.alibi {
                     Some((s, off, bs)) => {
                         let (p, g) = dptr(s, off, &stream);
@@ -377,7 +374,7 @@ impl CudaStorage {
             }
             let sfx = half_sfx(self.dtype(), "flash-attn")?;
             let comb = format!("fa_combine_{sfx}");
-            launch_combine(dev, &comb, &mut part, &mut out, rows, d, splits)?;
+            launch_combine(dev, &comb, part, &mut out, rows, d, splits)?;
         }
         Ok(CudaStorage {
             slice: out,
@@ -385,9 +382,9 @@ impl CudaStorage {
         })
     }
 
-    /// Decoding attention of `self` (queries, geometry from `AttnGeometry::paged`) over the K/V
-    /// blocks of a paged cache, without concatenating them (row kernel `fa_rowp_*`). The keys
-    /// are the blocks' rows in order; the output is contiguous in the query dtype.
+    /// Attention of `self` (queries, geometry from `AttnGeometry::paged`) over the K/V blocks of
+    /// a paged cache, without concatenating them (`fa_rowp_*` for decode, `fa2p_*`/`fa3p_*` for
+    /// chunked prefill). Output contiguous in the query dtype.
     pub fn flash_attn_paged(
         &self,
         blocks: &[PagedKv<'_, Self>],
@@ -411,15 +408,29 @@ impl CudaStorage {
         }
         let dev = &self.device;
         let prof = dev.accel_profile();
-        let launch = att::row_launch(geom, p, prof.compute_units, self.dtype(), kv_dtype, true)?;
-        let (grid, smem, splits) = (launch.grid, launch.shared_bytes, launch.splits);
+        let plan = att::plan(geom, p, prof.max_shared_mem, prof.compute_units);
+        let (name, grid, smem, splits) = match plan {
+            FaPlan::Tile { .. } => {
+                let name = att::paged_tile_kernel_name(&plan, self.dtype(), kv_dtype)?;
+                let (grid, smem, splits) = att::launch_dims(geom, &plan);
+                (name, grid, smem, splits)
+            }
+            FaPlan::Row { .. } => {
+                let l =
+                    att::row_launch(geom, p, prof.compute_units, self.dtype(), kv_dtype, true)?;
+                (l.name, l.grid, l.shared_bytes, l.splits)
+            }
+        };
         let rows = geom.out_rows();
         let d = geom.d;
         let mut out = alloc(dev, self.dtype(), rows * d)?;
         if rows > 0 && d > 0 {
-            let func = dev.accel_func(&launch.name)?;
+            let func = dev.accel_func(&name)?;
+            if smem > 48 * 1024 {
+                func.set_max_dynamic_shared_memory(smem)?;
+            }
             let stream = dev.cuda_stream();
-            let mut part = alloc_parts(dev, splits, rows, d)?;
+            let part = alloc_parts(dev, splits, rows, d)?;
             {
                 let (table, _gt) = page_table(blocks, &stream)?;
                 if table.total_rows() != geom.lk {
@@ -431,14 +442,7 @@ impl CudaStorage {
                 }
                 let (q_p, _gq) = dptr(self, geom.q_offset, &stream);
                 let (o_p, _go) = dptr_mut(&mut out, &stream);
-                let (po_p, pl_p, _gp) = match part.as_mut() {
-                    Some((po, pl)) => {
-                        let (a, ga) = dptr_mut(po, &stream);
-                        let (b, gb) = dptr_mut(pl, &stream);
-                        (a, b, Some((ga, gb)))
-                    }
-                    None => (0, 0, None),
-                };
+                let (po_p, pl_p) = part.unwrap_or((0, 0));
                 let (al_p, alibi_bs, _ga) = match extra.alibi {
                     Some((s, off, bs)) => {
                         let (p, g) = dptr(s, off, &stream);
@@ -497,7 +501,96 @@ impl CudaStorage {
             }
             let sfx = half_sfx(self.dtype(), "flash-attn")?;
             let comb = format!("fa_combine_{sfx}");
-            launch_combine(dev, &comb, &mut part, &mut out, rows, d, splits)?;
+            launch_combine(dev, &comb, part, &mut out, rows, d, splits)?;
+        }
+        Ok(CudaStorage {
+            slice: out,
+            device: dev.clone(),
+        })
+    }
+
+    /// Single-pass TurboProd quantization (codes + residual + QJL signs + rsc0/rsc1 in 1 launch).
+    pub fn tq_quantize_prod_fused(
+        &self,
+        offset: usize,
+        tab: &Self,
+        tab_off: usize,
+        s_mat: &Self,
+        s_off: usize,
+        a: &TqRowArgs,
+    ) -> Result<Self> {
+        use crate::backend::BackendStorage;
+        let sfx = half_sfx(self.dtype(), "turbo-quant")?;
+        let dev = &self.device;
+        let mut out = alloc(dev, DType::U32, a.rows * a.row_words)?;
+        if a.rows > 0 {
+            let func = dev.accel_func(&format!("tq_quant_prod_{sfx}"))?;
+            let stream = dev.cuda_stream();
+            let (s_p, _g1) = dptr(self, offset, &stream);
+            let (t_p, _g2) = dptr(tab, tab_off, &stream);
+            let (sm_p, _g3) = dptr(s_mat, s_off, &stream);
+            let (o_p, _g4) = dptr_mut(&mut out, &stream);
+            let rows64 = a.rows as u64;
+            let dim32 = a.dim as u32;
+            let stride64 = a.dim as u64;
+            let cb32 = a.code_bits;
+            let cw32 = a.code_words as u32;
+            let rw32 = a.row_words as u32;
+            let mut b = func.builder();
+            b.arg(&s_p)
+                .arg(&t_p)
+                .arg(&sm_p)
+                .arg(&o_p)
+                .arg(&rows64)
+                .arg(&dim32)
+                .arg(&stride64)
+                .arg(&cb32)
+                .arg(&cw32)
+                .arg(&rw32);
+            let smem = (2 * a.dim + TQ_THREADS) * 4;
+            unsafe { b.launch(cfg((grid_rows(a.rows), 1, 1), smem)) }.w()?;
+        }
+        Ok(CudaStorage {
+            slice: out,
+            device: dev.clone(),
+        })
+    }
+
+    /// On-chip O(d log d) Fast Walsh-Hadamard Transform (`rows x dim` -> F32 `rows x dim`).
+    pub fn tq_fwht(
+        &self,
+        offset: usize,
+        sign_bits: &Self,
+        sign_off: usize,
+        rows: usize,
+        dim: usize,
+        forward: bool,
+    ) -> Result<Self> {
+        use crate::backend::BackendStorage;
+        let sfx = half_sfx(self.dtype(), "tq_fwht")?;
+        let dev = &self.device;
+        let mut out = alloc(dev, DType::F32, rows * dim)?;
+        if rows > 0 && dim > 0 {
+            let func = dev.accel_func(&format!("tq_fwht_{sfx}"))?;
+            let stream = dev.cuda_stream();
+            let (s_p, _g1) = dptr(self, offset, &stream);
+            let (o_p, _g2) = dptr_mut(&mut out, &stream);
+            let (sb_p, _g3) = dptr(sign_bits, sign_off, &stream);
+            let rows64 = rows as u64;
+            let dim32 = dim as u32;
+            let stride64 = dim as u64;
+            let inv_sqrt_d = 1.0f32 / (dim as f32).sqrt();
+            let fwd32 = u32::from(forward);
+            let mut b = func.builder();
+            b.arg(&s_p)
+                .arg(&o_p)
+                .arg(&sb_p)
+                .arg(&rows64)
+                .arg(&dim32)
+                .arg(&stride64)
+                .arg(&inv_sqrt_d)
+                .arg(&fwd32);
+            unsafe { b.launch(cfg((grid_rows(rows), 1, 1), dim * 4)) }.w()?;
         }
         Ok(CudaStorage {
             slice: out,
@@ -736,10 +829,48 @@ impl CudaStorage {
         if rows > 0 && d > 0 {
             let splits = a.splits.max(1);
             let stream = dev.cuda_stream();
-            let mut part = alloc_parts(dev, splits, rows, d)?;
+            let prof = dev.accel_profile();
+            let tile_plan = if splits <= 1 {
+                let version = crate::accel::config()
+                    .flash_attn
+                    .version
+                    .unwrap_or(prof.flash_attn_version);
+                tq_tile_launch(a, version, prof.max_shared_mem, dense.is_none())
+            } else {
+                None
+            };
+            let part = if tile_plan.is_some() {
+                None
+            } else {
+                alloc_parts(dev, splits, rows, d)?
+            };
             {
                 let group = tq_attn_group(a.hq, a.hkv);
-                let func = dev.accel_func(&tq_attn_kernel(&a.k, &a.v, dense.is_none(), group))?;
+                let (kname, grid, smem) = if let Some((tname, br, _bc, tsmem)) = tile_plan {
+                    (
+                        tname,
+                        (
+                            a.lq.div_ceil(br).clamp(1, MAX_GRID_X) as u32,
+                            a.hq as u32,
+                            a.b as u32,
+                        ),
+                        tsmem,
+                    )
+                } else {
+                    (
+                        tq_attn_kernel(&a.k, &a.v, dense.is_none(), group),
+                        (
+                            (a.lq * a.hq / group).clamp(1, MAX_GRID_X) as u32,
+                            splits as u32,
+                            a.b as u32,
+                        ),
+                        a.smem_bytes_for(group),
+                    )
+                };
+                let func = dev.accel_func(&kname)?;
+                if smem > 48 * 1024 {
+                    func.set_max_dynamic_shared_memory(smem)?;
+                }
                 let (table, _gt) = match dense {
                     Some(_) => (None, Vec::new()),
                     None => {
@@ -772,14 +903,7 @@ impl CudaStorage {
                     None => (0, None),
                 };
                 let (o_p, _g6) = dptr_mut(&mut out, &stream);
-                let (po_p, pl_p, _g7) = match part.as_mut() {
-                    Some((po, pl)) => {
-                        let (x, gx) = dptr_mut(po, &stream);
-                        let (y, gy) = dptr_mut(pl, &stream);
-                        (x, y, Some((gx, gy)))
-                    }
-                    None => (0, 0, None),
-                };
+                let (po_p, pl_p) = part.unwrap_or((0, 0));
                 let ptrs: [u64; 8] = [q_p, k_p, v_p, t_p, al_p, o_p, po_p, pl_p];
                 let dims: [u32; 5] = [
                     a.lq as u32,
@@ -839,16 +963,11 @@ impl CudaStorage {
                 if let Some(t) = table.as_ref() {
                     b.arg(t);
                 }
-                let grid = (
-                    (a.lq * a.hq / group).clamp(1, MAX_GRID_X) as u32,
-                    splits as u32,
-                    a.b as u32,
-                );
-                // SAFETY: arguments match tq_attn* (TQ_ATTN_PARAMS), followed by the block table
-                // for the paged tq_attnp* kernels.
-                unsafe { b.launch(cfg(grid, a.smem_bytes_for(group))) }.w()?;
+                // SAFETY: arguments match tq_attn* / tq_tile* (TQ_ATTN_PARAMS), followed by the
+                // block table for the paged variants.
+                unsafe { b.launch(cfg(grid, smem)) }.w()?;
             }
-            launch_combine(dev, "tq_combine", &mut part, &mut out, rows, d, splits)?;
+            launch_combine(dev, "tq_combine", part, &mut out, rows, d, splits)?;
         }
         Ok(CudaStorage {
             slice: out,

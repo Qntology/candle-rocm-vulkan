@@ -20,6 +20,9 @@
 #![allow(clippy::missing_safety_doc)]
 
 mod accel;
+pub(crate) mod decoder_ops;
+pub(crate) mod delta_rule;
+mod lm_head;
 pub(crate) mod qgpu;
 pub mod shaders;
 
@@ -47,6 +50,7 @@ pub(crate) struct Limits {
     pub max_push_constants_size: u32,
     pub max_shared_memory: u32,
     pub max_invocations: u32,
+    pub max_storage_bindings: u32,
 }
 
 /// One Vulkan logical device with its queue, kernel cache and allocator state.
@@ -59,8 +63,14 @@ pub(crate) struct VulkanContext {
     queue: vk::Queue,
     /// Command pool / buffer / descriptor pool / fence used for every
     /// dispatch. Host access to a `VkQueue` is externally synchronized, so the
-    /// mutex also serializes every submit + wait.
+    /// mutex also serializes every batch record + submit + wait.
     exec: Mutex<shaders::ExecState>,
+    /// True while `exec.cmd` holds unsubmitted GPU dispatches (fast-path guard
+    /// for host reads and deferred buffer recycling).
+    pub(crate) has_pending_gpu_work: AtomicBool,
+    /// Buffers dropped while a deferred command batch was still open/in-flight;
+    /// drained back into `pool` (or released) immediately after the batch fence completes.
+    deferred_returns: Mutex<Vec<PooledBuffer>>,
     kernels: Mutex<HashMap<String, Arc<shaders::Kernel>>>,
     memory_properties: vk::PhysicalDeviceMemoryProperties,
     /// HOST_VISIBLE | HOST_COHERENT memory types, best first.
@@ -183,7 +193,27 @@ impl VulkanContext {
         }
     }
 
+    pub(crate) fn drain_deferred_returns(&self) {
+        let pending = match self.deferred_returns.lock() {
+            Ok(mut v) => std::mem::take(&mut *v),
+            Err(_) => return,
+        };
+        for b in pending {
+            if b.bucket <= POOL_MAX_BUFFER {
+                if let Ok(mut pool) = self.pool.lock() {
+                    if pool.bytes + b.alloc_size <= self.pool_limit {
+                        pool.bytes += b.alloc_size;
+                        pool.free.entry(b.bucket).or_default().push(b);
+                        continue;
+                    }
+                }
+            }
+            unsafe { self.release(b) };
+        }
+    }
+
     fn trim_pool(&self) {
+        self.drain_deferred_returns();
         let drained: Vec<PooledBuffer> = match self.pool.lock() {
             Ok(mut pool) => {
                 pool.bytes = 0;
@@ -218,6 +248,10 @@ const SLAB_MAX_SLOTS: usize = 1024;
 
 impl Drop for VulkanContext {
     fn drop(&mut self) {
+        unsafe {
+            let _ = self.device.device_wait_idle();
+        }
+        self.has_pending_gpu_work.store(false, Ordering::Release);
         self.trim_pool();
         self.gpu.release_scratch(&self.device);
         let chunks: Vec<SlabChunk> = match self.slabs.lock() {
@@ -557,7 +591,11 @@ fn init_vulkan(gpu_id: usize) -> Result<VulkanContext> {
         )));
     }
 
-    let exec = match shaders::ExecState::new(&device, queue_family) {
+    let max_storage_bindings = props
+        .limits
+        .max_per_stage_descriptor_storage_buffers
+        .clamp(8, 16);
+    let exec = match shaders::ExecState::new(&device, queue_family, max_storage_bindings) {
         Ok(e) => e,
         Err(e) => {
             unsafe {
@@ -574,6 +612,7 @@ fn init_vulkan(gpu_id: usize) -> Result<VulkanContext> {
         max_push_constants_size: props.limits.max_push_constants_size,
         max_shared_memory: props.limits.max_compute_shared_memory_size,
         max_invocations: props.limits.max_compute_work_group_invocations,
+        max_storage_bindings,
     };
 
     let unified = props.device_type == vk::PhysicalDeviceType::INTEGRATED_GPU
@@ -606,6 +645,8 @@ fn init_vulkan(gpu_id: usize) -> Result<VulkanContext> {
         device,
         queue,
         exec: Mutex::new(exec),
+        has_pending_gpu_work: AtomicBool::new(false),
+        deferred_returns: Mutex::new(Vec::new()),
         kernels: Mutex::new(HashMap::new()),
         memory_properties,
         memory_types,
@@ -814,9 +855,10 @@ impl VulkanDevice {
         match self.alloc_dedicated(backing, bytes, numel, dtype) {
             Ok(s) => Ok(s),
             Err(first) => {
-                // Out of memory or out of allocation handles: give the pooled
-                // buffers back to the driver and try again, then fall back to
-                // a slot of an existing slab.
+                // Out of memory or out of allocation handles: flush pending GPU work so
+                // deferred buffers are released, give pooled buffers back to the driver
+                // and try again, then fall back to a slot of an existing slab.
+                let _ = shaders::flush(self);
                 ctx.trim_pool();
                 match self.alloc_dedicated(backing, bytes, numel, dtype) {
                     Ok(s) => Ok(s),
@@ -1068,8 +1110,18 @@ impl VulkanDevice {
                 data.len()
             )
         }
-        unsafe { std::ptr::copy_nonoverlapping(data.as_ptr(), storage.mapped, data.len()) };
+        if !data.is_empty() {
+            unsafe { std::ptr::copy_nonoverlapping(data.as_ptr(), storage.mapped, data.len()) };
+        }
         Ok(storage)
+    }
+
+    /// Uploads a slice of `u32` parameters to a fresh buffer without flushing pending GPU work.
+    pub(crate) fn upload_u32_slice(&self, vals: &[u32]) -> Result<VulkanStorage> {
+        let bytes = unsafe {
+            std::slice::from_raw_parts(vals.as_ptr() as *const u8, std::mem::size_of_val(vals))
+        };
+        self.upload_bytes(bytes, vals.len(), DType::U32)
     }
 }
 
@@ -1150,6 +1202,12 @@ impl Drop for VulkanStorage {
             bucket: self.bucket,
             slot: self.slot,
         };
+        if ctx.has_pending_gpu_work.load(Ordering::Acquire) {
+            if let Ok(mut def) = ctx.deferred_returns.lock() {
+                def.push(b);
+                return;
+            }
+        }
         if self.bucket <= POOL_MAX_BUFFER {
             if let Ok(mut pool) = ctx.pool.lock() {
                 if pool.bytes + b.alloc_size <= ctx.pool_limit {
@@ -1187,8 +1245,17 @@ impl VulkanStorage {
         device.upload_bytes(bytes, data.len(), T::DTYPE)
     }
 
+    /// Flushes any pending batched GPU dispatches before CPU access to mapped memory.
+    #[inline]
+    fn ensure_host_visible(&self) {
+        if self.device.inner.has_pending_gpu_work.load(Ordering::Acquire) {
+            let _ = shaders::flush(&self.device);
+        }
+    }
+
     /// The raw bytes of the buffer.
     pub fn as_bytes(&self) -> &[u8] {
+        self.ensure_host_visible();
         if self.capacity_bytes == 0 {
             return &[];
         }
@@ -1203,6 +1270,7 @@ impl VulkanStorage {
     }
 
     pub(crate) fn as_bytes_mut(&mut self) -> &mut [u8] {
+        self.ensure_host_visible();
         self.invalidate_mirror();
         if self.capacity_bytes == 0 {
             return &mut [];
@@ -1212,6 +1280,7 @@ impl VulkanStorage {
 
     /// The elements of the buffer as a slice of `T`.
     pub fn as_slice<T: crate::WithDType>(&self) -> Result<&[T]> {
+        self.ensure_host_visible();
         if T::DTYPE != self.dtype {
             crate::bail!(
                 "vulkan as_slice: expected {:?}, got {:?}",
@@ -1226,6 +1295,7 @@ impl VulkanStorage {
     }
 
     pub(crate) fn as_mut_slice<T: crate::WithDType>(&mut self) -> Result<&mut [T]> {
+        self.ensure_host_visible();
         self.invalidate_mirror();
         if T::DTYPE != self.dtype {
             crate::bail!(
@@ -1242,6 +1312,7 @@ impl VulkanStorage {
 
     /// A `CpuStorage` aliasing the mapped memory, for read-only CPU fallbacks.
     pub(crate) fn host_view(&self) -> ManuallyDrop<CpuStorage> {
+        self.ensure_host_visible();
         let (p, n) = (self.mapped, self.numel);
         let s = unsafe {
             match self.dtype {
@@ -1753,8 +1824,10 @@ impl BackendDevice for VulkanDevice {
         if dtype.size_in_bytes() == 0 || dtype == DType::F8E8M0 {
             return Err(Error::UnsupportedDTypeForOp(dtype, "zeros").bt());
         }
-        let mut storage = self.alloc_buffer(shape.elem_count(), dtype)?;
-        storage.as_bytes_mut().fill(0);
+        let storage = self.alloc_buffer(shape.elem_count(), dtype)?;
+        if storage.capacity_bytes > 0 {
+            unsafe { std::ptr::write_bytes(storage.mapped, 0, storage.capacity_bytes) };
+        }
         Ok(storage)
     }
 

@@ -440,6 +440,10 @@ impl CudaDevice {
     }
 }
 
+/// Minimum payload size for routing uploads through the pinned staging buffer + non-blocking
+/// CopyStream. Smaller transfers bypass pinned staging and copy directly on the compute stream.
+pub const ASYNC_DMA_MIN_BYTES: usize = 2 * 1024 * 1024;
+
 /// Reusable page-locked staging slot for overlapping host-to-device DMA uploads (such as
 /// layer weight streaming or next-crop vision inputs) with compute kernels on `CudaDevice`.
 pub struct AsyncPrefetchSlot {

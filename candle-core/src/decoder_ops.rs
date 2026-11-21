@@ -7,11 +7,11 @@
 use crate::accel::decoder_ops::{
     self as dop, HeadLayout, RopeKvLaunchArgs, RopeMode, ROPE_NORM_PLUS_ONE,
 };
-#[cfg(any(feature = "cuda", feature = "rocm"))]
+#[cfg(any(feature = "cuda", feature = "rocm", feature = "vulkan"))]
 use crate::op::BackpropOp;
-#[cfg(any(feature = "cuda", feature = "rocm"))]
+#[cfg(any(feature = "cuda", feature = "rocm", feature = "vulkan"))]
 use crate::storage::Storage;
-#[cfg(any(feature = "cuda", feature = "rocm"))]
+#[cfg(any(feature = "cuda", feature = "rocm", feature = "vulkan"))]
 use crate::tensor::from_storage;
 use crate::{bail, CpuStorage, DType, Device, Layout, Result, Tensor};
 
@@ -177,6 +177,32 @@ pub fn residual_rmsnorm_inplace(
             let y = from_storage(y_storage, dims, BackpropOp::none(), false);
             Ok((x, y))
         }
+        #[cfg(feature = "vulkan")]
+        Device::Vulkan(vdev) if crate::vulkan_backend::decoder_ops::vk_fused_ready(vdev) => {
+            let y_res = {
+                let mut xs = x.storage_mut();
+                let Storage::Vulkan(xv) = &mut *xs else {
+                    unreachable!()
+                };
+                let (ws, wl) = w_f32.storage_and_layout();
+                let Storage::Vulkan(wv) = &*ws else {
+                    unreachable!()
+                };
+                let dl_guard = delta_c.as_ref().map(|t| t.storage_and_layout());
+                let dl_arg = dl_guard.as_ref().map(|(s, l)| match &**s {
+                    Storage::Vulkan(dv) => (dv, l.start_offset()),
+                    _ => unreachable!(),
+                });
+                xv.res_rmsnorm_inplace(dl_arg, wv, wl.start_offset(), rows, d, eps, plus_one)
+            };
+            match y_res {
+                Ok(y_s) => {
+                    let y = from_storage(Storage::Vulkan(y_s), dims, BackpropOp::none(), false);
+                    Ok((x, y))
+                }
+                Err(_) => residual_rmsnorm(&x, delta_c.as_ref(), &w_f32, eps, plus_one),
+            }
+        }
         _ => residual_rmsnorm(&x, delta_c.as_ref(), &w_f32, eps, plus_one),
     }
 }
@@ -295,6 +321,46 @@ fn res_rmsnorm_dispatch(
                 from_storage(Storage::Rocm(s), dims.clone(), BackpropOp::none(), false)
             });
             let y_t = from_storage(Storage::Rocm(y_st), dims, BackpropOp::none(), false);
+            Ok((r_t, y_t))
+        }
+        #[cfg(feature = "vulkan")]
+        Device::Vulkan(vdev)
+            if crate::vulkan_backend::decoder_ops::vk_fused_ready(vdev)
+                && (dtype == DType::F32
+                    || (d % 2 == 0
+                        && x_c.layout().start_offset() % 2 == 0
+                        && delta_c
+                            .as_ref()
+                            .map_or(true, |dl| dl.layout().start_offset() % 2 == 0))) =>
+        {
+            let (xs, xl) = x_c.storage_and_layout();
+            let Storage::Vulkan(xv) = &*xs else {
+                unreachable!()
+            };
+            let (ws, wl) = w_f32.storage_and_layout();
+            let Storage::Vulkan(wv) = &*ws else {
+                unreachable!()
+            };
+            let dl_guard = delta_c.as_ref().map(|t| t.storage_and_layout());
+            let dl_arg = dl_guard.as_ref().map(|(s, l)| match &**s {
+                Storage::Vulkan(dv) => (dv, l.start_offset()),
+                _ => unreachable!(),
+            });
+            let (r_st, y_st) = xv.res_rmsnorm(
+                xl.start_offset(),
+                dl_arg,
+                wv,
+                wl.start_offset(),
+                rows,
+                d,
+                eps,
+                plus_one,
+                write_residual,
+            )?;
+            let r_t = r_st.map(|s| {
+                from_storage(Storage::Vulkan(s), dims.clone(), BackpropOp::none(), false)
+            });
+            let y_t = from_storage(Storage::Vulkan(y_st), dims, BackpropOp::none(), false);
             Ok((r_t, y_t))
         }
         _ => {
@@ -418,6 +484,32 @@ pub fn silu_mul(gate: &Tensor, up: &Tensor) -> Result<Tensor> {
             )?;
             Ok(from_storage(
                 Storage::Rocm(out),
+                dims,
+                BackpropOp::none(),
+                false,
+            ))
+        }
+        #[cfg(feature = "vulkan")]
+        Device::Vulkan(vdev)
+            if crate::vulkan_backend::decoder_ops::vk_fused_ready(vdev)
+                && (dtype == DType::F32 || inter_dim % 2 == 0) =>
+        {
+            let (gs, gl) = g_ref.storage_and_layout();
+            let (us, ul) = u_ref.storage_and_layout();
+            let (Storage::Vulkan(gv), Storage::Vulkan(uv)) = (&*gs, &*us) else {
+                unreachable!()
+            };
+            let out = gv.silu_mul(
+                gl.start_offset(),
+                g_stride,
+                uv,
+                ul.start_offset(),
+                u_stride,
+                rows,
+                inter_dim,
+            )?;
+            Ok(from_storage(
+                Storage::Vulkan(out),
                 dims,
                 BackpropOp::none(),
                 false,
@@ -751,6 +843,65 @@ pub fn rope_kv_write(
             )?;
             Ok(from_storage(
                 Storage::Rocm(qo),
+                q_out_dims,
+                BackpropOp::none(),
+                false,
+            ))
+        }
+        #[cfg(feature = "vulkan")]
+        Device::Vulkan(vdev)
+            if crate::vulkan_backend::decoder_ops::vk_fused_ready(vdev)
+                && d <= 512
+                && vdev.limits().max_storage_bindings >= 11
+                && (dtype == DType::F32
+                    || (d % 2 == 0
+                        && args.kc_off % 2 == 0
+                        && args.vc_off % 2 == 0
+                        && args.qo_strides.iter().all(|&s| s % 2 == 0)
+                        && args.kc_strides.iter().all(|&s| s % 2 == 0))) =>
+        {
+            let (qs, _) = q_c.storage_and_layout();
+            let (ks, _) = k_c.storage_and_layout();
+            let (vs, _) = v_c.storage_and_layout();
+            let (cs, _) = cos_f32.storage_and_layout();
+            let (ss, _) = sin_f32.storage_and_layout();
+            let qnw_g = qnw_f32.as_ref().map(|w| w.storage_and_layout());
+            let knw_g = knw_f32.as_ref().map(|w| w.storage_and_layout());
+            let mut kc_s = k_cache.storage_mut();
+            let mut vc_s = v_cache.storage_mut();
+            let (
+                Storage::Vulkan(qv),
+                Storage::Vulkan(kv_in),
+                Storage::Vulkan(vv_in),
+                Storage::Vulkan(cos_v),
+                Storage::Vulkan(sin_v),
+                Storage::Vulkan(kc_mut),
+                Storage::Vulkan(vc_mut),
+            ) = (
+                &*qs,
+                &*ks,
+                &*vs,
+                &*cs,
+                &*ss,
+                &mut *kc_s,
+                &mut *vc_s,
+            )
+            else {
+                unreachable!()
+            };
+            let qnw_v = qnw_g.as_ref().map(|(s, _)| match &**s {
+                Storage::Vulkan(c) => c,
+                _ => unreachable!(),
+            });
+            let knw_v = knw_g.as_ref().map(|(s, _)| match &**s {
+                Storage::Vulkan(c) => c,
+                _ => unreachable!(),
+            });
+            let qo = qv.rope_kv_write(
+                kv_in, vv_in, qnw_v, knw_v, cos_v, sin_v, kc_mut, vc_mut, &args,
+            )?;
+            Ok(from_storage(
+                Storage::Vulkan(qo),
                 q_out_dims,
                 BackpropOp::none(),
                 false,

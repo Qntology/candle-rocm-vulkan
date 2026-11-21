@@ -2259,3 +2259,100 @@ fn w8a16_bench_cuda() -> Result<()> {
     }
     Ok(())
 }
+
+#[cfg(feature = "rocm")]
+#[test]
+fn w8a16_dequantize_and_forward_exact_rocm() -> Result<()> {
+    let dev = &Device::new_rocm(0)?;
+    let (n, k) = (128, 512);
+    for wtype in [
+        GgmlDType::Q8_0,
+        GgmlDType::Q4_0,
+        GgmlDType::Q4K,
+        GgmlDType::Q5K,
+        GgmlDType::Q6K,
+    ] {
+        let bytes = w8_weight_bytes(wtype, n, k, 19 + wtype.type_size() as u64);
+        let q_cpu = w8_qtensor(&bytes, wtype, n, k, &Device::Cpu)?;
+        let q_gpu = w8_qtensor(&bytes, wtype, n, k, dev)?;
+        for dtype in [DType::F32, DType::F16, DType::BF16] {
+            let want = q_cpu.dequantize(&Device::Cpu)?.to_dtype(dtype)?;
+            let got = q_gpu.dequantize_to(dtype, dev)?;
+            assert_eq!(got.dtype(), dtype);
+            assert!(got.device().is_rocm());
+            assert_eq!(w8_bits(&got)?, w8_bits(&want)?, "rocm {wtype:?} -> {dtype:?}");
+            let rows = q_gpu.dequantize_rows_to(17, 43, dtype, dev)?;
+            assert_eq!(w8_bits(&rows)?, w8_bits(&want.narrow(0, 17, 43)?)?);
+        }
+        w8_check_forward_exact(
+            dev,
+            "rocm-w8a16",
+            wtype,
+            n,
+            k,
+            &[1, 3, 8, 16],
+            1 << 20,
+            48,
+            false,
+        )?;
+    }
+
+    // Native ROCm indexed_moe_forward
+    let (n_exp, out_n, in_k, batch, topk) = (4, 64, 256, 2, 2);
+    let w_moe = Tensor::randn(0f32, 0.5, (n_exp, out_n, in_k), &Device::Cpu)?;
+    let q_moe = quantized::QTensor::quantize_onto(&w_moe, GgmlDType::Q4K, dev)?;
+    let x_cpu = Tensor::randn(0f32, 0.5, (batch, in_k), &Device::Cpu)?;
+    let ids_cpu = Tensor::from_vec(vec![2u32, 0, 1, 3], (batch, topk), &Device::Cpu)?;
+    let moe_gpu = q_moe
+        .indexed_moe_forward(&x_cpu.to_device(dev)?, &ids_cpu.to_device(dev)?)?
+        .to_device(&Device::Cpu)?;
+    let moe_ref = quantized::QTensor::quantize(&w_moe, GgmlDType::Q4K)?
+        .indexed_moe_forward(&x_cpu, &ids_cpu)?;
+    let moe_diff = (&moe_gpu - &moe_ref)?.abs()?.max_all()?.to_scalar::<f32>()?;
+    assert!(moe_diff <= 1e-3, "rocm indexed_moe diff {moe_diff}");
+
+    // Quantized Mode A lm_head on ROCm
+    let w_lm = Tensor::randn(0f32, 0.5, (96, 256), &Device::Cpu)?;
+    let q_lm = quantized::QTensor::quantize_onto(&w_lm, GgmlDType::Q8_0, dev)?;
+    let h_lm = Tensor::randn(0f32, 0.5, (3, 256), dev)?;
+    let out_q = candle_core::lm_head::fused_quant_argmax_cs(&h_lm, &q_lm, None, None, None)?;
+    let logits_ref = q_lm.forward_exact(&h_lm)?;
+    let out_b = candle_core::lm_head::logits_argmax_cs(&logits_ref, None, None, None)?;
+    assert_eq!(out_q.ids.to_vec1::<u32>()?, out_b.ids.to_vec1::<u32>()?);
+
+    // Skinny GEMM, conv1d, conv_transpose1d, avg_pool2d, max_pool2d, upsample_nearest1d, arg_sort
+    let a = Tensor::randn(0f32, 0.5, (3, 128), &Device::Cpu)?;
+    let b = Tensor::randn(0f32, 0.5, (128, 96), &Device::Cpu)?;
+    let g_ref = a.matmul(&b)?;
+    let g_gpu = a.to_device(dev)?.matmul(&b.to_device(dev)?)?.to_device(&Device::Cpu)?;
+    assert!((&g_ref - &g_gpu)?.abs()?.max_all()?.to_scalar::<f32>()? <= 1e-3);
+
+    let c_in = Tensor::randn(0f32, 1.0, (2, 4, 15), &Device::Cpu)?;
+    let c_k = Tensor::randn(0f32, 1.0, (6, 4, 3), &Device::Cpu)?;
+    let c1_ref = c_in.conv1d(&c_k, 1, 1, 1, 1)?;
+    let c1_gpu = c_in.to_device(dev)?.conv1d(&c_k.to_device(dev)?, 1, 1, 1, 1)?.to_device(&Device::Cpu)?;
+    assert!((&c1_ref - &c1_gpu)?.abs()?.max_all()?.to_scalar::<f32>()? <= 1e-4);
+
+    let ct_k = Tensor::randn(0f32, 1.0, (4, 6, 3), &Device::Cpu)?;
+    let ct_ref = c_in.conv_transpose1d(&ct_k, 1, 0, 2, 1, 1)?;
+    let ct_gpu = c_in.to_device(dev)?.conv_transpose1d(&ct_k.to_device(dev)?, 1, 0, 2, 1, 1)?.to_device(&Device::Cpu)?;
+    assert!((&ct_ref - &ct_gpu)?.abs()?.max_all()?.to_scalar::<f32>()? <= 1e-4);
+
+    let p_in = Tensor::randn(0f32, 1.0, (1, 3, 8, 8), &Device::Cpu)?;
+    let ap_ref = p_in.avg_pool2d(2)?;
+    let ap_gpu = p_in.to_device(dev)?.avg_pool2d(2)?.to_device(&Device::Cpu)?;
+    assert!((&ap_ref - &ap_gpu)?.abs()?.max_all()?.to_scalar::<f32>()? <= 1e-5);
+    let mp_ref = p_in.max_pool2d(2)?;
+    let mp_gpu = p_in.to_device(dev)?.max_pool2d(2)?.to_device(&Device::Cpu)?;
+    assert!((&mp_ref - &mp_gpu)?.abs()?.max_all()?.to_scalar::<f32>()? <= 1e-5);
+
+    let u_ref = c_in.upsample_nearest1d(30)?;
+    let u_gpu = c_in.to_device(dev)?.upsample_nearest1d(30)?.to_device(&Device::Cpu)?;
+    assert_eq!((&u_ref - &u_gpu)?.abs()?.max_all()?.to_scalar::<f32>()?, 0.0);
+
+    let s_in = Tensor::randn(0f32, 1.0, (4, 17), &Device::Cpu)?;
+    let s_ref = s_in.arg_sort_last_dim(true)?.to_vec2::<u32>()?;
+    let s_gpu = s_in.to_device(dev)?.arg_sort_last_dim(true)?.to_device(&Device::Cpu)?.to_vec2::<u32>()?;
+    assert_eq!(s_ref, s_gpu);
+    Ok(())
+}

@@ -333,6 +333,122 @@ DEVFN void upsample_bilinear2d_impl(const T *src, T *dst, const size_t b, const 
     }
 }
 
+template <typename T>
+DEVFN void im2col_1d_impl(const T *src, T *dst, const size_t b, const size_t c_in, const size_t l_in,
+                          const size_t k_size, const size_t l_out, const size_t padding, const size_t stride,
+                          const size_t dilation) {
+    const size_t ck = c_in * k_size;
+    const size_t total = b * ck * l_out;
+    for (size_t idx = GS_START; idx < total; idx += GS_STEP) {
+        const size_t ol = idx % l_out;
+        const size_t t1 = idx / l_out;
+        const size_t kl = t1 % k_size;
+        const size_t t2 = t1 / k_size;
+        const size_t ci = t2 % c_in;
+        const size_t bi = t2 / c_in;
+        const long long il = (long long)(ol * stride + kl * dilation) - (long long)padding;
+        if (il >= 0 && (size_t)il < l_in) {
+            dst[idx] = src[(bi * c_in + ci) * l_in + (size_t)il];
+        } else {
+            dst[idx] = Ty<T>::from((typename Ty<T>::acc)0);
+        }
+    }
+}
+
+template <typename T>
+DEVFN void col2im_1d_impl(const T *col, T *dst, const size_t b, const size_t c_out, const size_t l_in,
+                          const size_t k_size, const size_t l_out, const size_t padding, const size_t stride,
+                          const size_t dilation) {
+    typedef typename Ty<T>::acc A;
+    const size_t total = b * c_out * l_out;
+    for (size_t idx = GS_START; idx < total; idx += GS_STEP) {
+        const size_t ol = idx % l_out;
+        const size_t t1 = idx / l_out;
+        const size_t co = t1 % c_out;
+        const size_t bi = t1 / c_out;
+        const size_t col_base = (bi * c_out + co) * k_size * l_in;
+        A acc = (A)0;
+        for (size_t kl = 0; kl < k_size; ++kl) {
+            const long long num = (long long)(ol + padding) - (long long)(kl * dilation);
+            if (num < 0 || (num % (long long)stride) != 0) continue;
+            const size_t il = (size_t)(num / (long long)stride);
+            if (il >= l_in) continue;
+            acc += Ty<T>::to(col[col_base + kl * l_in + il]);
+        }
+        dst[idx] = Ty<T>::from(acc);
+    }
+}
+
+template <typename T>
+DEVFN void avg_pool2d_impl(const T *src, T *dst, const size_t b, const size_t c, const size_t i_h,
+                           const size_t i_w, const size_t o_h, const size_t o_w, const size_t k_h,
+                           const size_t k_w, const size_t s_h, const size_t s_w) {
+    typedef typename Ty<T>::acc A;
+    const size_t hw_in = i_h * i_w;
+    const size_t hw_out = o_h * o_w;
+    const size_t n = b * c * hw_out;
+    const A inv = (A)1 / (A)(k_h * k_w);
+    for (size_t idx = GS_START; idx < n; idx += GS_STEP) {
+        const size_t ow = idx % o_w;
+        const size_t t1 = idx / o_w;
+        const size_t oh = t1 % o_h;
+        const size_t bc = t1 / o_h;
+        const size_t base = bc * hw_in;
+        const size_t h0 = oh * s_h;
+        const size_t w0 = ow * s_w;
+        A acc = (A)0;
+        for (size_t kh = 0; kh < k_h; ++kh) {
+            const size_t row = base + (h0 + kh) * i_w + w0;
+            for (size_t kw = 0; kw < k_w; ++kw) {
+                acc += Ty<T>::to(src[row + kw]);
+            }
+        }
+        dst[idx] = Ty<T>::from(acc * inv);
+    }
+}
+
+template <typename T>
+DEVFN void max_pool2d_impl(const T *src, T *dst, const size_t b, const size_t c, const size_t i_h,
+                           const size_t i_w, const size_t o_h, const size_t o_w, const size_t k_h,
+                           const size_t k_w, const size_t s_h, const size_t s_w) {
+    typedef typename Ty<T>::acc A;
+    const size_t hw_in = i_h * i_w;
+    const size_t hw_out = o_h * o_w;
+    const size_t n = b * c * hw_out;
+    for (size_t idx = GS_START; idx < n; idx += GS_STEP) {
+        const size_t ow = idx % o_w;
+        const size_t t1 = idx / o_w;
+        const size_t oh = t1 % o_h;
+        const size_t bc = t1 / o_h;
+        const size_t base = bc * hw_in;
+        const size_t h0 = oh * s_h;
+        const size_t w0 = ow * s_w;
+        A best = Ty<T>::to(src[base + h0 * i_w + w0]);
+        for (size_t kh = 0; kh < k_h; ++kh) {
+            const size_t row = base + (h0 + kh) * i_w + w0;
+            for (size_t kw = 0; kw < k_w; ++kw) {
+                const A v = Ty<T>::to(src[row + kw]);
+                if (v > best) best = v;
+            }
+        }
+        dst[idx] = Ty<T>::from(best);
+    }
+}
+
+template <typename T>
+DEVFN void upsample_nearest1d_impl(const T *src, T *dst, const size_t b, const size_t c,
+                                   const size_t l_in, const size_t l_out) {
+    const double scale = (double)l_in / (double)l_out;
+    const size_t n = b * c * l_out;
+    for (size_t idx = GS_START; idx < n; idx += GS_STEP) {
+        const size_t ol = idx % l_out;
+        const size_t bc = idx / l_out;
+        size_t sl = (size_t)((double)ol * scale);
+        if (sl >= l_in) sl = l_in - 1;
+        dst[idx] = src[bc * l_in + sl];
+    }
+}
+
 #define NN_FNS(T, SFX)                                                                                         \
     extern "C" __global__ void softmax_##SFX(const T *src, T *dst, const size_t nrows, const size_t ncols) {   \
         softmax_impl<T>(src, dst, nrows, ncols);                                                               \
@@ -404,7 +520,40 @@ DEVFN void upsample_bilinear2d_impl(const T *src, T *dst, const size_t b, const 
                                                          const double scale_w, const uint32_t align_corners) { \
         upsample_bilinear2d_impl<T>(src, dst, b, c, i_h, i_w, o_h, o_w, scale_h, scale_w, align_corners);      \
     }                                                                                                          \
-    CANDLE_REGISTER(upsample_bilinear2d_##SFX)
+    CANDLE_REGISTER(upsample_bilinear2d_##SFX)                                                                 \
+    extern "C" __global__ void im2col_1d_##SFX(const T *src, T *dst, const size_t b, const size_t c_in,        \
+                                               const size_t l_in, const size_t k_size, const size_t l_out,     \
+                                               const size_t padding, const size_t stride,                      \
+                                               const size_t dilation) {                                        \
+        im2col_1d_impl<T>(src, dst, b, c_in, l_in, k_size, l_out, padding, stride, dilation);                  \
+    }                                                                                                          \
+    CANDLE_REGISTER(im2col_1d_##SFX)                                                                           \
+    extern "C" __global__ void col2im_1d_##SFX(const T *col, T *dst, const size_t b, const size_t c_out,       \
+                                               const size_t l_in, const size_t k_size, const size_t l_out,     \
+                                               const size_t padding, const size_t stride,                      \
+                                               const size_t dilation) {                                        \
+        col2im_1d_impl<T>(col, dst, b, c_out, l_in, k_size, l_out, padding, stride, dilation);                 \
+    }                                                                                                          \
+    CANDLE_REGISTER(col2im_1d_##SFX)                                                                           \
+    extern "C" __global__ void avg_pool2d_##SFX(const T *src, T *dst, const size_t b, const size_t c,          \
+                                                const size_t i_h, const size_t i_w, const size_t o_h,          \
+                                                const size_t o_w, const size_t k_h, const size_t k_w,          \
+                                                const size_t s_h, const size_t s_w) {                          \
+        avg_pool2d_impl<T>(src, dst, b, c, i_h, i_w, o_h, o_w, k_h, k_w, s_h, s_w);                            \
+    }                                                                                                          \
+    CANDLE_REGISTER(avg_pool2d_##SFX)                                                                          \
+    extern "C" __global__ void max_pool2d_##SFX(const T *src, T *dst, const size_t b, const size_t c,          \
+                                                const size_t i_h, const size_t i_w, const size_t o_h,          \
+                                                const size_t o_w, const size_t k_h, const size_t k_w,          \
+                                                const size_t s_h, const size_t s_w) {                          \
+        max_pool2d_impl<T>(src, dst, b, c, i_h, i_w, o_h, o_w, k_h, k_w, s_h, s_w);                            \
+    }                                                                                                          \
+    CANDLE_REGISTER(max_pool2d_##SFX)                                                                          \
+    extern "C" __global__ void upsample_nearest1d_##SFX(const T *src, T *dst, const size_t b, const size_t c,  \
+                                                        const size_t l_in, const size_t l_out) {               \
+        upsample_nearest1d_impl<T>(src, dst, b, c, l_in, l_out);                                               \
+    }                                                                                                          \
+    CANDLE_REGISTER(upsample_nearest1d_##SFX)
 
 NN_FNS(float, f32)
 NN_FNS(double, f64)

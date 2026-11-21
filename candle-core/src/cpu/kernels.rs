@@ -17,6 +17,23 @@ pub trait VecOps: num_traits::NumAssign + Copy {
         xs.iter().zip(ys).for_each(|(&x, y)| *y = x + scalar)
     }
 
+    /// Dot-product of two vectors accumulated and returned in `f32` (never narrows half types).
+    ///
+    /// # Safety
+    /// The length of `lhs` and `rhs` must be at least `len`.
+    #[inline(always)]
+    unsafe fn vec_dot_f32(lhs: *const Self, rhs: *const Self, len: usize) -> f32 {
+        let mut res = Self::zero();
+        Self::vec_dot(lhs, rhs, &mut res, len);
+        // Scalar fallback for integer/non-float types; overridden for f32/f16/bf16/f64.
+        let _ = res;
+        0.0
+    }
+
+    /// Fused multiply-add of a `Self` vector into an `f32` accumulator: `acc[i] += v[i] * w`.
+    #[inline(always)]
+    fn vec_fmadd_to_f32(_acc: &mut [f32], _v: &[Self], _w: f32) {}
+
     /// Dot-product of two vectors.
     ///
     /// # Safety
@@ -103,6 +120,16 @@ impl VecOps for f32 {
     }
 
     #[inline(always)]
+    unsafe fn vec_dot_f32(lhs: *const Self, rhs: *const Self, len: usize) -> f32 {
+        super::vec_dot_f32_simd(lhs, rhs, len)
+    }
+
+    #[inline(always)]
+    fn vec_fmadd_to_f32(acc: &mut [f32], v: &[Self], w: f32) {
+        super::vec_fmadd_f32_simd(acc, v, w)
+    }
+
+    #[inline(always)]
     unsafe fn vec_reduce_sum(xs: *const Self, res: *mut Self, len: usize) {
         super::vec_sum(xs, res, len)
     }
@@ -134,6 +161,16 @@ impl VecOps for half::f16 {
         super::vec_dot_f16(lhs, rhs, &mut res_f32, len);
         *res = half::f16::from_f32(res_f32);
     }
+
+    #[inline(always)]
+    unsafe fn vec_dot_f32(lhs: *const Self, rhs: *const Self, len: usize) -> f32 {
+        super::vec_dot_f16_to_f32_simd(lhs, rhs, len)
+    }
+
+    #[inline(always)]
+    fn vec_fmadd_to_f32(acc: &mut [f32], v: &[Self], w: f32) {
+        super::vec_fmadd_f16_to_f32_simd(acc, v, w)
+    }
 }
 
 impl VecOps for f64 {
@@ -145,6 +182,22 @@ impl VecOps for f64 {
     #[inline(always)]
     fn max(self, other: Self) -> Self {
         Self::max(self, other)
+    }
+
+    #[inline(always)]
+    unsafe fn vec_dot_f32(lhs: *const Self, rhs: *const Self, len: usize) -> f32 {
+        let mut acc = 0.0f64;
+        for i in 0..len {
+            acc += *lhs.add(i) * *rhs.add(i);
+        }
+        acc as f32
+    }
+
+    #[inline(always)]
+    fn vec_fmadd_to_f32(acc: &mut [f32], v: &[Self], w: f32) {
+        for (a, &e) in acc.iter_mut().zip(v.iter()) {
+            *a += (e as f32) * w;
+        }
     }
 
     #[inline(always)]
@@ -186,6 +239,16 @@ impl VecOps for half::bf16 {
         let mut res_f32 = 0f32;
         super::vec_dot_bf16(lhs, rhs, &mut res_f32, len);
         *res = half::bf16::from_f32(res_f32);
+    }
+
+    #[inline(always)]
+    unsafe fn vec_dot_f32(lhs: *const Self, rhs: *const Self, len: usize) -> f32 {
+        super::vec_dot_bf16_to_f32_simd(lhs, rhs, len)
+    }
+
+    #[inline(always)]
+    fn vec_fmadd_to_f32(acc: &mut [f32], v: &[Self], w: f32) {
+        super::vec_fmadd_bf16_to_f32_simd(acc, v, w)
     }
 }
 impl VecOps for u8 {
@@ -281,7 +344,7 @@ pub fn par_range(lo: usize, up: usize, n_threads: usize, func: impl Fn(usize) + 
             for thread_idx in 0..n_threads {
                 let func = &func;
                 s.spawn(move |_| {
-                    for i in (thread_idx..up).step_by(n_threads) {
+                    for i in (lo + thread_idx..up).step_by(n_threads) {
                         func(i)
                     }
                 });

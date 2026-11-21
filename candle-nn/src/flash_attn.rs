@@ -747,10 +747,9 @@ fn paged_flash_attn(
     if !fused || !matches!(q.device(), Device::Cuda(_) | Device::Rocm(_)) {
         return Ok(None);
     }
-    let (_, _, lq, _) = q.dims4()?;
+    let (_, _, _lq, _) = q.dims4()?;
     let kv_dtype = blocks[0].k.dtype();
-    if lq > att::FA_DECODE_MAX_Q
-        || blocks.len() > att::FA_MAX_PAGES
+    if blocks.len() > att::FA_MAX_PAGES
         || blocks[0].v.dtype() != kv_dtype
         || !FlashAttnOp::kv_as_is(q.dtype(), kv_dtype, kv_dtype)
         || blocks.iter().any(|x| {

@@ -9,11 +9,32 @@ use crate::accel::attention::{
     self as att, AttnGeometry, FaExtra, FaPlan, FlashAttnParams, PageTable, PagedKv, FA_THREADS,
     MAX_GRID_X,
 };
-use crate::accel::turbo::{tq_attn_group, tq_attn_kernel, TqAttnArgs, TqRowArgs, TQ_THREADS};
+use crate::accel::turbo::{
+    tq_attn_group, tq_attn_kernel, tq_tile_launch, TqAttnArgs, TqRowArgs, TQ_THREADS,
+};
 use crate::{bail, DType, Result};
 
 fn null() -> *const u8 {
     std::ptr::null()
+}
+
+/// Ensures the per-device `"fa_split_kv"` workspace holds `(part_o, part_lse)` for `splits > 1`,
+/// returning 256-byte aligned pointers with zero per-call HIP allocations.
+fn split_kv_ptrs(
+    dev: &super::RocmDevice,
+    splits: usize,
+    rows: usize,
+    d: usize,
+) -> Result<Option<(*const u8, *const u8)>> {
+    if splits <= 1 || rows == 0 || d == 0 {
+        return Ok(None);
+    }
+    let po_bytes = (splits * rows * d * 4).div_ceil(256) * 256;
+    let pl_bytes = splits * rows * 4;
+    let base = dev.workspace_ensure("fa_split_kv", po_bytes + pl_bytes)?;
+    let po = base as *const u8;
+    let pl = unsafe { base.add(po_bytes) } as *const u8;
+    Ok(Some((po, pl)))
 }
 
 fn half_sfx(dtype: DType, op: &str) -> Result<&'static str> {
@@ -88,14 +109,7 @@ impl RocmStorage {
             return Ok(Self::new(out, self.dtype, self.device.clone()));
         }
         let func = self.device.get_func(Module::FlashAttn, &name)?;
-        let part = if splits > 1 {
-            Some((
-                self.device.alloc(splits * rows * d * 4)?,
-                self.device.alloc(splits * rows * 4)?,
-            ))
-        } else {
-            None
-        };
+        let part = split_kv_ptrs(&self.device, splits, rows, d)?;
         let (alibi, alibi_bs) = match extra.alibi {
             Some((s, off, bs)) => (s.ptr_at(off), bs),
             None => (null(), 0),
@@ -109,8 +123,8 @@ impl RocmStorage {
             .ptr(k.ptr_at(geom.k_offset))
             .ptr(v.ptr_at(geom.v_offset))
             .ptr(out.as_ptr())
-            .ptr(part.as_ref().map(|p| p.0.as_ptr()).unwrap_or(null()))
-            .ptr(part.as_ref().map(|p| p.1.as_ptr()).unwrap_or(null()))
+            .ptr(part.map(|p| p.0).unwrap_or(null()))
+            .ptr(part.map(|p| p.1).unwrap_or(null()))
             .ptr(alibi)
             .ptr(cu_q)
             .ptr(cu_k)
@@ -140,8 +154,8 @@ impl RocmStorage {
                 .device
                 .get_func(Module::FlashAttn, &format!("fa_combine_{sfx}"))?;
             let mut a = LaunchArgs::new();
-            a.ptr(po.as_ptr())
-                .ptr(pl.as_ptr())
+            a.ptr(po)
+                .ptr(pl)
                 .ptr(out.as_ptr())
                 .usize(rows)
                 .u32(d as u32)
@@ -157,9 +171,9 @@ impl RocmStorage {
         Ok(Self::new(out, self.dtype, self.device.clone()))
     }
 
-    /// Decoding attention of `self` (queries, geometry from `AttnGeometry::paged`) over the K/V
-    /// blocks of a paged cache without concatenating them (`fa_rowp_*`). Output contiguous in
-    /// the query dtype.
+    /// Attention of `self` (queries, geometry from `AttnGeometry::paged`) over the K/V blocks of
+    /// a paged cache without concatenating them (`fa_rowp_*` for decode, `fa2p_*`/`fa3p_*` for
+    /// chunked prefill). Output contiguous in the query dtype.
     pub fn flash_attn_paged(
         &self,
         blocks: &[PagedKv<'_, Self>],
@@ -189,23 +203,26 @@ impl RocmStorage {
             )
         }
         let prof = self.device.accel_profile();
-        let launch = att::row_launch(geom, p, prof.compute_units, self.dtype, kv_dtype, true)?;
-        let (grid, smem, splits) = (launch.grid, launch.shared_bytes, launch.splits);
+        let plan = att::plan(geom, p, prof.max_shared_mem, prof.compute_units);
+        let (name, grid, smem, splits) = match plan {
+            FaPlan::Tile { .. } => {
+                let name = att::paged_tile_kernel_name(&plan, self.dtype, kv_dtype)?;
+                let (grid, smem, splits) = att::launch_dims(geom, &plan);
+                (name, grid, smem, splits)
+            }
+            FaPlan::Row { .. } => {
+                let l = att::row_launch(geom, p, prof.compute_units, self.dtype, kv_dtype, true)?;
+                (l.name, l.grid, l.shared_bytes, l.splits)
+            }
+        };
         let rows = geom.out_rows();
         let d = geom.d;
         let out = self.device.alloc(rows * d * self.esz())?;
         if rows == 0 || d == 0 {
             return Ok(Self::new(out, self.dtype, self.device.clone()));
         }
-        let func = self.device.get_func(Module::FlashAttn, &launch.name)?;
-        let part = if splits > 1 {
-            Some((
-                self.device.alloc(splits * rows * d * 4)?,
-                self.device.alloc(splits * rows * 4)?,
-            ))
-        } else {
-            None
-        };
+        let func = self.device.get_func(Module::FlashAttn, &name)?;
+        let part = split_kv_ptrs(&self.device, splits, rows, d)?;
         let (alibi, alibi_bs) = match extra.alibi {
             Some((s, off, bs)) => (s.ptr_at(off), bs),
             None => (null(), 0),
@@ -215,8 +232,8 @@ impl RocmStorage {
             .ptr(null())
             .ptr(null())
             .ptr(out.as_ptr())
-            .ptr(part.as_ref().map(|p| p.0.as_ptr()).unwrap_or(null()))
-            .ptr(part.as_ref().map(|p| p.1.as_ptr()).unwrap_or(null()))
+            .ptr(part.map(|p| p.0).unwrap_or(null()))
+            .ptr(part.map(|p| p.1).unwrap_or(null()))
             .ptr(alibi)
             .ptr(null())
             .ptr(null())
@@ -247,8 +264,8 @@ impl RocmStorage {
                 .device
                 .get_func(Module::FlashAttn, &format!("fa_combine_{sfx}"))?;
             let mut a = LaunchArgs::new();
-            a.ptr(po.as_ptr())
-                .ptr(pl.as_ptr())
+            a.ptr(po)
+                .ptr(pl)
                 .ptr(out.as_ptr())
                 .usize(rows)
                 .u32(d as u32)
@@ -300,6 +317,82 @@ impl RocmStorage {
             )?;
         }
         Ok(Self::new(out, DType::U32, self.device.clone()))
+    }
+
+    /// Single-pass TurboProd quantization (codes + residual + QJL signs + rsc0/rsc1 in 1 launch).
+    pub fn tq_quantize_prod_fused(
+        &self,
+        offset: usize,
+        tab: &Self,
+        tab_off: usize,
+        s_mat: &Self,
+        s_off: usize,
+        a: &TqRowArgs,
+    ) -> Result<Self> {
+        let sfx = half_sfx(self.dtype, "turbo-quant")?;
+        let out = self.device.alloc(a.rows * a.row_words * 4)?;
+        if a.rows > 0 {
+            let func = self
+                .device
+                .get_func(Module::TurboQuant, &format!("tq_quant_prod_{sfx}"))?;
+            let mut l = LaunchArgs::new();
+            l.ptr(self.ptr_at(offset))
+                .ptr(tab.ptr_at(tab_off))
+                .ptr(s_mat.ptr_at(s_off))
+                .ptr(out.as_ptr())
+                .usize(a.rows)
+                .u32(a.dim as u32)
+                .usize(a.dim)
+                .u32(a.code_bits)
+                .u32(a.code_words as u32)
+                .u32(a.row_words as u32);
+            let smem = (2 * a.dim + TQ_THREADS) * 4;
+            self.device.launch(
+                func,
+                (grid_rows(a.rows), 1, 1),
+                (TQ_THREADS as u32, 1, 1),
+                smem as u32,
+                &mut l,
+            )?;
+        }
+        Ok(Self::new(out, DType::U32, self.device.clone()))
+    }
+
+    /// On-chip O(d log d) Fast Walsh-Hadamard Transform (`rows x dim` -> F32 `rows x dim`).
+    pub fn tq_fwht(
+        &self,
+        offset: usize,
+        sign_bits: &Self,
+        sign_off: usize,
+        rows: usize,
+        dim: usize,
+        forward: bool,
+    ) -> Result<Self> {
+        let sfx = half_sfx(self.dtype, "tq_fwht")?;
+        let out = self.device.alloc(rows * dim * 4)?;
+        if rows > 0 && dim > 0 {
+            let func = self
+                .device
+                .get_func(Module::TurboQuant, &format!("tq_fwht_{sfx}"))?;
+            let inv_sqrt_d = 1.0f32 / (dim as f32).sqrt();
+            let mut l = LaunchArgs::new();
+            l.ptr(self.ptr_at(offset))
+                .ptr(out.as_ptr())
+                .ptr(sign_bits.ptr_at(sign_off))
+                .usize(rows)
+                .u32(dim as u32)
+                .usize(dim)
+                .f32(inv_sqrt_d)
+                .u32(u32::from(forward));
+            self.device.launch(
+                func,
+                (grid_rows(rows), 1, 1),
+                (TQ_THREADS as u32, 1, 1),
+                (dim * 4) as u32,
+                &mut l,
+            )?;
+        }
+        Ok(Self::new(out, DType::F32, self.device.clone()))
     }
 
     /// Residual of the unit vectors to their codebook values (TurboQuant prod), F32 rows.
@@ -481,22 +574,83 @@ impl RocmStorage {
         if rows == 0 || d == 0 {
             return Ok(Self::new(out, DType::F32, self.device.clone()));
         }
-        let splits = a.splits.max(1);
-        let part = if splits > 1 {
-            Some((
-                self.device.alloc(splits * rows * d * 4)?,
-                self.device.alloc(splits * rows * 4)?,
-            ))
-        } else {
-            None
-        };
-        let group = tq_attn_group(a.hq, a.hkv);
-        let name = tq_attn_kernel(&a.k, &a.v, table.is_some(), group);
-        let func = self.device.get_func(Module::TurboQuant, &name)?;
+        let prof = self.device.accel_profile();
         let (k_p, v_p) = match dense {
             Some((kd, vd)) => (kd.ptr_at(a.k_offset), vd.ptr_at(a.v_offset)),
             None => (null(), null()),
         };
+        let tile_plan = if a.splits <= 1 {
+            let version = crate::accel::config()
+                .flash_attn
+                .version
+                .unwrap_or(prof.flash_attn_version);
+            tq_tile_launch(a, version, prof.max_shared_mem, table.is_some())
+        } else {
+            None
+        };
+        if let Some((tname, br, _bc, tsmem)) = tile_plan {
+            if let Ok(func) = self.device.get_func(Module::TurboQuant, &tname) {
+                let mut l = LaunchArgs::new();
+                l.ptr(self.ptr_at(a.q_offset))
+                    .ptr(k_p)
+                    .ptr(v_p)
+                    .ptr(tab.ptr_at(tab_off))
+                    .ptr(alibi.map(|(s, o)| s.ptr_at(o)).unwrap_or(null()))
+                    .ptr(out.as_ptr())
+                    .ptr(null())
+                    .ptr(null())
+                    .u32(a.lq as u32)
+                    .u32(a.lk as u32)
+                    .u32(a.hq as u32)
+                    .u32(a.hkv as u32)
+                    .u32(d as u32)
+                    .usize(a.q_strides[0])
+                    .usize(a.q_strides[1])
+                    .usize(a.q_strides[2])
+                    .usize(a.k_strides[0])
+                    .usize(a.k_strides[1])
+                    .usize(a.k_strides[2])
+                    .usize(a.v_strides[0])
+                    .usize(a.v_strides[1])
+                    .usize(a.v_strides[2])
+                    .u32(a.k.mode)
+                    .u32(a.k.code_bits)
+                    .u32(a.k.code_words as u32)
+                    .u32(a.k.rsc_offset as u32)
+                    .u32(a.v.mode)
+                    .u32(a.v.code_bits)
+                    .u32(a.v.code_words as u32)
+                    .u32(a.v.rsc_offset as u32)
+                    .f32(a.scale)
+                    .f32(a.softcap)
+                    .u32(a.window_left as u32)
+                    .u32(a.window_right as u32)
+                    .u32(1)
+                    .u32(a.alibi_bstride as u32)
+                    .usize(rows);
+                if let Some(t) = table {
+                    l.words(t.to_words());
+                }
+                let grid = (
+                    a.lq.div_ceil(br).clamp(1, MAX_GRID_X) as u32,
+                    a.hq as u32,
+                    a.b as u32,
+                );
+                self.device.launch(
+                    func,
+                    grid,
+                    (TQ_THREADS as u32, 1, 1),
+                    tsmem as u32,
+                    &mut l,
+                )?;
+                return Ok(Self::new(out, DType::F32, self.device.clone()));
+            }
+        }
+        let splits = a.splits.max(1);
+        let part = split_kv_ptrs(&self.device, splits, rows, d)?;
+        let group = tq_attn_group(a.hq, a.hkv);
+        let name = tq_attn_kernel(&a.k, &a.v, table.is_some(), group);
+        let func = self.device.get_func(Module::TurboQuant, &name)?;
         let mut l = LaunchArgs::new();
         l.ptr(self.ptr_at(a.q_offset))
             .ptr(k_p)
@@ -504,8 +658,8 @@ impl RocmStorage {
             .ptr(tab.ptr_at(tab_off))
             .ptr(alibi.map(|(s, o)| s.ptr_at(o)).unwrap_or(null()))
             .ptr(out.as_ptr())
-            .ptr(part.as_ref().map(|p| p.0.as_ptr()).unwrap_or(null()))
-            .ptr(part.as_ref().map(|p| p.1.as_ptr()).unwrap_or(null()))
+            .ptr(part.map(|p| p.0).unwrap_or(null()))
+            .ptr(part.map(|p| p.1).unwrap_or(null()))
             .u32(a.lq as u32)
             .u32(a.lk as u32)
             .u32(a.hq as u32)
@@ -553,8 +707,8 @@ impl RocmStorage {
         if let Some((po, pl)) = part {
             let comb = self.device.get_func(Module::TurboQuant, "tq_combine")?;
             let mut l = LaunchArgs::new();
-            l.ptr(po.as_ptr())
-                .ptr(pl.as_ptr())
+            l.ptr(po)
+                .ptr(pl)
                 .ptr(out.as_ptr())
                 .usize(rows)
                 .u32(d as u32)
