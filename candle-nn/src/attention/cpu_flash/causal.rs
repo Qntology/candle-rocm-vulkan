@@ -11,10 +11,10 @@ use super::online_softmax::online_softmax_step;
 
 // These utils are mostly for readability.
 
-// Multiply-add a vector into an accumulator.
+// Multiply-add a vector into an accumulator using SIMD FMA when available.
 #[inline(always)]
 fn vec_fmadd_scalar(acc: &mut [f32], v: &[f32], w: f32) {
-    acc.iter_mut().zip(v).for_each(|(a, e)| *a += e * w);
+    f32::vec_fmadd_to_f32(acc, v, w);
 }
 
 // Scale an accumulator in place
@@ -826,6 +826,44 @@ fn causal_decode_generic<T: WithDType + num_traits::Float>(
 
     let mut out = vec![0f32; h_q * d];
 
+    // GQA-grouped path: load each K/V row once per KV head and reuse across all `rk` query heads
+    // (cuts KV memory bandwidth by `rk` = 2x..8x for F16/BF16 decode).
+    if h_kv == h_v && rk > 1 && max_bias == 0.0 {
+        out.par_chunks_mut(rk * d).enumerate().for_each(|(hk, grp_out)| {
+            let mut accs = vec![0f32; rk * d];
+            let mut ms = vec![f32::NEG_INFINITY; rk];
+            let mut ssums = vec![0.0f32; rk];
+            let kv_head_off = hk * d;
+            for kv_pos in 0..kv_len {
+                let k_base = kv_pos * k_seq_stride + kv_head_off;
+                let k_row = &k_data[k_base..k_base + d];
+                let v_base = kv_pos * v_seq_stride + kv_head_off;
+                let v_row = &v_data[v_base..v_base + d];
+                for g in 0..rk {
+                    let h_i = hk * rk + g;
+                    let q_row = &q_data[h_i * d..(h_i + 1) * d];
+                    let mut s_val = dot_f32(q_row, k_row) * scale_pre;
+                    if do_softcap {
+                        s_val = logit_softcap * s_val.tanh();
+                    }
+                    let acc = &mut accs[g * d..(g + 1) * d];
+                    online_softmax_step(s_val, &mut ms[g], &mut ssums[g], acc, |acc, w| {
+                        T::vec_fmadd_to_f32(acc, v_row, w);
+                    });
+                }
+            }
+            for g in 0..rk {
+                let inv = if ssums[g] > 0.0 { 1.0 / ssums[g] } else { 0.0 };
+                let dst = &mut grp_out[g * d..(g + 1) * d];
+                let src = &accs[g * d..(g + 1) * d];
+                for t in 0..d {
+                    dst[t] = src[t] * inv;
+                }
+            }
+        });
+        return Tensor::from_vec(out, (h_q, 1usize, d), &Device::Cpu);
+    }
+
     out.par_chunks_mut(d).enumerate().for_each_init(
         || vec![0f32; d],
         |acc, (h_i, out_chunk)| {
@@ -850,10 +888,7 @@ fn causal_decode_generic<T: WithDType + num_traits::Float>(
                 };
                 let k_base = kv_pos * k_seq_stride + k_head_off;
                 let k_row = &k_data[k_base..k_base + d];
-                let mut s_val_t = T::zero();
-                unsafe { T::vec_dot(q_row.as_ptr(), k_row.as_ptr(), &mut s_val_t, q_row.len()) }
-                let mut s_val = s_val_t.to_f32().unwrap_or(0.0);
-                s_val *= scale_pre;
+                let mut s_val = dot_f32(q_row, k_row) * scale_pre;
                 if do_softcap {
                     s_val = logit_softcap * s_val.tanh();
                 }
@@ -862,9 +897,7 @@ fn causal_decode_generic<T: WithDType + num_traits::Float>(
                 let v_base = kv_pos * v_seq_stride + v_head_off;
                 let v_row = &v_data[v_base..v_base + d];
                 online_softmax_step(s_val, &mut m, &mut ssum, acc, |acc, w| {
-                    for t in 0..d {
-                        acc[t] += v_row[t].to_f32().unwrap_or(0.0) * w;
-                    }
+                    T::vec_fmadd_to_f32(acc, v_row, w);
                 });
             }
             let inv = if ssum > 0.0 { 1.0 / ssum } else { 0.0 };
@@ -949,9 +982,7 @@ fn causal_prefill_generic<T: WithDType>(
                     let v_base = kv_pos * v_seq_stride + v_head_off;
                     let v_row = &v_data[v_base..v_base + d];
                     online_softmax_step(s_val, &mut m, &mut ssum, acc, |acc, w| {
-                        for t in 0..d {
-                            acc[t] += v_row[t].to_f64() as f32 * w;
-                        }
+                        T::vec_fmadd_to_f32(acc, v_row, w);
                     });
                 }
                 let inv = if ssum > 0.0 { 1.0 / ssum } else { 0.0 };

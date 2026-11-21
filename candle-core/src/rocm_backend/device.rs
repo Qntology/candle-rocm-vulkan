@@ -143,6 +143,9 @@ struct DeviceInner {
     accel: OnceLock<crate::accel::AccelProfile>,
     /// Non-blocking stream used by [`super::offload::CopyStream`], created on first use.
     copy_stream: Mutex<Option<Arc<super::offload::RawStream>>>,
+    /// Persistent named scratch buffers reused across calls (split-KV, lm_head, dequant tiles)
+    /// to eliminate per-step Windows HIP `hipMallocAsync`/`hipFreeAsync` overhead.
+    workspaces: Mutex<HashMap<&'static str, DeviceBuffer<u8>>>,
 }
 
 /// A ROCm (HIP) GPU device. Clones share the same underlying context, rocBLAS handle and
@@ -288,6 +291,7 @@ impl RocmDevice {
                 gemm_backend: AtomicU8::new(gemm_backend.as_u8()),
                 accel: OnceLock::new(),
                 copy_stream: Mutex::new(None),
+                workspaces: Mutex::new(HashMap::new()),
             }),
         })
     }
@@ -457,13 +461,53 @@ impl RocmDevice {
         Ok(s)
     }
 
-    /// The ROCm backend keeps no per-device quantized matmul scratch: nothing to free.
+    /// Ensures a named persistent scratch buffer holds at least `bytes` and returns its
+    /// device pointer (reallocated only when growing). Safe for stream-ordered sequential use
+    /// on the NULL compute stream.
+    pub(crate) fn workspace_ensure(&self, name: &'static str, bytes: usize) -> Result<*mut u8> {
+        let bytes = bytes.max(256);
+        let mut map = self
+            .inner
+            .workspaces
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        let needs_alloc = map
+            .get(name)
+            .map_or(true, |buf| buf.byte_size() < bytes);
+        if needs_alloc {
+            let buf = self.alloc(bytes)?;
+            let ptr = buf.as_mut_ptr();
+            map.insert(name, buf);
+            Ok(ptr)
+        } else {
+            Ok(map.get(name).unwrap().as_mut_ptr())
+        }
+    }
+
+    /// Total bytes currently held by per-device reusable workspaces.
+    pub fn workspace_bytes(&self) -> usize {
+        self.inner
+            .workspaces
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .values()
+            .map(|b| b.byte_size())
+            .sum()
+    }
+
+    /// Releases all persistent per-device workspaces (split-KV, lm_head, dequant tiles).
     pub fn release_workspaces(&self) -> Result<()> {
+        self.inner
+            .workspaces
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .clear();
         Ok(())
     }
 
     pub fn release_cached_resources(&self) -> Result<()> {
         self.inner.hip.synchronize().w()?;
+        self.release_workspaces()?;
         self.trim_memory_pool()?;
         {
             let mut blas = self.inner.blas.lock().unwrap();
@@ -603,28 +647,48 @@ impl RocmDevice {
         }
     }
 
-    /// GEMM with the tiled kernel of `kernels/gemm.hip` (same contract as rocBLAS).
+    /// GEMM with the HIP kernels of `kernels/gemm.hip` (same contract as rocBLAS).
+    /// Dispatches Skinny-M/N decode shapes (`min(m, n) <= 8 && k >= 256`) to `gemm_skinny_*`
+    /// to avoid wasting 98% of a 64x64 tile.
     pub(crate) fn hip_gemm(&self, c: &GemmCall) -> Result<GemmOutcome> {
         if c.m == 0 || c.n == 0 || c.batch == 0 {
             return Ok(GemmOutcome::Done);
         }
-        let name = match c.ty {
-            GemmType::F32 => "gemm_f32",
-            GemmType::F64 => "gemm_f64",
-            GemmType::F16 => "gemm_f16",
-            GemmType::BF16 => "gemm_bf16",
+        let sfx = match c.ty {
+            GemmType::F32 => "f32",
+            GemmType::F64 => "f64",
+            GemmType::F16 => "f16",
+            GemmType::BF16 => "bf16",
         };
-        let func = match self.get_func(Module::Gemm, name) {
-            Ok(f) => f,
+        let skinny = c.m.min(c.n) <= 8 && c.k >= 256;
+        let name = if skinny {
+            format!("gemm_skinny_{sfx}")
+        } else {
+            format!("gemm_{sfx}")
+        };
+        let (func, used_skinny) = match self.get_func(Module::Gemm, &name) {
+            Ok(f) => (f, skinny),
+            Err(_) if skinny => match self.get_func(Module::Gemm, &format!("gemm_{sfx}")) {
+                Ok(f) => (f, false),
+                Err(e) => return Ok(GemmOutcome::NoKernel(e.to_string())),
+            },
             Err(e) => return Ok(GemmOutcome::NoKernel(e.to_string())),
         };
         const TILE: usize = 64;
         const MAX_GRID: usize = 65535;
-        let grid = (
-            c.m.div_ceil(TILE).min(MAX_GRID) as u32,
-            c.n.div_ceil(TILE).min(MAX_GRID) as u32,
-            c.batch.min(MAX_GRID) as u32,
-        );
+        let grid = if used_skinny {
+            (
+                c.m.min(MAX_GRID) as u32,
+                c.n.min(MAX_GRID) as u32,
+                c.batch.min(MAX_GRID) as u32,
+            )
+        } else {
+            (
+                c.m.div_ceil(TILE).min(MAX_GRID) as u32,
+                c.n.div_ceil(TILE).min(MAX_GRID) as u32,
+                c.batch.min(MAX_GRID) as u32,
+            )
+        };
         let mut args = LaunchArgs::new();
         args.ptr(c.a)
             .ptr(c.b)

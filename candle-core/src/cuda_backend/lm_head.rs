@@ -92,8 +92,15 @@ impl CudaStorage {
         if m > 0 && v_valid > 0 && k > 0 {
             let plan = lmh::plan_stage1(m, v_valid);
             let n_tiles = plan.n_tiles as usize;
-            let mut part_val = unsafe { dev.alloc::<f32>((m * n_tiles).max(1))? };
-            let mut part_idx = unsafe { dev.alloc::<u32>((m * n_tiles).max(1))? };
+            let pv_bytes = ((m * n_tiles).max(1) * 4).div_ceil(256) * 256;
+            let pi_bytes = (m * n_tiles).max(1) * 4;
+            let base = dev
+                .workspaces
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .ensure(dev, "lm_head_parts", pv_bytes + pi_bytes)?;
+            let pv_p = base;
+            let pi_p = base + pv_bytes as u64;
 
             let f1 = dev.lm_head_func(&plan.kernel_name(sfx))?;
             let f2 = dev.lm_head_func(&format!("lm_stage2_reduce_cs_{sfx}"))?;
@@ -110,8 +117,6 @@ impl CudaStorage {
                     }
                     None => (0u64, None),
                 };
-                let (pv_p, _g3) = part_val.device_ptr_mut(&stream);
-                let (pi_p, _g4) = part_idx.device_ptr_mut(&stream);
                 let m32 = m as u32;
                 let v32 = v_valid as u32;
                 let k32 = k as u32;
@@ -136,8 +141,6 @@ impl CudaStorage {
 
             // Stage 2: Tile reduction + core_ids remap + CS upper-bound check
             {
-                let (pv_p, _g0) = part_val.device_ptr(&stream);
-                let (pi_p, _g1) = part_idx.device_ptr(&stream);
                 let (cid_p, _g2) = match core_ids {
                     Some((cs, off)) => {
                         let (p, g) = dptr(cs, off, &stream)?;

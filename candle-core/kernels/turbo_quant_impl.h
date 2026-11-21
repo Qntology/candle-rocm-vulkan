@@ -226,14 +226,103 @@ AX_DEV void tq_dequant_impl(const ax_u32 *data, const float *tab, float *out, fl
 // Element j of an FP8 row (bit-identical to tq_elem for TQ_FP8 rows).
 AX_DEV float tq_fp8_elem(const ax_u32 *row, ax_u32 j) { return ax_e4m3_to_f_fast(tq_byte(row, j)); }
 
-// Dot product of a packed key row with the rotated query, without the rsc0 factor. The FP8
-// specialization reads one word per four codes and decodes them without branches; the sum runs
-// in the same order with the same products as the generic path, so the result is bit-identical.
-template <bool F8>
+// Element j of an NVFP4 row (bit-identical to tq_elem for TQ_NVFP4 rows).
+AX_DEV float tq_nvfp4_elem(const ax_u32 *row, ax_u32 j, ax_u32 cw) {
+    const ax_u32 c = (row[j >> 3] >> ((j & 7u) * 4u)) & 0xfu;
+    return ax_fp4_to_f(c) * ax_e4m3_to_f_fast(tq_byte(row + cw, j >> 4));
+}
+
+#define TQ_FM_GENERIC 0
+#define TQ_FM_FP8     1
+#define TQ_FM_NVFP4   2
+
+// Single-pass TurboProd quantization: normalizes, quantizes to codebook, computes residual in
+// shared memory, projects with S (L2-cached D x D matrix), packs code words + QJL sign bits +
+// rsc0/rsc1 in one kernel launch (bit-exact with tq_quant + tq_resid + matmul + tq_signs).
+// Shared memory: (2 * D + TQ_NT) * sizeof(float).
+template <typename T>
+AX_DEV void tq_quant_prod_fused_impl(const T *src, const float *tab, const float *s_mat,
+                                     ax_u32 *out, ax_u64 rows, ax_u32 D, ax_u64 src_stride,
+                                     ax_u32 cb, ax_u32 code_words, ax_u32 row_words) {
+    float *y = ax_smem();
+    ax_u32 *codes = reinterpret_cast<ax_u32 *>(y + D);
+    float *red = y + 2 * D;
+    const ax_u32 t = AX_TID;
+    const ax_u32 nb = (1u << cb) - 1u;
+    const ax_u32 sign_words = (D + 31u) / 32u;
+    for (ax_u64 row = AX_BID_X; row < rows; row += AX_NBLK_X) {
+        AX_SYNC();
+        const T *x = src + row * src_stride;
+        float ss = 0.0f;
+        for (ax_u32 j = t; j < D; j += TQ_NT) {
+            const float v = ax_load(x, j);
+            y[j] = v;
+            ss += v * v;
+        }
+        ss = ax_block_sum<TQ_NT>(ss, red);
+        const float norm = sqrtf(ss);
+        const float inv = norm > 0.0f ? 1.0f / norm : 0.0f;
+        float ss_r = 0.0f;
+        for (ax_u32 j = t; j < D; j += TQ_NT) {
+            const float u = y[j] * inv;
+            ax_u32 idx = 0;
+            for (ax_u32 bi = 0; bi < nb; ++bi) idx += u >= tab[16 + bi] ? 1u : 0u;
+            codes[j] = idx;
+            const float r = u - tab[idx];
+            y[j] = r;
+            ss_r += r * r;
+        }
+        ss_r = ax_block_sum<TQ_NT>(ss_r, red); // also publishes y[0..D] and codes[0..D]
+        ax_u32 *orow = out + row * row_words;
+        for (ax_u32 w = t; w < code_words; w += TQ_NT) orow[w] = tq_pack_word(codes, w, cb, D);
+        AX_SYNC(); // codes[] can now be reused for sign bits
+        for (ax_u32 i = t; i < D; i += TQ_NT) {
+            const float *srow = s_mat + (ax_u64)i * (ax_u64)D;
+            float dot = 0.0f;
+            for (ax_u32 j = 0; j < D; ++j) dot += y[j] * srow[j];
+            codes[i] = dot >= 0.0f ? 1u : 0u;
+        }
+        AX_SYNC();
+        for (ax_u32 w = t; w < sign_words; w += TQ_NT) {
+            ax_u32 word = 0;
+            const ax_u32 base = w * 32u;
+            for (ax_u32 e = 0; e < 32u && base + e < D; ++e) {
+                if (codes[base + e]) word |= 1u << e;
+            }
+            orow[code_words + w] = word;
+        }
+        if (t == 0) {
+            orow[code_words + sign_words] = ax_f2u(norm);
+            orow[code_words + sign_words + 1u] = ax_f2u(sqrtf(ss_r));
+        }
+    }
+}
+
+// On-chip Fast Walsh-Hadamard Transform kernel over rows of power-of-two length D.
+// Shared memory: D * sizeof(float).
+template <typename T>
+AX_DEV void tq_fwht_impl(const T *src, float *dst, const ax_u32 *sign_bits, ax_u64 rows, ax_u32 D,
+                         ax_u64 src_stride, float inv_sqrt_d, ax_u32 forward) {
+    float *buf = ax_smem();
+    const ax_u32 t = AX_TID;
+    for (ax_u64 row = AX_BID_X; row < rows; row += AX_NBLK_X) {
+        AX_SYNC();
+        const T *x = src + row * src_stride;
+        for (ax_u32 j = t; j < D; j += TQ_NT) buf[j] = ax_load(x, j);
+        ax_fwht_inplace<TQ_NT>(buf, D, sign_bits, inv_sqrt_d, forward != 0u);
+        float *y = dst + row * (ax_u64)D;
+        for (ax_u32 j = t; j < D; j += TQ_NT) y[j] = buf[j];
+    }
+}
+
+// Dot product of a packed key row with the rotated query, without the rsc0 factor.
+// The FP8 and NVFP4 specializations read whole words and reuse block scales while preserving
+// the exact product and summation order of the generic path (bit-identical).
+template <int KM>
 AX_DEV float tq_key_dot(const ax_u32 *kr, const float *qr, ax_u32 D, ax_u32 k_mode, ax_u32 k_cb,
                         ax_u32 k_cw, const float *kc) {
     float dot = 0.0f;
-    if (F8) {
+    if (KM == TQ_FM_FP8) {
         ax_u32 d = 0;
         for (; d + 4u <= D; d += 4u) {
             const ax_u32 x = kr[d >> 2];
@@ -243,6 +332,23 @@ AX_DEV float tq_key_dot(const ax_u32 *kr, const float *qr, ax_u32 D, ax_u32 k_mo
             dot += ax_e4m3_to_f_fast(x >> 24) * qr[d + 3];
         }
         for (; d < D; ++d) dot += tq_fp8_elem(kr, d) * qr[d];
+    } else if (KM == TQ_FM_NVFP4) {
+        const ax_u32 *aux = kr + k_cw;
+        ax_u32 d = 0;
+        for (; d + 16u <= D; d += 16u) {
+            const ax_u32 w0 = kr[d >> 3];
+            const ax_u32 w1 = kr[(d >> 3) + 1u];
+            const float bsc = ax_e4m3_to_f_fast(tq_byte(aux, d >> 4));
+            AX_UNROLL
+            for (ax_u32 i = 0; i < 8u; ++i) {
+                dot += (ax_fp4_to_f((w0 >> (4u * i)) & 0xfu) * bsc) * qr[d + i];
+            }
+            AX_UNROLL
+            for (ax_u32 i = 0; i < 8u; ++i) {
+                dot += (ax_fp4_to_f((w1 >> (4u * i)) & 0xfu) * bsc) * qr[d + 8u + i];
+            }
+        }
+        for (; d < D; ++d) dot += tq_nvfp4_elem(kr, d, k_cw) * qr[d];
     } else {
         for (ax_u32 d = 0; d < D; ++d) dot += tq_elem(kr, d, k_mode, k_cb, k_cw, kc) * qr[d];
     }
@@ -254,22 +360,29 @@ struct tq_sides {
     ax_u32 k_mode, k_cb, k_cw, k_rsc, v_mode, v_cb, v_cw, v_rsc;
 };
 
+template <int VM>
+AX_DEV float tq_val_elem(const ax_u32 *vr, ax_u32 j, const tq_sides &sd, const float *vc) {
+    if (VM == TQ_FM_FP8) return tq_fp8_elem(vr, j);
+    if (VM == TQ_FM_NVFP4) return tq_nvfp4_elem(vr, j, sd.v_cw);
+    return tq_elem(vr, j, sd.v_mode, sd.v_cb, sd.v_cw, vc);
+}
+
 // One window of up to TQ_NT keys [kb, min(kb + TQ_NT, e)): key j sits at row j - j0 of kp / vp.
-template <bool F8>
+template <int KM, int VM>
 AX_DEV void tq_attn_window(const float *qr, const float *qs, float *red, float *pr,
                            const float *kc, const float *vc, const ax_u32 *kp, const ax_u32 *vp,
                            ax_u64 k_ss, ax_u64 v_ss, long long j0, long long kb, long long e,
                            ax_u32 D, const tq_sides &sd, float scale, float softcap, float slope,
                            long long pos, float &m, float &l, float &acc0, float &acc1) {
     const ax_u32 t = AX_TID;
-    const bool prod = sd.k_mode == TQ_PROD;
+    const bool prod = (KM == TQ_FM_GENERIC) && (sd.k_mode == TQ_PROD);
     const long long j = kb + t;
     float s = -AX_INF, vscale = 0.0f;
     if (j < e) {
         const ax_u32 *kr = kp + (ax_u64)(j - j0) * k_ss;
-        const float dot = tq_key_dot<F8>(kr, qr, D, sd.k_mode, sd.k_cb, sd.k_cw, kc);
+        const float dot = tq_key_dot<KM>(kr, qr, D, sd.k_mode, sd.k_cb, sd.k_cw, kc);
         float sc = ax_u2f(kr[sd.k_rsc]) * dot;
-        if (!F8 && prod) {
+        if (prod) {
             float sdot = 0.0f;
             for (ax_u32 d = 0; d < D; ++d)
                 sdot += ((kr[sd.k_cw + (d >> 5)] >> (d & 31u)) & 1u) ? qs[d] : -qs[d];
@@ -291,13 +404,8 @@ AX_DEV void tq_attn_window(const float *qr, const float *qs, float *red, float *
         const float pu = pr[u];
         if (pu != 0.0f) {
             const ax_u32 *vr = vp + (ax_u64)(kb + u - j0) * v_ss;
-            if (F8) {
-                if (t < D) acc0 += pu * tq_fp8_elem(vr, t);
-                if (t + TQ_NT < D) acc1 += pu * tq_fp8_elem(vr, t + TQ_NT);
-            } else {
-                if (t < D) acc0 += pu * tq_elem(vr, t, sd.v_mode, sd.v_cb, sd.v_cw, vc);
-                if (t + TQ_NT < D) acc1 += pu * tq_elem(vr, t + TQ_NT, sd.v_mode, sd.v_cb, sd.v_cw, vc);
-            }
+            if (t < D) acc0 += pu * tq_val_elem<VM>(vr, t, sd, vc);
+            if (t + TQ_NT < D) acc1 += pu * tq_val_elem<VM>(vr, t + TQ_NT, sd, vc);
         }
     }
     m = m_new;
@@ -305,15 +413,7 @@ AX_DEV void tq_attn_window(const float *qr, const float *qs, float *red, float *
 }
 
 // Attention of rotated queries over packed K/V rows.
-//   qx: query rows (B, Hq, Lq) with strides q_sb, q_sh, q_ss; D rotated values, followed by
-//       D values of S·q when the keys are prod rows.
-//   kd / vd: packed rows; key row of (b, kv head, key t) at word b * k_sb + hk * k_sh + t * k_ss,
-//            value row at b * v_sb + hk * v_sh + t * v_ss. With PAGED the rows come from the
-//            blocks of `pg` instead (kd / vd unused, k_ss / v_ss are the row strides).
-//   tab: 64 floats: key centroids [0, 16), value centroids [32, 48).
-//   out (n_splits == 1) or part_o / part_lse: row (b * Hq + h) * Lq + i.
-// Grid (min(Lq * Hq, 2^31 - 1), n_splits, B). Shared memory: 2 D + 2 TQ_NT + 32 floats.
-template <bool F8, bool PAGED>
+template <int KM, int VM, bool PAGED>
 AX_DEV void tq_attn_core(const float *qx, const ax_u32 *kd, const ax_u32 *vd, const float *tab,
                          const float *alibi, float *out, float *part_o, float *part_lse, ax_u32 Lq,
                          ax_u32 Lk, ax_u32 Hq, ax_u32 Hkv, ax_u32 D, ax_u64 q_sb, ax_u64 q_sh,
@@ -332,7 +432,7 @@ AX_DEV void tq_attn_core(const float *qx, const ax_u32 *kd, const ax_u32 *vd, co
     const ax_u32 split = AX_BID_Y;
     const ax_u32 b = AX_BID_Z;
     const ax_u32 group = Hq / Hkv;
-    const bool prod = sd.k_mode == TQ_PROD;
+    const bool prod = (KM == TQ_FM_GENERIC) && (sd.k_mode == TQ_PROD);
     for (ax_u64 rowi = AX_BID_X; rowi < (ax_u64)Lq * Hq; rowi += AX_NBLK_X) {
         const ax_u32 i = (ax_u32)(rowi / Hq);
         const ax_u32 h = (ax_u32)(rowi % Hq);
@@ -364,8 +464,8 @@ AX_DEV void tq_attn_core(const float *qx, const ax_u32 *kd, const ax_u32 *vd, co
             const ax_u32 *kbase = kd + (ax_u64)b * k_sb + (ax_u64)hk * k_sh;
             const ax_u32 *vbase = vd + (ax_u64)b * v_sb + (ax_u64)hk * v_sh;
             for (long long kb = s_lo; kb < s_hi; kb += TQ_NT)
-                tq_attn_window<F8>(qr, qs, red, pr, kc, vc, kbase, vbase, k_ss, v_ss, 0, kb, s_hi,
-                                   D, sd, scale, softcap, slope, pos, m, l, acc0, acc1);
+                tq_attn_window<KM, VM>(qr, qs, red, pr, kc, vc, kbase, vbase, k_ss, v_ss, 0, kb,
+                                       s_hi, D, sd, scale, softcap, slope, pos, m, l, acc0, acc1);
         } else {
             // windows never straddle two blocks; the block loop is uniform over the workgroup
             long long j0 = 0;
@@ -379,9 +479,9 @@ AX_DEV void tq_attn_core(const float *qx, const ax_u32 *kd, const ax_u32 *vd, co
                     const ax_u32 *vbase = reinterpret_cast<const ax_u32 *>(pg->v[bi]) +
                                           bh * ((ax_u64)pg->v_cap[bi] * v_ss);
                     for (long long kb = a; kb < e; kb += TQ_NT)
-                        tq_attn_window<F8>(qr, qs, red, pr, kc, vc, kbase, vbase, k_ss, v_ss, j0,
-                                           kb, e, D, sd, scale, softcap, slope, pos, m, l, acc0,
-                                           acc1);
+                        tq_attn_window<KM, VM>(qr, qs, red, pr, kc, vc, kbase, vbase, k_ss, v_ss,
+                                               j0, kb, e, D, sd, scale, softcap, slope, pos, m, l,
+                                               acc0, acc1);
                 }
                 j0 = j1;
             }
@@ -401,11 +501,8 @@ AX_DEV void tq_attn_core(const float *qx, const ax_u32 *kd, const ax_u32 *vd, co
 }
 
 // GQA-packed tq_attn: one workgroup per (query row, pack of G query heads sharing a kv head,
-// split), so every packed K/V row is loaded and decoded once for G heads. Each head's
-// arithmetic is the one of tq_attn (same products, summation and reduction order): the results
-// are bit-identical to tq_attn / tq_attn_fp8. Grid (min(Lq * Hq / G, 2^31 - 1), n_splits, B).
-// Shared memory: 2 G D + 2 G TQ_NT + 32 floats.
-template <bool F8, int G>
+// split), so every packed K/V row is loaded and decoded once for G heads.
+template <int KM, int VM, int G>
 AX_DEV void tq_attng_window(const float *qr, const float *qs, float *red, float *pr,
                             const float *kc, const float *vc, const ax_u32 *kp, const ax_u32 *vp,
                             ax_u64 k_ss, ax_u64 v_ss, long long j0, long long kb, long long e,
@@ -413,7 +510,7 @@ AX_DEV void tq_attng_window(const float *qr, const float *qs, float *red, float 
                             const float *slope, long long pos, float *m, float *l, float *acc0,
                             float *acc1) {
     const ax_u32 t = AX_TID;
-    const bool prod = sd.k_mode == TQ_PROD;
+    const bool prod = (KM == TQ_FM_GENERIC) && (sd.k_mode == TQ_PROD);
     const long long j = kb + t;
     float s[G];
     AX_UNROLL
@@ -424,7 +521,7 @@ AX_DEV void tq_attng_window(const float *qr, const float *qs, float *red, float 
         float dot[G];
         AX_UNROLL
         for (int g = 0; g < G; ++g) dot[g] = 0.0f;
-        if (F8) {
+        if (KM == TQ_FM_FP8) {
             ax_u32 d = 0;
             for (; d + 4u <= D; d += 4u) {
                 const ax_u32 x = kr[d >> 2];
@@ -446,6 +543,31 @@ AX_DEV void tq_attng_window(const float *qr, const float *qs, float *red, float 
                 AX_UNROLL
                 for (int g = 0; g < G; ++g) dot[g] += c * qr[g * D + d];
             }
+        } else if (KM == TQ_FM_NVFP4) {
+            const ax_u32 *aux = kr + sd.k_cw;
+            ax_u32 d = 0;
+            for (; d + 16u <= D; d += 16u) {
+                const ax_u32 w0 = kr[d >> 3];
+                const ax_u32 w1 = kr[(d >> 3) + 1u];
+                const float bsc = ax_e4m3_to_f_fast(tq_byte(aux, d >> 4));
+                AX_UNROLL
+                for (ax_u32 i = 0; i < 8u; ++i) {
+                    const float c = ax_fp4_to_f((w0 >> (4u * i)) & 0xfu) * bsc;
+                    AX_UNROLL
+                    for (int g = 0; g < G; ++g) dot[g] += c * qr[g * D + d + i];
+                }
+                AX_UNROLL
+                for (ax_u32 i = 0; i < 8u; ++i) {
+                    const float c = ax_fp4_to_f((w1 >> (4u * i)) & 0xfu) * bsc;
+                    AX_UNROLL
+                    for (int g = 0; g < G; ++g) dot[g] += c * qr[g * D + d + 8u + i];
+                }
+            }
+            for (; d < D; ++d) {
+                const float c = tq_nvfp4_elem(kr, d, sd.k_cw);
+                AX_UNROLL
+                for (int g = 0; g < G; ++g) dot[g] += c * qr[g * D + d];
+            }
         } else {
             for (ax_u32 d = 0; d < D; ++d) {
                 const float c = tq_elem(kr, d, sd.k_mode, sd.k_cb, sd.k_cw, kc);
@@ -457,7 +579,7 @@ AX_DEV void tq_attng_window(const float *qr, const float *qs, float *red, float 
         float sdot[G];
         AX_UNROLL
         for (int g = 0; g < G; ++g) sdot[g] = 0.0f;
-        if (!F8 && prod) {
+        if (prod) {
             for (ax_u32 d = 0; d < D; ++d) {
                 const bool bit = ((kr[sd.k_cw + (d >> 5)] >> (d & 31u)) & 1u) != 0;
                 AX_UNROLL
@@ -467,7 +589,7 @@ AX_DEV void tq_attng_window(const float *qr, const float *qs, float *red, float 
         AX_UNROLL
         for (int g = 0; g < G; ++g) {
             float sc = rsc * dot[g];
-            if (!F8 && prod)
+            if (prod)
                 sc += ax_u2f(kr[sd.k_rsc]) * ax_u2f(kr[sd.k_rsc + 1]) * TQ_QJL / (float)D * sdot[g];
             s[g] = tq_logit(sc * scale, softcap, slope[g], pos - j);
         }
@@ -498,13 +620,8 @@ AX_DEV void tq_attng_window(const float *qr, const float *qs, float *red, float 
         if (any) {
             const ax_u32 *vr = vp + (ax_u64)(kb + u - j0) * v_ss;
             float v0 = 0.0f, v1 = 0.0f;
-            if (F8) {
-                if (t < D) v0 = tq_fp8_elem(vr, t);
-                if (t + TQ_NT < D) v1 = tq_fp8_elem(vr, t + TQ_NT);
-            } else {
-                if (t < D) v0 = tq_elem(vr, t, sd.v_mode, sd.v_cb, sd.v_cw, vc);
-                if (t + TQ_NT < D) v1 = tq_elem(vr, t + TQ_NT, sd.v_mode, sd.v_cb, sd.v_cw, vc);
-            }
+            if (t < D) v0 = tq_val_elem<VM>(vr, t, sd, vc);
+            if (t + TQ_NT < D) v1 = tq_val_elem<VM>(vr, t + TQ_NT, sd, vc);
             AX_UNROLL
             for (int g = 0; g < G; ++g) {
                 const float pu = pr[g * TQ_NT + u];
@@ -518,7 +635,7 @@ AX_DEV void tq_attng_window(const float *qr, const float *qs, float *red, float 
     AX_SYNC();
 }
 
-template <bool F8, bool PAGED, int G>
+template <int KM, int VM, bool PAGED, int G>
 AX_DEV void tq_attng_core(const float *qx, const ax_u32 *kd, const ax_u32 *vd, const float *tab,
                           const float *alibi, float *out, float *part_o, float *part_lse,
                           ax_u32 Lq, ax_u32 Lk, ax_u32 Hq, ax_u32 Hkv, ax_u32 D, ax_u64 q_sb,
@@ -538,7 +655,7 @@ AX_DEV void tq_attng_core(const float *qx, const ax_u32 *kd, const ax_u32 *vd, c
     const ax_u32 b = AX_BID_Z;
     const ax_u32 packs = Hq / G;
     const ax_u32 group = Hq / Hkv;
-    const bool prod = sd.k_mode == TQ_PROD;
+    const bool prod = (KM == TQ_FM_GENERIC) && (sd.k_mode == TQ_PROD);
     for (ax_u64 rowi = AX_BID_X; rowi < (ax_u64)Lq * packs; rowi += AX_NBLK_X) {
         const ax_u32 i = (ax_u32)(rowi / packs);
         const ax_u32 h0 = (ax_u32)(rowi % packs) * G;
@@ -580,8 +697,9 @@ AX_DEV void tq_attng_core(const float *qx, const ax_u32 *kd, const ax_u32 *vd, c
             const ax_u32 *kbase = kd + (ax_u64)b * k_sb + (ax_u64)hk * k_sh;
             const ax_u32 *vbase = vd + (ax_u64)b * v_sb + (ax_u64)hk * v_sh;
             for (long long kb = s_lo; kb < s_hi; kb += TQ_NT)
-                tq_attng_window<F8, G>(qr, qs, red, pr, kc, vc, kbase, vbase, k_ss, v_ss, 0, kb,
-                                       s_hi, D, sd, scale, softcap, slope, pos, m, l, acc0, acc1);
+                tq_attng_window<KM, VM, G>(qr, qs, red, pr, kc, vc, kbase, vbase, k_ss, v_ss, 0, kb,
+                                           s_hi, D, sd, scale, softcap, slope, pos, m, l, acc0,
+                                           acc1);
         } else {
             long long j0 = 0;
             for (ax_u32 bi = 0; bi < pg->n && j0 < s_hi; ++bi) {
@@ -594,9 +712,9 @@ AX_DEV void tq_attng_core(const float *qx, const ax_u32 *kd, const ax_u32 *vd, c
                     const ax_u32 *vbase = reinterpret_cast<const ax_u32 *>(pg->v[bi]) +
                                           bh * ((ax_u64)pg->v_cap[bi] * v_ss);
                     for (long long kb = a; kb < e; kb += TQ_NT)
-                        tq_attng_window<F8, G>(qr, qs, red, pr, kc, vc, kbase, vbase, k_ss, v_ss,
-                                               j0, kb, e, D, sd, scale, softcap, slope, pos, m, l,
-                                               acc0, acc1);
+                        tq_attng_window<KM, VM, G>(qr, qs, red, pr, kc, vc, kbase, vbase, k_ss,
+                                                   v_ss, j0, kb, e, D, sd, scale, softcap, slope,
+                                                   pos, m, l, acc0, acc1);
                 }
                 j0 = j1;
             }
@@ -618,6 +736,180 @@ AX_DEV void tq_attng_core(const float *qx, const ax_u32 *kd, const ax_u32 *vd, c
     }
 }
 
+// Cooperative-decoding tiled prefill attention over packed K/V rows (non-PROD modes).
+// Decodes each BC key/value tile once into shared memory for BR query rows.
+// Grid: (ceil(Lq / BR), Hq, B), Block: (TQ_NT, 1, 1).
+// Shared memory: ((BR + BC) * (D + 1) + BR * BC + 32) * sizeof(float).
+AX_DEV const ax_u32 *tq_paged_row(const ax_pages *pg, ax_u32 bi_start, long long j0_start,
+                                  long long j, ax_u64 bh, ax_u64 row_stride, bool is_v) {
+    ax_u32 bi = bi_start;
+    long long j0 = j0_start;
+    while (bi + 1u < pg->n && j >= j0 + (long long)pg->rows[bi]) {
+        j0 += (long long)pg->rows[bi];
+        ++bi;
+    }
+    const ax_u64 cap = is_v ? (ax_u64)pg->v_cap[bi] : (ax_u64)pg->k_cap[bi];
+    const ax_u64 ptr = is_v ? pg->v[bi] : pg->k[bi];
+    const ax_u32 *base = reinterpret_cast<const ax_u32 *>(ptr) + bh * (cap * row_stride);
+    return base + (ax_u64)(j - j0) * row_stride;
+}
+
+template <bool PAGED, int BR, int BC, int DMAX>
+AX_DEV void tq_tile_core(const float *qx, const ax_u32 *kd, const ax_u32 *vd, const float *tab,
+                         const float *alibi, float *out, ax_u32 Lq, ax_u32 Lk, ax_u32 Hq,
+                         ax_u32 Hkv, ax_u32 D, ax_u64 q_sb, ax_u64 q_sh, ax_u64 q_ss, ax_u64 k_sb,
+                         ax_u64 k_sh, ax_u64 k_ss, ax_u64 v_sb, ax_u64 v_sh, ax_u64 v_ss,
+                         const tq_sides &sd, float scale, float softcap, int wl, int wr,
+                         ax_u32 alibi_bs, const ax_pages *pg) {
+    const int TPR = TQ_NT / BR;
+    const int NACC = DMAX / TPR;
+    const ax_u32 DP = D + 1;
+    float *sm = ax_smem();
+    float *Qs = sm;            // BR * DP
+    float *KVs = Qs + BR * DP; // BC * DP
+    float *S = KVs + BC * DP;  // BR * BC
+    float *kc = S + BR * BC;   // 16
+    float *vc = kc + 16;       // 16
+    const ax_u32 t = AX_TID;
+    const ax_u32 r = t / TPR;
+    const ax_u32 lane = t % TPR;
+    const ax_u32 h = AX_BID_Y;
+    const ax_u32 b = AX_BID_Z;
+    const ax_u32 hk = h / (Hq / Hkv);
+    const ax_u64 bh = (ax_u64)b * Hkv + hk;
+    const float *qb = qx + b * q_sb + h * q_sh;
+    const ax_u32 *kbase = PAGED ? nullptr : kd + (ax_u64)b * k_sb + (ax_u64)hk * k_sh;
+    const ax_u32 *vbase = PAGED ? nullptr : vd + (ax_u64)b * v_sb + (ax_u64)hk * v_sh;
+    const long long off = (long long)Lk - (long long)Lq;
+    const float slope = alibi ? alibi[(ax_u64)b * alibi_bs + h] : 0.0f;
+
+    if (t < 16u) {
+        kc[t] = tab[t];
+        vc[t] = tab[32u + t];
+    }
+    AX_SYNC();
+
+    for (ax_u64 tile = AX_BID_X; (long long)(tile * BR) < (long long)Lq; tile += AX_NBLK_X) {
+        const long long i0 = (long long)tile * BR;
+        AX_SYNC();
+        for (ax_u32 idx = t; idx < BR * D; idx += TQ_NT) {
+            const ax_u32 rr = idx / D, d = idx % D;
+            const long long ii = i0 + rr;
+            Qs[rr * DP + d] = ii < (long long)Lq ? scale * qb[(ax_u64)ii * q_ss + d] : 0.0f;
+        }
+        const long long last = ax_min_ll(i0 + BR, (long long)Lq) - 1;
+        long long lo = wl >= 0 ? ax_max_ll(i0 + off - wl, 0) : 0;
+        long long hi = wr >= 0 ? ax_min_ll(last + off + wr + 1, (long long)Lk) : (long long)Lk;
+        if (lo > (long long)Lk) lo = Lk;
+        if (hi < lo) hi = lo;
+        const long long i = i0 + r;
+        float m = -AX_INF, l = 0.0f;
+        float acc[NACC];
+        AX_UNROLL
+        for (int a = 0; a < NACC; ++a) acc[a] = 0.0f;
+        ax_u32 bi_start = 0;
+        long long j0_start = 0;
+        for (long long kt = lo; kt < hi; kt += BC) {
+            if (PAGED) {
+                while (bi_start + 1u < pg->n && j0_start + (long long)pg->rows[bi_start] <= kt) {
+                    j0_start += (long long)pg->rows[bi_start];
+                    ++bi_start;
+                }
+            }
+            AX_SYNC();
+            for (ax_u32 idx = t; idx < BC * D; idx += TQ_NT) {
+                const ax_u32 c = idx / D, d = idx % D;
+                const long long j = kt + c;
+                float kv = 0.0f;
+                if (j < hi) {
+                    const ax_u32 *kr = PAGED
+                                           ? tq_paged_row(pg, bi_start, j0_start, j, bh, k_ss, false)
+                                           : (kbase + (ax_u64)j * k_ss);
+                    const float elem =
+                        (sd.k_mode == TQ_FP8)
+                            ? tq_fp8_elem(kr, d)
+                            : ((sd.k_mode == TQ_NVFP4)
+                                   ? tq_nvfp4_elem(kr, d, sd.k_cw)
+                                   : tq_elem(kr, d, sd.k_mode, sd.k_cb, sd.k_cw, kc));
+                    kv = ax_u2f(kr[sd.k_rsc]) * elem;
+                }
+                KVs[c * DP + d] = kv;
+            }
+            AX_SYNC();
+            for (ax_u32 idx = t; idx < BR * BC; idx += TQ_NT) {
+                const ax_u32 rr = idx / BC, c = idx % BC;
+                const long long ii = i0 + rr, j = kt + c;
+                const long long p2 = ii + off;
+                float s = -AX_INF;
+                if (ii < (long long)Lq && j < hi && (wl < 0 || j >= p2 - wl) &&
+                    (wr < 0 || j <= p2 + wr)) {
+                    const float *qr_row = Qs + rr * DP;
+                    const float *kr_row = KVs + c * DP;
+                    float dot = 0.0f;
+                    for (ax_u32 d = 0; d < D; ++d) dot += qr_row[d] * kr_row[d];
+                    s = tq_logit(dot, softcap, slope, p2 - j);
+                }
+                S[idx] = s;
+            }
+            AX_SYNC();
+            for (ax_u32 idx = t; idx < BC * D; idx += TQ_NT) {
+                const ax_u32 c = idx / D, d = idx % D;
+                const long long j = kt + c;
+                float vv = 0.0f;
+                if (j < hi) {
+                    const ax_u32 *vr = PAGED
+                                           ? tq_paged_row(pg, bi_start, j0_start, j, bh, v_ss, true)
+                                           : (vbase + (ax_u64)j * v_ss);
+                    const float elem =
+                        (sd.v_mode == TQ_FP8)
+                            ? tq_fp8_elem(vr, d)
+                            : ((sd.v_mode == TQ_NVFP4)
+                                   ? tq_nvfp4_elem(vr, d, sd.v_cw)
+                                   : tq_elem(vr, d, sd.v_mode, sd.v_cb, sd.v_cw, vc));
+                    vv = ax_u2f(vr[sd.v_rsc]) * elem;
+                }
+                KVs[c * DP + d] = vv;
+            }
+            float mt = -AX_INF;
+            for (int c = 0; c < BC; ++c) mt = fmaxf(mt, S[r * BC + c]);
+            const float m_new = fmaxf(m, mt);
+            AX_SYNC();
+            for (int c = lane; c < BC; c += TPR) {
+                const float s = S[r * BC + c];
+                S[r * BC + c] = s == -AX_INF ? 0.0f : expf(s - m_new);
+            }
+            AX_SYNC();
+            const float alpha = m == -AX_INF ? 0.0f : expf(m - m_new);
+            float lt = 0.0f;
+            for (int c = 0; c < BC; ++c) lt += S[r * BC + c];
+            l = l * alpha + lt;
+            AX_UNROLL
+            for (int a = 0; a < NACC; ++a) acc[a] *= alpha;
+            for (int c = 0; c < BC; ++c) {
+                const float p = S[r * BC + c];
+                if (p != 0.0f) {
+                    const float *vr = KVs + c * DP;
+                    AX_UNROLL
+                    for (int a = 0; a < NACC; ++a) {
+                        const ax_u32 d = lane + a * TPR;
+                        if (d < D) acc[a] += p * vr[d];
+                    }
+                }
+            }
+            m = m_new;
+        }
+        if (i < (long long)Lq) {
+            const float inv = l > 0.0f ? 1.0f / l : 0.0f;
+            const ax_u64 orow = ((ax_u64)b * Hq + h) * Lq + (ax_u64)i;
+            AX_UNROLL
+            for (int a = 0; a < NACC; ++a) {
+                const ax_u32 d = lane + a * TPR;
+                if (d < D) out[orow * D + d] = acc[a] * inv;
+            }
+        }
+    }
+}
+
 #define TQ_ATTN_PARAMS                                                                             \
     const float *qx, const ax_u32 *kd, const ax_u32 *vd, const float *tab, const float *alibi,     \
         float *out, float *part_o, float *part_lse, ax_u32 Lq, ax_u32 Lk, ax_u32 Hq, ax_u32 Hkv,   \
@@ -626,35 +918,56 @@ AX_DEV void tq_attng_core(const float *qx, const ax_u32 *kd, const ax_u32 *vd, c
         ax_u32 k_rsc, ax_u32 v_mode, ax_u32 v_cb, ax_u32 v_cw, ax_u32 v_rsc, float scale,          \
         float softcap, int wl, int wr, ax_u32 n_splits, ax_u32 alibi_bs, ax_u64 rows_total
 
-#define TQ_ATTN_CALL(F8, PAGED, PG)                                                                \
+#define TQ_ATTN_CALL_M(KM, VM, PAGED, PG)                                                          \
     {                                                                                              \
         const tq_sides sd = {k_mode, k_cb, k_cw, k_rsc, v_mode, v_cb, v_cw, v_rsc};                \
-        tq_attn_core<F8, PAGED>(qx, kd, vd, tab, alibi, out, part_o, part_lse, Lq, Lk, Hq, Hkv, D, \
-                                q_sb, q_sh, q_ss, k_sb, k_sh, k_ss, v_sb, v_sh, v_ss, sd, scale,   \
-                                softcap, wl, wr, n_splits, alibi_bs, rows_total, PG);              \
+        tq_attn_core<KM, VM, PAGED>(qx, kd, vd, tab, alibi, out, part_o, part_lse, Lq, Lk, Hq,     \
+                                    Hkv, D, q_sb, q_sh, q_ss, k_sb, k_sh, k_ss, v_sb, v_sh, v_ss,  \
+                                    sd, scale, softcap, wl, wr, n_splits, alibi_bs, rows_total,    \
+                                    PG);                                                           \
     }
 
-#define TQ_ATTNG_CALL(F8, PAGED, G, PG)                                                            \
+#define TQ_ATTNG_CALL_M(KM, VM, PAGED, G, PG)                                                      \
     {                                                                                              \
         const tq_sides sd = {k_mode, k_cb, k_cw, k_rsc, v_mode, v_cb, v_cw, v_rsc};                \
-        tq_attng_core<F8, PAGED, G>(qx, kd, vd, tab, alibi, out, part_o, part_lse, Lq, Lk, Hq, Hkv,\
-                                    D, q_sb, q_sh, q_ss, k_sb, k_sh, k_ss, v_sb, v_sh, v_ss, sd,   \
-                                    scale, softcap, wl, wr, n_splits, alibi_bs, rows_total, PG);   \
+        tq_attng_core<KM, VM, PAGED, G>(qx, kd, vd, tab, alibi, out, part_o, part_lse, Lq, Lk, Hq, \
+                                        Hkv, D, q_sb, q_sh, q_ss, k_sb, k_sh, k_ss, v_sb, v_sh,    \
+                                        v_ss, sd, scale, softcap, wl, wr, n_splits, alibi_bs,      \
+                                        rows_total, PG);                                           \
+    }
+
+#define TQ_TILE_CALL(PAGED, BR, BC, DMAX, PG)                                                      \
+    {                                                                                              \
+        const tq_sides sd = {k_mode, k_cb, k_cw, k_rsc, v_mode, v_cb, v_cw, v_rsc};                \
+        tq_tile_core<PAGED, BR, BC, DMAX>(qx, kd, vd, tab, alibi, out, Lq, Lk, Hq, Hkv, D, q_sb,   \
+                                          q_sh, q_ss, k_sb, k_sh, k_ss, v_sb, v_sh, v_ss, sd,      \
+                                          scale, softcap, wl, wr, alibi_bs, PG);                   \
     }
 
 // GQA-packed entry (G query heads per workgroup), dense (pg == nullptr) or paged.
 template <bool F8, bool PAGED, int G>
-AX_DEV void tq_attng_impl(TQ_ATTN_PARAMS, const ax_pages *pg) TQ_ATTNG_CALL(F8, PAGED, G, pg)
+AX_DEV void tq_attng_impl(TQ_ATTN_PARAMS, const ax_pages *pg)
+    TQ_ATTNG_CALL_M(F8 ? TQ_FM_FP8 : TQ_FM_GENERIC, F8 ? TQ_FM_FP8 : TQ_FM_GENERIC, PAGED, G, pg)
 
 // Generic entry (every K / V format), kept with its historical signature.
-AX_DEV void tq_attn_impl(TQ_ATTN_PARAMS) TQ_ATTN_CALL(false, false, nullptr)
+AX_DEV void tq_attn_impl(TQ_ATTN_PARAMS) TQ_ATTN_CALL_M(TQ_FM_GENERIC, TQ_FM_GENERIC, false, nullptr)
 
-// FP8 K and V rows (k_mode == v_mode == TQ_FP8).
-AX_DEV void tq_attn_fp8_impl(TQ_ATTN_PARAMS) TQ_ATTN_CALL(true, false, nullptr)
+// FP8 / NVFP4 / NVFP4+FP8 specialized entries.
+AX_DEV void tq_attn_fp8_impl(TQ_ATTN_PARAMS) TQ_ATTN_CALL_M(TQ_FM_FP8, TQ_FM_FP8, false, nullptr)
+AX_DEV void tq_attn_nvfp4_impl(TQ_ATTN_PARAMS)
+    TQ_ATTN_CALL_M(TQ_FM_NVFP4, TQ_FM_NVFP4, false, nullptr)
+AX_DEV void tq_attn_nvfp4_fp8_impl(TQ_ATTN_PARAMS)
+    TQ_ATTN_CALL_M(TQ_FM_NVFP4, TQ_FM_FP8, false, nullptr)
 
 // Paged block tables: the TQ_ATTN_PARAMS (kd / vd unused) followed by the table.
-AX_DEV void tq_attnp_impl(TQ_ATTN_PARAMS, const ax_pages &pg) TQ_ATTN_CALL(false, true, &pg)
-AX_DEV void tq_attnp_fp8_impl(TQ_ATTN_PARAMS, const ax_pages &pg) TQ_ATTN_CALL(true, true, &pg)
+AX_DEV void tq_attnp_impl(TQ_ATTN_PARAMS, const ax_pages &pg)
+    TQ_ATTN_CALL_M(TQ_FM_GENERIC, TQ_FM_GENERIC, true, &pg)
+AX_DEV void tq_attnp_fp8_impl(TQ_ATTN_PARAMS, const ax_pages &pg)
+    TQ_ATTN_CALL_M(TQ_FM_FP8, TQ_FM_FP8, true, &pg)
+AX_DEV void tq_attnp_nvfp4_impl(TQ_ATTN_PARAMS, const ax_pages &pg)
+    TQ_ATTN_CALL_M(TQ_FM_NVFP4, TQ_FM_NVFP4, true, &pg)
+AX_DEV void tq_attnp_nvfp4_fp8_impl(TQ_ATTN_PARAMS, const ax_pages &pg)
+    TQ_ATTN_CALL_M(TQ_FM_NVFP4, TQ_FM_FP8, true, &pg)
 
 // Merges the key splits of tq_attn (weights once per row, see fa_combine_impl; shared memory:
 // n_splits floats).
@@ -697,7 +1010,37 @@ AX_DEV void tq_combine_impl(const float *part_o, const float *part_lse, float *o
                        ax_u64 rows, ax_u32 D, ax_u64 src_stride, ax_u32 cb, ax_u32 row_words,      \
                        ax_u32 rsc_off) {                                                           \
         tq_resid_impl<T>(src, data, tab, resid, rows, D, src_stride, cb, row_words, rsc_off);      \
+    }                                                                                              \
+    AX_KERNEL void AX_BOUNDS(TQ_NT)                                                                \
+        tq_quant_prod_##SFX(const T *src, const float *tab, const float *s_mat, ax_u32 *out,       \
+                            ax_u64 rows, ax_u32 D, ax_u64 src_stride, ax_u32 cb,                   \
+                            ax_u32 code_words, ax_u32 row_words) {                                 \
+        tq_quant_prod_fused_impl<T>(src, tab, s_mat, out, rows, D, src_stride, cb, code_words,     \
+                                    row_words);                                                    \
+    }                                                                                              \
+    AX_KERNEL void AX_BOUNDS(TQ_NT)                                                                \
+        tq_fwht_##SFX(const T *src, float *dst, const ax_u32 *sign_bits, ax_u64 rows, ax_u32 D,    \
+                      ax_u64 src_stride, float inv_sqrt_d, ax_u32 forward) {                       \
+        tq_fwht_impl<T>(src, dst, sign_bits, rows, D, src_stride, inv_sqrt_d, forward);            \
     }
+
+#define TQ_ATTN_GROUP_SET(SFX, KM, VM)                                                             \
+    AX_KERNEL void AX_BOUNDS(TQ_NT) tq_attn##SFX(TQ_ATTN_PARAMS)                                   \
+        TQ_ATTN_CALL_M(KM, VM, false, nullptr)                                                     \
+    AX_KERNEL void AX_BOUNDS(TQ_NT) tq_attnp##SFX(TQ_ATTN_PARAMS, const ax_pages pg)               \
+        TQ_ATTN_CALL_M(KM, VM, true, &pg)                                                          \
+    AX_KERNEL void AX_BOUNDS(TQ_NT) tq_attng2##SFX(TQ_ATTN_PARAMS)                                 \
+        TQ_ATTNG_CALL_M(KM, VM, false, 2, nullptr)                                                 \
+    AX_KERNEL void AX_BOUNDS(TQ_NT) tq_attnpg2##SFX(TQ_ATTN_PARAMS, const ax_pages pg)             \
+        TQ_ATTNG_CALL_M(KM, VM, true, 2, &pg)                                                      \
+    AX_KERNEL void AX_BOUNDS(TQ_NT) tq_attng4##SFX(TQ_ATTN_PARAMS)                                 \
+        TQ_ATTNG_CALL_M(KM, VM, false, 4, nullptr)                                                 \
+    AX_KERNEL void AX_BOUNDS(TQ_NT) tq_attnpg4##SFX(TQ_ATTN_PARAMS, const ax_pages pg)             \
+        TQ_ATTNG_CALL_M(KM, VM, true, 4, &pg)                                                      \
+    AX_KERNEL void AX_BOUNDS(TQ_NT) tq_attng8##SFX(TQ_ATTN_PARAMS)                                 \
+        TQ_ATTNG_CALL_M(KM, VM, false, 8, nullptr)                                                 \
+    AX_KERNEL void AX_BOUNDS(TQ_NT) tq_attnpg8##SFX(TQ_ATTN_PARAMS, const ax_pages pg)             \
+        TQ_ATTNG_CALL_M(KM, VM, true, 8, &pg)
 
 #define TQ_COMMON_KERNELS                                                                          \
     AX_KERNEL void AX_BOUNDS(TQ_NT)                                                                \
@@ -711,36 +1054,34 @@ AX_DEV void tq_combine_impl(const float *part_o, const float *part_lse, float *o
                    ax_u32 rsc_off) {                                                               \
         tq_dequant_impl(data, tab, out, zs, rows, D, mode, cb, code_words, row_words, rsc_off);    \
     }                                                                                              \
-    AX_KERNEL void AX_BOUNDS(TQ_NT) tq_attn(TQ_ATTN_PARAMS) TQ_ATTN_CALL(false, false, nullptr)     \
-    AX_KERNEL void AX_BOUNDS(TQ_NT) tq_attn_fp8(TQ_ATTN_PARAMS) TQ_ATTN_CALL(true, false, nullptr)  \
-    AX_KERNEL void AX_BOUNDS(TQ_NT) tq_attnp(TQ_ATTN_PARAMS, const ax_pages pg)                    \
-        TQ_ATTN_CALL(false, true, &pg)                                                             \
-    AX_KERNEL void AX_BOUNDS(TQ_NT) tq_attnp_fp8(TQ_ATTN_PARAMS, const ax_pages pg)                \
-        TQ_ATTN_CALL(true, true, &pg)                                                              \
-    AX_KERNEL void AX_BOUNDS(TQ_NT) tq_attng2(TQ_ATTN_PARAMS)                                      \
-        TQ_ATTNG_CALL(false, false, 2, nullptr)                                                    \
-    AX_KERNEL void AX_BOUNDS(TQ_NT) tq_attng2_fp8(TQ_ATTN_PARAMS)                                  \
-        TQ_ATTNG_CALL(true, false, 2, nullptr)                                                     \
-    AX_KERNEL void AX_BOUNDS(TQ_NT) tq_attnpg2(TQ_ATTN_PARAMS, const ax_pages pg)                  \
-        TQ_ATTNG_CALL(false, true, 2, &pg)                                                         \
-    AX_KERNEL void AX_BOUNDS(TQ_NT) tq_attnpg2_fp8(TQ_ATTN_PARAMS, const ax_pages pg)              \
-        TQ_ATTNG_CALL(true, true, 2, &pg)                                                          \
-    AX_KERNEL void AX_BOUNDS(TQ_NT) tq_attng4(TQ_ATTN_PARAMS)                                      \
-        TQ_ATTNG_CALL(false, false, 4, nullptr)                                                    \
-    AX_KERNEL void AX_BOUNDS(TQ_NT) tq_attng4_fp8(TQ_ATTN_PARAMS)                                  \
-        TQ_ATTNG_CALL(true, false, 4, nullptr)                                                     \
-    AX_KERNEL void AX_BOUNDS(TQ_NT) tq_attnpg4(TQ_ATTN_PARAMS, const ax_pages pg)                  \
-        TQ_ATTNG_CALL(false, true, 4, &pg)                                                         \
-    AX_KERNEL void AX_BOUNDS(TQ_NT) tq_attnpg4_fp8(TQ_ATTN_PARAMS, const ax_pages pg)              \
-        TQ_ATTNG_CALL(true, true, 4, &pg)                                                          \
-    AX_KERNEL void AX_BOUNDS(TQ_NT) tq_attng8(TQ_ATTN_PARAMS)                                      \
-        TQ_ATTNG_CALL(false, false, 8, nullptr)                                                    \
-    AX_KERNEL void AX_BOUNDS(TQ_NT) tq_attng8_fp8(TQ_ATTN_PARAMS)                                  \
-        TQ_ATTNG_CALL(true, false, 8, nullptr)                                                     \
-    AX_KERNEL void AX_BOUNDS(TQ_NT) tq_attnpg8(TQ_ATTN_PARAMS, const ax_pages pg)                  \
-        TQ_ATTNG_CALL(false, true, 8, &pg)                                                         \
-    AX_KERNEL void AX_BOUNDS(TQ_NT) tq_attnpg8_fp8(TQ_ATTN_PARAMS, const ax_pages pg)              \
-        TQ_ATTNG_CALL(true, true, 8, &pg)                                                          \
+    TQ_ATTN_GROUP_SET(, TQ_FM_GENERIC, TQ_FM_GENERIC)                                              \
+    TQ_ATTN_GROUP_SET(_fp8, TQ_FM_FP8, TQ_FM_FP8)                                                  \
+    TQ_ATTN_GROUP_SET(_nvfp4, TQ_FM_NVFP4, TQ_FM_NVFP4)                                            \
+    TQ_ATTN_GROUP_SET(_nvfp4_fp8, TQ_FM_NVFP4, TQ_FM_FP8)                                          \
+    AX_KERNEL void AX_BOUNDS(TQ_NT) tq_tile2_d64(TQ_ATTN_PARAMS)                                   \
+        TQ_TILE_CALL(false, 32, 32, 64, nullptr)                                                   \
+    AX_KERNEL void AX_BOUNDS(TQ_NT) tq_tile2_d128(TQ_ATTN_PARAMS)                                  \
+        TQ_TILE_CALL(false, 16, 32, 128, nullptr)                                                  \
+    AX_KERNEL void AX_BOUNDS(TQ_NT) tq_tile2_d256(TQ_ATTN_PARAMS)                                  \
+        TQ_TILE_CALL(false, 8, 16, 256, nullptr)                                                   \
+    AX_KERNEL void AX_BOUNDS(TQ_NT) tq_tile3_d64(TQ_ATTN_PARAMS)                                   \
+        TQ_TILE_CALL(false, 64, 64, 64, nullptr)                                                   \
+    AX_KERNEL void AX_BOUNDS(TQ_NT) tq_tile3_d128(TQ_ATTN_PARAMS)                                  \
+        TQ_TILE_CALL(false, 32, 64, 128, nullptr)                                                  \
+    AX_KERNEL void AX_BOUNDS(TQ_NT) tq_tile3_d256(TQ_ATTN_PARAMS)                                  \
+        TQ_TILE_CALL(false, 16, 32, 256, nullptr)                                                  \
+    AX_KERNEL void AX_BOUNDS(TQ_NT) tq_tilep2_d64(TQ_ATTN_PARAMS, const ax_pages pg)               \
+        TQ_TILE_CALL(true, 32, 32, 64, &pg)                                                        \
+    AX_KERNEL void AX_BOUNDS(TQ_NT) tq_tilep2_d128(TQ_ATTN_PARAMS, const ax_pages pg)              \
+        TQ_TILE_CALL(true, 16, 32, 128, &pg)                                                       \
+    AX_KERNEL void AX_BOUNDS(TQ_NT) tq_tilep2_d256(TQ_ATTN_PARAMS, const ax_pages pg)              \
+        TQ_TILE_CALL(true, 8, 16, 256, &pg)                                                        \
+    AX_KERNEL void AX_BOUNDS(TQ_NT) tq_tilep3_d64(TQ_ATTN_PARAMS, const ax_pages pg)               \
+        TQ_TILE_CALL(true, 64, 64, 64, &pg)                                                        \
+    AX_KERNEL void AX_BOUNDS(TQ_NT) tq_tilep3_d128(TQ_ATTN_PARAMS, const ax_pages pg)              \
+        TQ_TILE_CALL(true, 32, 64, 128, &pg)                                                       \
+    AX_KERNEL void AX_BOUNDS(TQ_NT) tq_tilep3_d256(TQ_ATTN_PARAMS, const ax_pages pg)              \
+        TQ_TILE_CALL(true, 16, 32, 256, &pg)                                                       \
     AX_KERNEL void AX_BOUNDS(TQ_NT) tq_combine(const float *part_o, const float *part_lse,         \
                                                float *o, ax_u64 rows, ax_u32 D, ax_u32 n_splits) { \
         tq_combine_impl(part_o, part_lse, o, rows, D, n_splits);                                   \

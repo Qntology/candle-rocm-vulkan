@@ -27,6 +27,7 @@ pub mod func;
 pub mod group_norm;
 pub mod init;
 pub mod kv_cache;
+pub mod kv_offload;
 pub mod layer_norm;
 pub mod linear;
 pub mod loss;

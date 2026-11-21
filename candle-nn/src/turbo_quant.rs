@@ -27,7 +27,10 @@ pub use crate::flash_attn::KvBlockRef;
 use crate::kv_cache::Cache;
 use candle::accel::attention as att;
 use candle::accel::formats::{row_layout, RowLayout};
-use candle::accel::turbo::{qjl_matrix, rotation_matrix, RowCodec, TqAttnArgs, TqRowArgs, TqSide};
+use candle::accel::turbo::{
+    fwht_f32_inplace, hadamard_sign_bits, qjl_matrix, rotation_matrix, RowCodec, TqAttnArgs,
+    TqRowArgs, TqSide,
+};
 use candle::accel::{self, RotationKind, TurboQuantOptions};
 use candle::backend::BackendStorage;
 use candle::{bail, CpuStorage, DType, Device, Layout, Result, Shape, Tensor};
@@ -62,6 +65,9 @@ pub struct TurboQuantizer {
     codec: Arc<RowCodec>,
     /// `Π` and `Πᵀ` (`dim x dim`), `None` without rotation.
     rot: Option<(Tensor, Tensor)>,
+    /// Packed sign bits (`ceil(dim / 32)` u32 words) for O(d log d) FWHT when
+    /// `rotation == Hadamard && dim.is_power_of_two() && dim <= 256`.
+    hadamard_signs: Option<(Tensor, Arc<Vec<u32>>)>,
     /// `S` and `Sᵀ` of the QJL stage (prod only).
     qjl: Option<(Tensor, Tensor)>,
     /// Codebook table (32 f32).
@@ -108,6 +114,16 @@ impl TurboQuantizer {
             let mt = m.t()?.contiguous()?;
             Some((m, mt))
         };
+        let hadamard_signs = if rotation == RotationKind::Hadamard
+            && dim.is_power_of_two()
+            && dim <= 256
+        {
+            let bits = hadamard_sign_bits(dim, seed)?;
+            let t = Tensor::from_vec(bits.clone(), bits.len(), device)?;
+            Some((t, Arc::new(bits)))
+        } else {
+            None
+        };
         let qjl = match &codec.qjl {
             Some(_) => {
                 let s = Tensor::from_vec(qjl_matrix(dim, seed), (dim, dim), device)?;
@@ -129,6 +145,7 @@ impl TurboQuantizer {
             layout,
             codec,
             rot,
+            hadamard_signs,
             qjl,
             tab,
             pair_tab: Arc::new(Mutex::new(None)),
@@ -178,8 +195,49 @@ impl TurboQuantizer {
         !self.device.is_cpu() && accel::config().turbo_quant_kernels_allowed(&self.device)
     }
 
-    /// `x Πᵀ` in f32 (rows of the rotated domain).
+    fn fwht_transform(&self, x: &Tensor, forward: bool) -> Result<Option<Tensor>> {
+        let Some((signs_t, signs_cpu)) = &self.hadamard_signs else {
+            return Ok(None);
+        };
+        let shape = x.shape().clone();
+        let d = self.dim;
+        let rows = x.elem_count() / d.max(1);
+        if rows == 0 {
+            return Ok(Some(Tensor::zeros(shape, DType::F32, x.device())?));
+        }
+        if x.device().is_cpu() {
+            let mut v = x
+                .to_dtype(DType::F32)?
+                .contiguous()?
+                .flatten_all()?
+                .to_vec1::<f32>()?;
+            let sb = signs_cpu.as_slice();
+            v.par_chunks_mut(d)
+                .for_each(|row| fwht_f32_inplace(row, sb, forward));
+            return Ok(Some(Tensor::from_vec(v, shape, x.device())?));
+        }
+        #[cfg(any(feature = "cuda", feature = "rocm"))]
+        if self.kernels() && matches!(x.device(), Device::Cuda(_) | Device::Rocm(_)) {
+            let x2 = x.contiguous()?.reshape((rows, d))?;
+            let out = x2.apply_op2_no_bwd(
+                signs_t,
+                &TqFwht {
+                    rows,
+                    dim: d,
+                    forward,
+                },
+            )?;
+            return Ok(Some(out.reshape(shape)?));
+        }
+        let _ = signs_t;
+        Ok(None)
+    }
+
+    /// `x Πᵀ` in f32 (rows of the rotated domain). Uses O(d log d) FWHT when `Hadamard`.
     fn rotate(&self, x: &Tensor) -> Result<Tensor> {
+        if let Some(y) = self.fwht_transform(x, true)? {
+            return Ok(y);
+        }
         let x = x.to_dtype(DType::F32)?;
         match &self.rot {
             Some((_, mt)) => x.broadcast_matmul(mt),
@@ -187,8 +245,11 @@ impl TurboQuantizer {
         }
     }
 
-    /// `y Π`: back from the rotated domain.
+    /// `y Π`: back from the rotated domain. Uses O(d log d) FWHT when `Hadamard`.
     fn unrotate(&self, y: &Tensor) -> Result<Tensor> {
+        if let Some(z) = self.fwht_transform(y, false)? {
+            return Ok(z);
+        }
         match &self.rot {
             Some((m, _)) => y.broadcast_matmul(m),
             None => Ok(y.clone()),
@@ -213,6 +274,16 @@ impl TurboQuantizer {
 
     fn quantize_gpu(&self, y: &Tensor, rows: usize) -> Result<Tensor> {
         let args = TqRowArgs::new(self.format, rows, self.dim)?;
+        #[cfg(any(feature = "cuda", feature = "rocm"))]
+        if let Some((s_mat, _)) = &self.qjl {
+            if matches!(y.device(), Device::Cuda(_) | Device::Rocm(_)) && self.dim <= 256 {
+                return y.apply_op3_no_bwd(
+                    &self.tab,
+                    s_mat,
+                    &TqQuantProdFused { args },
+                );
+            }
+        }
         let packed = y.apply_op1_no_bwd(&TqQuant {
             format: self.format,
             args,
@@ -341,6 +412,118 @@ fn contiguous_offset(l: &Layout, what: &str) -> Result<usize> {
     match l.contiguous_offsets() {
         Some((o, _)) => Ok(o),
         None => bail!("turbo-quant: {what} must be contiguous"),
+    }
+}
+
+/// On-chip `O(d log d)` FWHT rotation/unrotation op on CUDA/ROCm.
+#[cfg(any(feature = "cuda", feature = "rocm"))]
+struct TqFwht {
+    rows: usize,
+    dim: usize,
+    forward: bool,
+}
+
+#[cfg(any(feature = "cuda", feature = "rocm"))]
+impl candle::CustomOp2 for TqFwht {
+    fn name(&self) -> &'static str {
+        "turbo-quant-fwht"
+    }
+
+    fn cpu_fwd(
+        &self,
+        _: &CpuStorage,
+        _: &Layout,
+        _: &CpuStorage,
+        _: &Layout,
+    ) -> Result<(CpuStorage, Shape)> {
+        bail!("turbo-quant-fwht: CPU path handled directly in fwht_transform")
+    }
+
+    #[cfg(feature = "cuda")]
+    fn cuda_fwd(
+        &self,
+        x: &candle::CudaStorage,
+        xl: &Layout,
+        signs: &candle::CudaStorage,
+        sl: &Layout,
+    ) -> Result<(candle::CudaStorage, Shape)> {
+        let xo = contiguous_offset(xl, "fwht input")?;
+        let so = contiguous_offset(sl, "fwht signs")?;
+        let out = x.tq_fwht(xo, signs, so, self.rows, self.dim, self.forward)?;
+        Ok((out, Shape::from((self.rows, self.dim))))
+    }
+
+    #[cfg(feature = "rocm")]
+    fn rocm_fwd(
+        &self,
+        x: &candle::RocmStorage,
+        xl: &Layout,
+        signs: &candle::RocmStorage,
+        sl: &Layout,
+    ) -> Result<(candle::RocmStorage, Shape)> {
+        let xo = contiguous_offset(xl, "fwht input")?;
+        let so = contiguous_offset(sl, "fwht signs")?;
+        let out = x.tq_fwht(xo, signs, so, self.rows, self.dim, self.forward)?;
+        Ok((out, Shape::from((self.rows, self.dim))))
+    }
+}
+
+/// Single-pass TurboProd quantization op on CUDA/ROCm (codes + residual + QJL signs in 1 launch).
+#[cfg(any(feature = "cuda", feature = "rocm"))]
+struct TqQuantProdFused {
+    args: TqRowArgs,
+}
+
+#[cfg(any(feature = "cuda", feature = "rocm"))]
+impl candle::CustomOp3 for TqQuantProdFused {
+    fn name(&self) -> &'static str {
+        "turbo-quant-prod-fused"
+    }
+
+    fn cpu_fwd(
+        &self,
+        _: &CpuStorage,
+        _: &Layout,
+        _: &CpuStorage,
+        _: &Layout,
+        _: &CpuStorage,
+        _: &Layout,
+    ) -> Result<(CpuStorage, Shape)> {
+        bail!("turbo-quant-prod-fused: GPU-only op")
+    }
+
+    #[cfg(feature = "cuda")]
+    fn cuda_fwd(
+        &self,
+        y: &candle::CudaStorage,
+        yl: &Layout,
+        tab: &candle::CudaStorage,
+        tl: &Layout,
+        s_mat: &candle::CudaStorage,
+        sl: &Layout,
+    ) -> Result<(candle::CudaStorage, Shape)> {
+        let yo = contiguous_offset(yl, "prod input")?;
+        let to = contiguous_offset(tl, "prod tab")?;
+        let so = contiguous_offset(sl, "prod s_mat")?;
+        let out = y.tq_quantize_prod_fused(yo, tab, to, s_mat, so, &self.args)?;
+        Ok((out, Shape::from((self.args.rows, self.args.row_words))))
+    }
+
+    #[cfg(feature = "rocm")]
+    fn rocm_fwd(
+        &self,
+        y: &candle::RocmStorage,
+        yl: &Layout,
+        tab: &candle::RocmStorage,
+        tl: &Layout,
+        s_mat: &candle::RocmStorage,
+        sl: &Layout,
+    ) -> Result<(candle::RocmStorage, Shape)> {
+        let yo = contiguous_offset(yl, "prod input")?;
+        let to = contiguous_offset(tl, "prod tab")?;
+        let so = contiguous_offset(sl, "prod s_mat")?;
+        let out = y.tq_quantize_prod_fused(yo, tab, to, s_mat, so, &self.args)?;
+        Ok((out, Shape::from((self.args.rows, self.args.row_words))))
     }
 }
 
@@ -1219,6 +1402,380 @@ fn tq_prepare(
     }))
 }
 
+/// Zero-dequant fused CPU attention directly over packed `u32` K/V rows.
+/// Uses fast 16-entry FP4 LUT + 256-entry E4M3 LUT and rayon-parallel online softmax without
+/// materializing `[B, Hkv, S, D]` dequantized K/V buffers.
+fn cpu_attention_packed_fused(
+    q: &Tensor,
+    kd: &Tensor,
+    vd: &Tensor,
+    lk: usize,
+    kq: &TurboQuantizer,
+    vq: &TurboQuantizer,
+    cfg: &FlashAttnConfig,
+) -> Result<Option<Tensor>> {
+    use candle::accel::formats::{e4m3_to_f32, e8m0_to_f32, fp4_to_f32, mode};
+    use std::sync::OnceLock;
+
+    let (b, hq, lq, d) = q.dims4()?;
+    let (bk, hkv, cap, kw) = kd.dims4()?;
+    let vw = vd.dim(3)?;
+    if bk != b || vd.dim(2)? != cap || lk > cap || lk == 0 || hkv == 0 || hq % hkv != 0 {
+        return Ok(None);
+    }
+
+    static FP4_LUT: [f32; 16] = [
+        0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0, -0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0,
+    ];
+    static E4M3_LUT: OnceLock<[f32; 256]> = OnceLock::new();
+    let e4m3_lut = E4M3_LUT.get_or_init(|| {
+        let mut t = [0.0f32; 256];
+        for (i, slot) in t.iter_mut().enumerate() {
+            *slot = e4m3_to_f32(i as u8);
+        }
+        t
+    });
+    let _ = fp4_to_f32;
+
+    let qr = kq.rotate(q)?;
+    let q_sk = match &kq.qjl {
+        Some((_, st)) => Some(qr.broadcast_matmul(st)?.contiguous()?.flatten_all()?.to_vec1::<f32>()?),
+        None => None,
+    };
+    let qr_v = qr.contiguous()?.flatten_all()?.to_vec1::<f32>()?;
+    let kd_c = kd.contiguous()?;
+    let vd_c = vd.contiguous()?;
+    let (kg, kl) = kd_c.storage_and_layout();
+    let (vg, vl) = vd_c.storage_and_layout();
+    let (CpuStorage::U32(k_all), CpuStorage::U32(v_all)) = (
+        match &*kg {
+            candle::Storage::Cpu(c) => c,
+            _ => return Ok(None),
+        },
+        match &*vg {
+            candle::Storage::Cpu(c) => c,
+            _ => return Ok(None),
+        },
+    ) else {
+        return Ok(None);
+    };
+    let k_words = &k_all[kl.start_offset()..];
+    let v_words = &v_all[vl.start_offset()..];
+
+    let alibi_v = match &cfg.alibi_slopes {
+        Some(t) => Some((
+            t.to_device(&Device::Cpu)?.to_dtype(DType::F32)?.flatten_all()?.to_vec1::<f32>()?,
+            att::alibi_batch_stride(t.shape(), b, hq)?,
+        )),
+        None => None,
+    };
+
+    let k_side = TqSide::new(kq.format(), d)?;
+    let v_side = TqSide::new(vq.format(), d)?;
+    let k_codec = &kq.codec;
+    let v_codec = &vq.codec;
+    let group = hq / hkv;
+    let wl = cfg.window_size_left.map(|v| v.min(i32::MAX as usize) as i32).unwrap_or(-1);
+    let wr = cfg.window_size_right.map(|v| v.min(i32::MAX as usize) as i32).unwrap_or(-1);
+    let scale = cfg.softmax_scale;
+    let softcap = cfg.softcap.unwrap_or(0.0);
+    const QJL_FACTOR: f32 = 1.2533141;
+
+    #[cfg(target_arch = "x86_64")]
+    #[target_feature(enable = "avx2,fma")]
+    unsafe fn dot16_fp4_avx2(q_blk8: *const u8, bsc: f32, qr: *const f32) -> f32 {
+        use std::arch::x86_64::*;
+        let lut = _mm_setr_epi8(0, 1, 2, 3, 4, 6, 8, 12, 0, -1, -2, -3, -4, -6, -8, -12);
+        let raw = _mm_loadl_epi64(q_blk8 as *const __m128i);
+        let mask = _mm_set1_epi8(0x0f);
+        let lo = _mm_and_si128(raw, mask);
+        let hi = _mm_and_si128(_mm_srli_epi16(raw, 4), mask);
+        let codes16 = _mm_unpacklo_epi8(lo, hi);
+        let vals_x2 = _mm_shuffle_epi8(lut, codes16);
+        let v0 = _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(vals_x2));
+        let v1 = _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(_mm_srli_si128(vals_x2, 8)));
+        let q0 = _mm256_loadu_ps(qr);
+        let q1 = _mm256_loadu_ps(qr.add(8));
+        let prod = _mm256_fmadd_ps(v0, q0, _mm256_mul_ps(v1, q1));
+        let lo128 = _mm256_castps256_ps128(prod);
+        let hi128 = _mm256_extractf128_ps(prod, 1);
+        let s4 = _mm_add_ps(lo128, hi128);
+        let s2 = _mm_add_ps(s4, _mm_movehl_ps(s4, s4));
+        let s1 = _mm_add_ss(s2, _mm_shuffle_ps(s2, s2, 1));
+        _mm_cvtss_f32(s1) * (bsc * 0.5)
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[target_feature(enable = "avx2,fma")]
+    unsafe fn fmadd16_fp4_avx2(v_blk8: *const u8, pb: f32, acc: *mut f32) {
+        use std::arch::x86_64::*;
+        let lut = _mm_setr_epi8(0, 1, 2, 3, 4, 6, 8, 12, 0, -1, -2, -3, -4, -6, -8, -12);
+        let raw = _mm_loadl_epi64(v_blk8 as *const __m128i);
+        let mask = _mm_set1_epi8(0x0f);
+        let lo = _mm_and_si128(raw, mask);
+        let hi = _mm_and_si128(_mm_srli_epi16(raw, 4), mask);
+        let codes16 = _mm_unpacklo_epi8(lo, hi);
+        let vals_x2 = _mm_shuffle_epi8(lut, codes16);
+        let v0 = _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(vals_x2));
+        let v1 = _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(_mm_srli_si128(vals_x2, 8)));
+        let wv = _mm256_set1_ps(pb * 0.5);
+        let a0 = _mm256_fmadd_ps(v0, wv, _mm256_loadu_ps(acc));
+        let a1 = _mm256_fmadd_ps(v1, wv, _mm256_loadu_ps(acc.add(8)));
+        _mm256_storeu_ps(acc, a0);
+        _mm256_storeu_ps(acc.add(8), a1);
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    let has_avx2_fma = std::is_x86_feature_detected!("avx2")
+        && std::is_x86_feature_detected!("fma")
+        && cfg!(target_endian = "little");
+
+    let decode_key_dot = |kr: &[u32], qrow: &[f32]| -> f32 {
+        match k_side.mode {
+            mode::NVFP4 => {
+                let mut dot = 0.0f32;
+                let aux = &kr[k_side.code_words..];
+                #[cfg(target_arch = "x86_64")]
+                if has_avx2_fma {
+                    for bk in 0..(d / 16) {
+                        let sbyte = ((aux[bk >> 2] >> ((bk & 3) * 8)) & 0xff) as usize;
+                        let bs = e4m3_lut[sbyte];
+                        unsafe {
+                            let p = kr.as_ptr().add(bk * 2) as *const u8;
+                            dot += dot16_fp4_avx2(p, bs, qrow.as_ptr().add(bk * 16));
+                        }
+                    }
+                    return dot;
+                }
+                for bk in 0..(d / 16) {
+                    let sbyte = ((aux[bk >> 2] >> ((bk & 3) * 8)) & 0xff) as usize;
+                    let bs = e4m3_lut[sbyte];
+                    let w0 = kr[bk * 2];
+                    let w1 = kr[bk * 2 + 1];
+                    let d0 = bk * 16;
+                    let mut sub = 0.0f32;
+                    for e in 0..8 {
+                        sub = FP4_LUT[((w0 >> (e * 4)) & 0xf) as usize].mul_add(qrow[d0 + e], sub);
+                    }
+                    for e in 0..8 {
+                        sub = FP4_LUT[((w1 >> (e * 4)) & 0xf) as usize]
+                            .mul_add(qrow[d0 + 8 + e], sub);
+                    }
+                    dot = sub.mul_add(bs, dot);
+                }
+                dot
+            }
+            mode::MXFP4 => {
+                let mut dot = 0.0f32;
+                let aux = &kr[k_side.code_words..];
+                #[cfg(target_arch = "x86_64")]
+                if has_avx2_fma {
+                    for bk in 0..(d / 32) {
+                        let sbyte = ((aux[bk >> 2] >> ((bk & 3) * 8)) & 0xff) as u8;
+                        let bs = e8m0_to_f32(sbyte);
+                        unsafe {
+                            let p0 = kr.as_ptr().add(bk * 4) as *const u8;
+                            let p1 = kr.as_ptr().add(bk * 4 + 2) as *const u8;
+                            dot += dot16_fp4_avx2(p0, bs, qrow.as_ptr().add(bk * 32));
+                            dot += dot16_fp4_avx2(p1, bs, qrow.as_ptr().add(bk * 32 + 16));
+                        }
+                    }
+                    return dot;
+                }
+                for bk in 0..(d / 32) {
+                    let sbyte = ((aux[bk >> 2] >> ((bk & 3) * 8)) & 0xff) as u8;
+                    let bs = e8m0_to_f32(sbyte);
+                    let d0 = bk * 32;
+                    let mut sub = 0.0f32;
+                    for wi in 0..4 {
+                        let w = kr[bk * 4 + wi];
+                        for e in 0..8 {
+                            sub = FP4_LUT[((w >> (e * 4)) & 0xf) as usize]
+                                .mul_add(qrow[d0 + wi * 8 + e], sub);
+                        }
+                    }
+                    dot = sub.mul_add(bs, dot);
+                }
+                dot
+            }
+            mode::FP8 => {
+                let mut dot = 0.0f32;
+                for wi in 0..(d / 4) {
+                    let w = kr[wi];
+                    let d0 = wi * 4;
+                    dot = e4m3_lut[(w & 0xff) as usize].mul_add(qrow[d0], dot);
+                    dot = e4m3_lut[((w >> 8) & 0xff) as usize].mul_add(qrow[d0 + 1], dot);
+                    dot = e4m3_lut[((w >> 16) & 0xff) as usize].mul_add(qrow[d0 + 2], dot);
+                    dot = e4m3_lut[((w >> 24) & 0xff) as usize].mul_add(qrow[d0 + 3], dot);
+                }
+                dot
+            }
+            _ => {
+                let mut dot = 0.0f32;
+                for j in 0..d {
+                    dot = k_codec.elem(kr, j).mul_add(qrow[j], dot);
+                }
+                dot
+            }
+        }
+    };
+
+    let accum_val = |vr: &[u32], p: f32, acc: &mut [f32]| {
+        match v_side.mode {
+            mode::NVFP4 => {
+                let aux = &vr[v_side.code_words..];
+                #[cfg(target_arch = "x86_64")]
+                if has_avx2_fma {
+                    for bk in 0..(d / 16) {
+                        let sbyte = ((aux[bk >> 2] >> ((bk & 3) * 8)) & 0xff) as usize;
+                        let pb = p * e4m3_lut[sbyte];
+                        unsafe {
+                            let vp = vr.as_ptr().add(bk * 2) as *const u8;
+                            fmadd16_fp4_avx2(vp, pb, acc.as_mut_ptr().add(bk * 16));
+                        }
+                    }
+                    return;
+                }
+                for bk in 0..(d / 16) {
+                    let sbyte = ((aux[bk >> 2] >> ((bk & 3) * 8)) & 0xff) as usize;
+                    let pb = p * e4m3_lut[sbyte];
+                    let w0 = vr[bk * 2];
+                    let w1 = vr[bk * 2 + 1];
+                    let d0 = bk * 16;
+                    for e in 0..8 {
+                        acc[d0 + e] = FP4_LUT[((w0 >> (e * 4)) & 0xf) as usize].mul_add(pb, acc[d0 + e]);
+                    }
+                    for e in 0..8 {
+                        acc[d0 + 8 + e] =
+                            FP4_LUT[((w1 >> (e * 4)) & 0xf) as usize].mul_add(pb, acc[d0 + 8 + e]);
+                    }
+                }
+            }
+            mode::MXFP4 => {
+                let aux = &vr[v_side.code_words..];
+                #[cfg(target_arch = "x86_64")]
+                if has_avx2_fma {
+                    for bk in 0..(d / 32) {
+                        let sbyte = ((aux[bk >> 2] >> ((bk & 3) * 8)) & 0xff) as u8;
+                        let pb = p * e8m0_to_f32(sbyte);
+                        unsafe {
+                            let vp0 = vr.as_ptr().add(bk * 4) as *const u8;
+                            let vp1 = vr.as_ptr().add(bk * 4 + 2) as *const u8;
+                            fmadd16_fp4_avx2(vp0, pb, acc.as_mut_ptr().add(bk * 32));
+                            fmadd16_fp4_avx2(vp1, pb, acc.as_mut_ptr().add(bk * 32 + 16));
+                        }
+                    }
+                    return;
+                }
+                for bk in 0..(d / 32) {
+                    let sbyte = ((aux[bk >> 2] >> ((bk & 3) * 8)) & 0xff) as u8;
+                    let pb = p * e8m0_to_f32(sbyte);
+                    let d0 = bk * 32;
+                    for wi in 0..4 {
+                        let w = vr[bk * 4 + wi];
+                        for e in 0..8 {
+                            acc[d0 + wi * 8 + e] = FP4_LUT[((w >> (e * 4)) & 0xf) as usize]
+                                .mul_add(pb, acc[d0 + wi * 8 + e]);
+                        }
+                    }
+                }
+            }
+            mode::FP8 => {
+                for wi in 0..(d / 4) {
+                    let w = vr[wi];
+                    let d0 = wi * 4;
+                    acc[d0] = e4m3_lut[(w & 0xff) as usize].mul_add(p, acc[d0]);
+                    acc[d0 + 1] = e4m3_lut[((w >> 8) & 0xff) as usize].mul_add(p, acc[d0 + 1]);
+                    acc[d0 + 2] = e4m3_lut[((w >> 16) & 0xff) as usize].mul_add(p, acc[d0 + 2]);
+                    acc[d0 + 3] = e4m3_lut[((w >> 24) & 0xff) as usize].mul_add(p, acc[d0 + 3]);
+                }
+            }
+            _ => {
+                for j in 0..d {
+                    acc[j] = v_codec.elem(vr, j).mul_add(p, acc[j]);
+                }
+            }
+        }
+    };
+
+    let total_rows = b * hq * lq;
+    let mut out = vec![0.0f32; total_rows * d];
+    out.par_chunks_mut(d).enumerate().for_each(|(row_idx, out_row)| {
+        let bh = row_idx / lq;
+        let qi = row_idx % lq;
+        let bi = bh / hq;
+        let h = bh % hq;
+        let hk = h / group;
+        let qrow = &qr_v[row_idx * d..(row_idx + 1) * d];
+        let qsk = q_sk.as_ref().map(|v| &v[row_idx * d..(row_idx + 1) * d]);
+        let slope = alibi_v
+            .as_ref()
+            .map(|(a, bs)| a[bi * bs + h])
+            .unwrap_or(0.0);
+
+        let pos = qi as i32 + lk as i32 - lq as i32;
+        let mut lo = if wl >= 0 { (pos - wl).max(0) } else { 0 };
+        let mut hi = if wr >= 0 { (pos + wr + 1).min(lk as i32) } else { lk as i32 };
+        if lo > lk as i32 {
+            lo = lk as i32;
+        }
+        if hi < lo {
+            hi = lo;
+        }
+        let k_head = (bi * hkv + hk) * cap * kw;
+        let v_head = (bi * hkv + hk) * cap * vw;
+        let mut m = f32::NEG_INFINITY;
+        let mut lsum = 0.0f32;
+        out_row.fill(0.0);
+
+        for j in (lo as usize)..(hi as usize) {
+            let kr = &k_words[k_head + j * kw..k_head + (j + 1) * kw];
+            let r0 = f32::from_bits(kr[k_side.rsc_offset]);
+            let mut sc = r0 * decode_key_dot(kr, qrow);
+            if let Some(sk) = qsk {
+                let mut sdot = 0.0f32;
+                for dd in 0..d {
+                    let bit = (kr[k_side.code_words + (dd >> 5)] >> (dd & 31)) & 1;
+                    sdot += if bit != 0 { sk[dd] } else { -sk[dd] };
+                }
+                let r1 = f32::from_bits(kr[k_side.rsc_offset + 1]);
+                sc += r0 * r1 * QJL_FACTOR / (d as f32) * sdot;
+            }
+            let mut s = sc * scale;
+            if softcap > 0.0 {
+                s = softcap * (s / softcap).tanh();
+            }
+            if slope != 0.0 {
+                s -= slope * (pos - j as i32).abs() as f32;
+            }
+            let vr = &v_words[v_head + j * vw..v_head + (j + 1) * vw];
+            let vscale = f32::from_bits(vr[v_side.rsc_offset]);
+            if s > m {
+                let alpha = if m.is_finite() { (m - s).exp() } else { 0.0 };
+                for v in out_row.iter_mut() {
+                    *v *= alpha;
+                }
+                lsum = lsum * alpha + 1.0;
+                m = s;
+                accum_val(vr, vscale, out_row);
+            } else {
+                let p = (s - m).exp();
+                lsum += p;
+                accum_val(vr, p * vscale, out_row);
+            }
+        }
+        if lsum > 0.0 {
+            let inv = 1.0 / lsum;
+            for v in out_row.iter_mut() {
+                *v *= inv;
+            }
+        }
+    });
+
+    let o = Tensor::from_vec(out, (b, hq, lq, d), q.device())?;
+    Ok(Some(vq.unrotate(&o)?.to_dtype(q.dtype())?))
+}
+
 /// The fused kernel over `kd` / `vd` (`(b, hkv, capacity, words)`, contiguous, same capacity),
 /// `Ok(None)` when it does not apply (CPU, kernels off, shape out of range).
 fn fused_attention_rows(
@@ -1230,6 +1787,9 @@ fn fused_attention_rows(
     vq: &TurboQuantizer,
     cfg: &FlashAttnConfig,
 ) -> Result<Option<Tensor>> {
+    if q.device().is_cpu() {
+        return cpu_attention_packed_fused(q, kd, vd, lk, kq, vq, cfg);
+    }
     let (b, _, _, _) = q.dims4()?;
     let (bk, hkv, cap, kw) = kd.dims4()?;
     let vw = vd.dim(3)?;

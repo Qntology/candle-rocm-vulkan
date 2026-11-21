@@ -7,10 +7,10 @@
 //   * plain C++ (CANDLE_ACCEL_HOST): every workgroup lane runs as a host thread, which lets
 //     candle-core/tests/accel_kernels_host.rs check the kernels without a GPU.
 //
-// The kernels only use dynamic shared memory, `__syncthreads` and plain arithmetic: no warp
-// intrinsics, so the wave32 (RDNA), wave64 (GCN / CDNA) and warp32 (NVIDIA) targets behave
-// the same. Floating point formats are converted with integer code, bit exact with the CPU
-// codec in candle-core/src/accel/formats.rs.
+// Workgroup reductions use a 2-stage shared-memory + 32-lane warp/wave shuffle tree on GPU
+// targets (identical binary-tree pairing order to the pure shared-memory tree on the host
+// emulator, preserving bit-exact plain vs GQA-packed parity). Floating point formats are
+// converted with integer code, bit exact with the CPU codec in candle-core/src/accel/formats.rs.
 #pragma once
 
 #if defined(CANDLE_ACCEL_HOST)
@@ -249,6 +249,98 @@ AX_DEV void ax_store(ax_f16 *p, ax_u64 i, float v) { p[i].b = ax_f2h(v); }
 AX_DEV void ax_store(ax_bf16 *p, ax_u64 i, float v) { p[i].b = ax_f2bf(v); }
 
 // ---------------------------------------------------------------------------
+// Portable 32-lane warp / wave shuffles (CUDA warp32, HIP wave32 & wave64)
+// ---------------------------------------------------------------------------
+
+#if defined(CANDLE_ACCEL_HOST)
+#define AX_HAS_WARP32_SHFL 0
+#elif defined(__HIP__) || defined(__HIPCC__)
+#define AX_HAS_WARP32_SHFL 1
+AX_DEV float ax_shfl_xor32(float v, int mask) { return __shfl_xor(v, mask, 32); }
+AX_DEV ax_u32 ax_shfl_xor32_u32(ax_u32 v, int mask) {
+    return (ax_u32)__shfl_xor((int)v, mask, 32);
+}
+#else
+#define AX_HAS_WARP32_SHFL 1
+AX_DEV float ax_shfl_xor32(float v, int mask) { return __shfl_xor_sync(0xffffffffu, v, mask, 32); }
+AX_DEV ax_u32 ax_shfl_xor32_u32(ax_u32 v, int mask) {
+    return __shfl_xor_sync(0xffffffffu, v, mask, 32);
+}
+#endif
+
+#if AX_HAS_WARP32_SHFL
+AX_DEV float ax_warp32_sum(float v) {
+    AX_UNROLL
+    for (int s = 16; s > 0; s >>= 1) v = v + ax_shfl_xor32(v, s);
+    return v;
+}
+
+AX_DEV float ax_warp32_max(float v) {
+    AX_UNROLL
+    for (int s = 16; s > 0; s >>= 1) v = fmaxf(v, ax_shfl_xor32(v, s));
+    return v;
+}
+
+// Deterministic warp-32 argmax: ties always prefer the smaller index.
+AX_DEV void ax_warp32_argmax(float &val, ax_u32 &idx) {
+    AX_UNROLL
+    for (int s = 16; s > 0; s >>= 1) {
+        const float o_val = ax_shfl_xor32(val, s);
+        const ax_u32 o_idx = ax_shfl_xor32_u32(idx, s);
+        if ((o_val > val) || (o_val == val && o_idx < idx)) {
+            val = o_val;
+            idx = o_idx;
+        }
+    }
+}
+#endif
+
+// ---------------------------------------------------------------------------
+// On-chip Fast Walsh-Hadamard Transform (Sylvester H * diag(signs) / sqrt(D))
+// Matches candle-core/src/accel/turbo.rs::rotation_matrix for RotationKind::Hadamard.
+// ---------------------------------------------------------------------------
+
+AX_DEV float ax_sign_mul(float v, const ax_u32 *sign_bits, ax_u32 j) {
+    const ax_u32 neg = (sign_bits[j >> 5] >> (j & 31u)) & 1u;
+    return neg ? -v : v;
+}
+
+// In-place FWHT over buf[0..D] (D a power of two).
+// forward = true : y = (H * (signs (.) x)) * inv_sqrt_d  (matches x @ Pi^T)
+// forward = false: z = signs (.) (H * y) * inv_sqrt_d    (matches y @ Pi)
+template <ax_u32 NT>
+AX_DEV void ax_fwht_inplace(float *buf, ax_u32 D, const ax_u32 *sign_bits, float inv_sqrt_d,
+                            bool forward) {
+    const ax_u32 t = AX_TID;
+    if (forward) {
+        for (ax_u32 j = t; j < D; j += NT) {
+            buf[j] = ax_sign_mul(buf[j], sign_bits, j) * inv_sqrt_d;
+        }
+    }
+    AX_SYNC();
+
+    const ax_u32 half = D >> 1;
+    for (ax_u32 h = 1u; h < D; h <<= 1u) {
+        for (ax_u32 p = t; p < half; p += NT) {
+            const ax_u32 i0 = ((p & ~(h - 1u)) << 1u) | (p & (h - 1u));
+            const ax_u32 i1 = i0 + h;
+            const float a = buf[i0];
+            const float b = buf[i1];
+            buf[i0] = a + b;
+            buf[i1] = a - b;
+        }
+        AX_SYNC();
+    }
+
+    if (!forward) {
+        for (ax_u32 j = t; j < D; j += NT) {
+            buf[j] = ax_sign_mul(buf[j], sign_bits, j) * inv_sqrt_d;
+        }
+        AX_SYNC();
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Workgroup reductions (NT threads, NT a power of two, `red` holds NT floats)
 // ---------------------------------------------------------------------------
 
@@ -257,6 +349,21 @@ AX_DEV float ax_block_sum(float v, float *red) {
     const ax_u32 t = AX_TID;
     red[t] = v;
     AX_SYNC();
+#if AX_HAS_WARP32_SHFL
+    for (ax_u32 s = NT / 2; s >= 64u; s >>= 1) {
+        if (t < s) red[t] = red[t] + red[t + s];
+        AX_SYNC();
+    }
+    if (t < 32u) {
+        float w = (NT >= 64) ? (red[t] + red[t + 32u]) : red[t];
+        w = ax_warp32_sum(w);
+        if (t == 0u) red[0] = w;
+    }
+    AX_SYNC();
+    const float r = red[0];
+    AX_SYNC();
+    return r;
+#else
     for (ax_u32 s = NT / 2; s > 0; s >>= 1) {
         if (t < s) red[t] = red[t] + red[t + s];
         AX_SYNC();
@@ -264,6 +371,7 @@ AX_DEV float ax_block_sum(float v, float *red) {
     const float r = red[0];
     AX_SYNC();
     return r;
+#endif
 }
 
 template <int NT>
@@ -271,6 +379,21 @@ AX_DEV float ax_block_max(float v, float *red) {
     const ax_u32 t = AX_TID;
     red[t] = v;
     AX_SYNC();
+#if AX_HAS_WARP32_SHFL
+    for (ax_u32 s = NT / 2; s >= 64u; s >>= 1) {
+        if (t < s) red[t] = fmaxf(red[t], red[t + s]);
+        AX_SYNC();
+    }
+    if (t < 32u) {
+        float w = (NT >= 64) ? fmaxf(red[t], red[t + 32u]) : red[t];
+        w = ax_warp32_max(w);
+        if (t == 0u) red[0] = w;
+    }
+    AX_SYNC();
+    const float r = red[0];
+    AX_SYNC();
+    return r;
+#else
     for (ax_u32 s = NT / 2; s > 0; s >>= 1) {
         if (t < s) red[t] = fmaxf(red[t], red[t + s]);
         AX_SYNC();
@@ -278,16 +401,44 @@ AX_DEV float ax_block_max(float v, float *red) {
     const float r = red[0];
     AX_SYNC();
     return r;
+#endif
 }
 
 // G maxima / sums over the workgroup in one tree (red: G * NT floats, the trees of
-// ax_block_max / ax_block_sum per head).
+// ax_block_max / ax_block_sum per head, bit-identical pairing order).
 template <int NT, int G, bool MAX>
 AX_DEV void ax_block_reduce_g(const float *v, float *red, float *out) {
     const ax_u32 t = AX_TID;
     AX_UNROLL
     for (int g = 0; g < G; ++g) red[g * NT + t] = v[g];
     AX_SYNC();
+#if AX_HAS_WARP32_SHFL
+    for (ax_u32 s = NT / 2; s >= 64u; s >>= 1) {
+        if (t < s) {
+            AX_UNROLL
+            for (int g = 0; g < G; ++g) {
+                float *r = red + g * NT;
+                r[t] = MAX ? fmaxf(r[t], r[t + s]) : r[t] + r[t + s];
+            }
+        }
+        AX_SYNC();
+    }
+    const ax_u32 lane = t & 31u;
+    const ax_u32 wid = t >> 5;
+    const ax_u32 nwarps = NT >> 5;
+    for (ax_u32 g = wid; g < (ax_u32)G; g += nwarps) {
+        float *r = red + g * NT;
+        float w = (NT >= 64)
+                      ? (MAX ? fmaxf(r[lane], r[lane + 32u]) : r[lane] + r[lane + 32u])
+                      : r[lane];
+        w = MAX ? ax_warp32_max(w) : ax_warp32_sum(w);
+        if (lane == 0u) r[0] = w;
+    }
+    AX_SYNC();
+    AX_UNROLL
+    for (int g = 0; g < G; ++g) out[g] = red[g * NT];
+    AX_SYNC();
+#else
     for (ax_u32 s = NT / 2; s > 0; s >>= 1) {
         if (t < s) {
             AX_UNROLL
@@ -301,4 +452,5 @@ AX_DEV void ax_block_reduce_g(const float *v, float *red, float *out) {
     AX_UNROLL
     for (int g = 0; g < G; ++g) out[g] = red[g * NT];
     AX_SYNC();
+#endif
 }

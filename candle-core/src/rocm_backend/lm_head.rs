@@ -49,16 +49,19 @@ impl RocmStorage {
         if m > 0 && v_valid > 0 && k > 0 {
             let plan = lmh::plan_stage1(m, v_valid);
             let n_tiles = plan.n_tiles as usize;
-            let part_val = dev.alloc((m * n_tiles).max(1) * 4)?;
-            let part_idx = dev.alloc((m * n_tiles).max(1) * 4)?;
+            let pv_bytes = ((m * n_tiles).max(1) * 4).div_ceil(256) * 256;
+            let pi_bytes = (m * n_tiles).max(1) * 4;
+            let base = dev.workspace_ensure("lm_head_parts", pv_bytes + pi_bytes)?;
+            let part_val = base as *const u8;
+            let part_idx = unsafe { base.add(pv_bytes) } as *const u8;
 
             let f1 = dev.get_func(Module::LmHeadArgmax, &plan.kernel_name(sfx))?;
             let mut la1 = LaunchArgs::new();
             la1.ptr(self.ptr_at(x_off))
                 .ptr(w.ptr_at(w_off))
                 .ptr(bias.map(|(bs, off)| bs.ptr_at(off)).unwrap_or(null()))
-                .ptr(part_val.as_ptr())
-                .ptr(part_idx.as_ptr())
+                .ptr(part_val)
+                .ptr(part_idx)
                 .u32(m as u32)
                 .u32(v_valid as u32)
                 .u32(k as u32)
@@ -67,8 +70,8 @@ impl RocmStorage {
 
             let f2 = dev.get_func(Module::LmHeadArgmax, &format!("lm_stage2_reduce_cs_{sfx}"))?;
             let mut la2 = LaunchArgs::new();
-            la2.ptr(part_val.as_ptr())
-                .ptr(part_idx.as_ptr())
+            la2.ptr(part_val)
+                .ptr(part_idx)
                 .ptr(core_ids.map(|(cs, off)| cs.ptr_at(off)).unwrap_or(null()))
                 .ptr(self.ptr_at(x_off))
                 .ptr(mu_rest.map(|(ms, off)| ms.ptr_at(off)).unwrap_or(null()))
@@ -79,6 +82,91 @@ impl RocmStorage {
                 .ptr(out_rescue.as_ptr())
                 .u32(m as u32)
                 .u32(plan.n_tiles)
+                .u32(k as u32)
+                .u32(u32::from(check_cs));
+            dev.launch(
+                f2,
+                (m as u32, 1, 1),
+                (LM_NT, 1, 1),
+                lmh::stage2_smem_bytes(),
+                &mut la2,
+            )?;
+        }
+
+        Ok((
+            Self::new(out_ids, DType::U32, dev.clone()),
+            Self::new(out_vals, DType::F32, dev.clone()),
+            Self::new(out_rescue, DType::U8, dev.clone()),
+        ))
+    }
+
+    /// Quantized Mode A: 2-Stage Fused Tile Argmax + CS Guard directly over quantized weights
+    /// (`Q8_0`, `Q4_0`, `Q4K`, `Q5K`, `Q6K`) with 0-byte `[M, V]` logits materialization for `M <= 8`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn fused_quant_argmax_cs(
+        &self,
+        x_off: usize,
+        wq_ptr: *const u8,
+        q_sfx: &str,
+        row_bytes: usize,
+        bias: Option<(&Self, usize)>,
+        core_ids: Option<(&Self, usize)>,
+        mu_rest: Option<(&Self, usize)>,
+        w_rest_bound: f32,
+        b_rest_max: f32,
+        check_cs: bool,
+        m: usize,
+        v_valid: usize,
+        k: usize,
+    ) -> Result<(Self, Self, Self)> {
+        let dtype = self.dtype;
+        let sfx = float_sfx(dtype)?;
+        let dev = &self.device;
+        if m > 8 {
+            bail!("fused_quant_argmax_cs: supports M <= 8, got {m}")
+        }
+        let out_ids = dev.alloc(m.max(1) * 4)?;
+        let out_vals = dev.alloc(m.max(1) * 4)?;
+        let out_rescue = dev.alloc(m.max(1))?;
+
+        if m > 0 && v_valid > 0 && k > 0 {
+            let n_tiles = v_valid.div_ceil(32);
+            let pv_bytes = ((m * n_tiles).max(1) * 4).div_ceil(256) * 256;
+            let pi_bytes = (m * n_tiles).max(1) * 4;
+            let base = dev.workspace_ensure("lm_head_parts", pv_bytes + pi_bytes)?;
+            let part_val = base as *const u8;
+            let part_idx = unsafe { base.add(pv_bytes) } as *const u8;
+
+            let m_tag = if m <= 1 { "1" } else { "8" };
+            let f1_name = format!("w8a16_lm{m_tag}_{q_sfx}_{sfx}");
+            let f1 = dev.get_func(Module::W8A16, &f1_name)?;
+            let mut la1 = LaunchArgs::new();
+            la1.ptr(self.ptr_at(x_off))
+                .ptr(wq_ptr)
+                .ptr(bias.map(|(bs, off)| bs.ptr_at(off)).unwrap_or(null()))
+                .ptr(part_val)
+                .ptr(part_idx)
+                .u32(m as u32)
+                .u32(v_valid as u32)
+                .u32(k as u32)
+                .u32(n_tiles as u32)
+                .bits(row_bytes as u64);
+            dev.launch(f1, (n_tiles as u32, 1, 1), (32, 8, 1), 0, &mut la1)?;
+
+            let f2 = dev.get_func(Module::LmHeadArgmax, &format!("lm_stage2_reduce_cs_{sfx}"))?;
+            let mut la2 = LaunchArgs::new();
+            la2.ptr(part_val)
+                .ptr(part_idx)
+                .ptr(core_ids.map(|(cs, off)| cs.ptr_at(off)).unwrap_or(null()))
+                .ptr(self.ptr_at(x_off))
+                .ptr(mu_rest.map(|(ms, off)| ms.ptr_at(off)).unwrap_or(null()))
+                .f32(w_rest_bound)
+                .f32(b_rest_max)
+                .ptr(out_ids.as_ptr())
+                .ptr(out_vals.as_ptr())
+                .ptr(out_rescue.as_ptr())
+                .u32(m as u32)
+                .u32(n_tiles as u32)
                 .u32(k as u32)
                 .u32(u32::from(check_cs));
             dev.launch(

@@ -6,13 +6,13 @@ use super::k_quants::{
 };
 use super::{GgmlDType, QStorage, QuantizedType};
 use crate::backend::BackendStorage;
-use crate::vulkan_backend::qgpu::{self, GpuQ8};
+use crate::vulkan_backend::qgpu::{self, GpuQuant};
 use crate::{CpuStorage, DType, Layout, Result, Shape, VulkanDevice, VulkanStorage};
 use half::{bf16, f16};
 
 pub struct QVulkanStorage {
     data: Option<VulkanStorage>,
-    gpu: Option<GpuQ8>,
+    gpu: Option<GpuQuant>,
     dtype: GgmlDType,
     device: VulkanDevice,
 }
@@ -128,17 +128,14 @@ impl QVulkanStorage {
     }
 
     pub fn from_bytes(device: &VulkanDevice, dtype: GgmlDType, bytes: &[u8]) -> Result<Self> {
-        if dtype == GgmlDType::Q8_0 && qgpu::want_q8_on_gpu(device, bytes.len()) {
-            match GpuQ8::from_ggml(device, bytes) {
-                Ok(g) => {
-                    return Ok(Self {
-                        data: None,
-                        gpu: Some(g),
-                        dtype,
-                        device: device.clone(),
-                    })
-                }
-                Err(_) => {}
+        if qgpu::want_quant_on_gpu(device, dtype, bytes.len()) {
+            if let Ok(g) = GpuQuant::from_ggml(device, dtype, bytes) {
+                return Ok(Self {
+                    data: None,
+                    gpu: Some(g),
+                    dtype,
+                    device: device.clone(),
+                });
             }
         }
         let data = device.upload_bytes(bytes, bytes.len(), DType::U8)?;
@@ -151,19 +148,16 @@ impl QVulkanStorage {
     }
 
     fn maybe_promote(&mut self) {
-        if self.gpu.is_some() || self.dtype != GgmlDType::Q8_0 {
+        if self.gpu.is_some() {
             return;
         }
         let Some(data) = &self.data else { return };
-        if !qgpu::want_q8_on_gpu(&self.device, data.capacity_bytes) {
+        if !qgpu::want_quant_on_gpu(&self.device, self.dtype, data.capacity_bytes) {
             return;
         }
-        match GpuQ8::from_ggml(&self.device, data.as_bytes()) {
-            Ok(g) => {
-                self.gpu = Some(g);
-                self.data = None;
-            }
-            Err(_) => {}
+        if let Ok(g) = GpuQuant::from_ggml(&self.device, self.dtype, data.as_bytes()) {
+            self.gpu = Some(g);
+            self.data = None;
         }
     }
 
@@ -358,16 +352,19 @@ impl QVulkanStorage {
     ) -> Result<(VulkanStorage, Shape)> {
         let (dst_shape, mkn) = qmatmul_shapes(self_shape, layout)?;
         if let Some(g) = &self.gpu {
-            match g.matmul(mkn, storage, layout) {
-                Ok(out) => {
-                    let in_dtype = storage.dtype();
-                    if in_dtype == DType::F32 {
-                        return Ok((out, dst_shape));
+            if let Ok(out) = g.matmul(mkn, storage, layout) {
+                let in_dtype = storage.dtype();
+                return match in_dtype {
+                    DType::F32 => Ok((out, dst_shape)),
+                    DType::F16 | DType::BF16 => Ok((
+                        qgpu::f32_to_f16_bf16_gpu(&self.device, &out, in_dtype)?,
+                        dst_shape,
+                    )),
+                    _ => {
+                        let out = out.to_dtype(&Layout::contiguous(&dst_shape), in_dtype)?;
+                        Ok((out, dst_shape))
                     }
-                    let out = out.to_dtype(&Layout::contiguous(&dst_shape), in_dtype)?;
-                    return Ok((out, dst_shape));
-                }
-                Err(_) => {}
+                };
             }
         }
         let dtype = self.dtype;
@@ -382,13 +379,69 @@ impl QVulkanStorage {
 
     pub fn indexed_moe_forward(
         &self,
-        _: &Shape,
-        _: &VulkanStorage,
-        _: &Layout,
-        _: &VulkanStorage,
-        _: &Layout,
+        self_shape: &Shape,
+        x: &VulkanStorage,
+        x_l: &Layout,
+        ids: &VulkanStorage,
+        ids_l: &Layout,
     ) -> Result<(VulkanStorage, Shape)> {
-        crate::bail!("indexed_moe_forward is not implemented on the Vulkan backend")
+        let (n_exp, n, k) = self_shape.dims3()?;
+        let (bsz, topk) = ids_l.shape().dims2()?;
+        let out_shape = Shape::from((bsz, topk, n));
+        let in_dtype = x.dtype();
+        if let Some(g) = &self.gpu {
+            if let Ok(out32) = g.indexed_moe_forward((n_exp, n, k), x, x_l, ids, ids_l) {
+                return match in_dtype {
+                    DType::F32 => Ok((out32, out_shape)),
+                    DType::F16 | DType::BF16 => Ok((
+                        qgpu::f32_to_f16_bf16_gpu(&self.device, &out32, in_dtype)?,
+                        out_shape,
+                    )),
+                    _ => Ok((
+                        out32.to_dtype(&Layout::contiguous(&out_shape), in_dtype)?,
+                        out_shape,
+                    )),
+                };
+            }
+        }
+        // Host fallback over mapped buffers for formats/shapes not resident in GPU VRAM.
+        let x_f32_cpu = x.host_view().to_dtype(x_l, DType::F32)?;
+        let x_f32 = x_f32_cpu.as_slice::<f32>()?;
+        let ids_u32_cpu = ids.host_view().to_dtype(ids_l, DType::U32)?;
+        let ids_u32 = ids_u32_cpu.as_slice::<u32>()?;
+        let x_dims = x_l.dims();
+        let x_stride_t = if x_dims.len() == 3 { x_dims[1] } else { 1 };
+        let exp_bytes = (n * k / self.dtype.block_size()) * self.dtype.type_size();
+        let mut out = self.device.alloc_buffer(bsz * topk * n, DType::F32)?;
+        let dst = out.as_mut_slice::<f32>()?;
+        let dtype = self.dtype;
+        self.with_host_bytes(|weights| {
+            for bi in 0..bsz {
+                for ti in 0..topk {
+                    let eid = ids_u32[bi * topk + ti] as usize;
+                    if eid >= n_exp {
+                        crate::bail!("vulkan indexed_moe_forward: expert id {eid} >= {n_exp}");
+                    }
+                    let x_slot = bi * x_stride_t + if x_stride_t > 1 { ti } else { 0 };
+                    let lhs = &x_f32[x_slot * k..(x_slot + 1) * k];
+                    let w_exp = &weights[eid * exp_bytes..(eid + 1) * exp_bytes];
+                    let o_slice = &mut dst[(bi * topk + ti) * n..(bi * topk + ti + 1) * n];
+                    with_blocks!(dtype, w_exp, |blocks| super::k_quants::matmul(
+                        (1, k, n),
+                        lhs,
+                        blocks,
+                        o_slice,
+                    ))?;
+                }
+            }
+            Ok(())
+        })?;
+        if in_dtype == DType::F32 {
+            Ok((out, out_shape))
+        } else {
+            let out = out.to_dtype(&Layout::contiguous(&out_shape), in_dtype)?;
+            Ok((out, out_shape))
+        }
     }
 }
 

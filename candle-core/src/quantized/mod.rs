@@ -12,6 +12,8 @@ pub mod ggml_file;
 pub mod gguf_file;
 pub mod imatrix_file;
 pub mod k_quants;
+pub mod nvfp;
+pub use nvfp::{NvfpFormat, NvfpPlanarLayout, NvfpWeight};
 #[cfg(feature = "metal")]
 pub mod metal;
 #[cfg(not(target_arch = "wasm32"))]
@@ -809,6 +811,11 @@ impl QTensor {
         &self.shape
     }
 
+    #[cfg_attr(not(feature = "rocm"), allow(dead_code))]
+    pub(crate) fn storage(&self) -> &QStorage {
+        &self.storage
+    }
+
     pub fn dequantize(&self, device: &Device) -> Result<Tensor> {
         let storage = self.storage.dequantize(self.shape.elem_count())?;
         let none = crate::op::BackpropOp::none();
@@ -865,13 +872,8 @@ impl QTensor {
                 crate::tensor::from_storage(Storage::Cuda(st), self.shape.clone(), none(), false)
             }
             QStorage::Rocm(s) => {
-                let st = if dtype == DType::F16 {
-                    s.dequantize_f16(elem_count)?
-                } else {
-                    s.dequantize(elem_count)?
-                };
+                let st = s.dequantize_range_to(0, elem_count, dtype)?;
                 crate::tensor::from_storage(Storage::Rocm(st), self.shape.clone(), none(), false)
-                    .to_dtype(dtype)?
             }
             QStorage::Vulkan(s) => {
                 let st = if dtype == DType::F16 {
@@ -908,7 +910,6 @@ impl QTensor {
                 crate::tensor::from_storage(Storage::Cuda(st), (nrows, k), none, false)
                     .to_device(device)
             }
-            #[cfg(feature = "rocm")]
             QStorage::Rocm(s) => {
                 let st = s.dequantize_range_to(row0 * k, nrows * k, dtype)?;
                 let none = crate::op::BackpropOp::none();
@@ -978,11 +979,15 @@ impl QTensor {
                 let none = crate::op::BackpropOp::none();
                 Ok(crate::tensor::from_storage(Storage::Cuda(st), shape, none, false))
             }
-            // The ROCm kernels need at least a 2D input.
-            QStorage::Rocm(_) if dims.len() == 1 => {
-                xs.unsqueeze(0)?.apply_op1_no_bwd(self)?.squeeze(0)
+            QStorage::Rocm(s) => {
+                let xs = xs.contiguous()?;
+                let (st, shape) = match &*xs.storage() {
+                    Storage::Rocm(x) => s.fwd_exact(&self.shape, x, xs.layout())?,
+                    _ => crate::bail!("forward_exact: the input is not on the weight's ROCm device"),
+                };
+                let none = crate::op::BackpropOp::none();
+                Ok(crate::tensor::from_storage(Storage::Rocm(st), shape, none, false))
             }
-            QStorage::Rocm(_) => xs.apply_op1_no_bwd(self),
             // Metal's native quantized matmul/matvec accepts F32 activations directly without
             // activation quantization, avoiding materializing a full F32 weight buffer every call.
             QStorage::Metal(_) if dtype == DType::F32 && dims.len() == 1 => {
@@ -1092,12 +1097,71 @@ impl QTensor {
                         false,
                     ))
                 }
-                _ => {
-                    panic!("Non-cuda indexed_moe_forward is not implemented!");
+                _ => crate::bail!("indexed_moe_forward: inputs must be on the CUDA weight device"),
+            },
+            QStorage::Rocm(s) => match (&*x.storage(), &*ids.storage()) {
+                (Storage::Rocm(x_storage), Storage::Rocm(ids_storage)) => {
+                    let (storage, out_shape) = s.indexed_moe_forward(
+                        self.shape(),
+                        x_storage,
+                        x.layout(),
+                        ids_storage,
+                        ids.layout(),
+                    )?;
+                    Ok(crate::tensor::from_storage(
+                        Storage::Rocm(storage),
+                        out_shape,
+                        crate::op::BackpropOp::none(),
+                        false,
+                    ))
                 }
+                _ => crate::bail!("indexed_moe_forward: inputs must be on the ROCm weight device"),
+            },
+            QStorage::Vulkan(s) => match (&*x.storage(), &*ids.storage()) {
+                (Storage::Vulkan(x_storage), Storage::Vulkan(ids_storage)) => {
+                    let (storage, out_shape) = s.indexed_moe_forward(
+                        self.shape(),
+                        x_storage,
+                        x.layout(),
+                        ids_storage,
+                        ids.layout(),
+                    )?;
+                    Ok(crate::tensor::from_storage(
+                        Storage::Vulkan(storage),
+                        out_shape,
+                        crate::op::BackpropOp::none(),
+                        false,
+                    ))
+                }
+                _ => crate::bail!("indexed_moe_forward: inputs must be on the Vulkan weight device"),
             },
             _ => {
-                panic!("indexed_moe_forward is not implemented in this platform!");
+                // Portable fallback (CPU / Metal / OpenCL): dequantize selected experts and multiply.
+                let (_n_experts, n, k) = self.shape().dims3()?;
+                let (batch, topk) = ids.dims2()?;
+                let x_dims = x.dims();
+                let x_has_topk = match x_dims {
+                    [b, k_in] if *b == batch && *k_in == k => false,
+                    [b, tk, k_in] if *b == batch && (*tk == 1 || *tk == topk) && *k_in == k => {
+                        *tk == topk
+                    }
+                    _ => crate::bail!("indexed_moe_forward: incompatible x shape {x_dims:?}"),
+                };
+                let in_dtype = x.dtype();
+                let ids_vec = ids.to_device(&Device::Cpu)?.to_dtype(DType::U32)?.flatten_all()?.to_vec1::<u32>()?;
+                let w_f32 = self.dequantize(&Device::Cpu)?;
+                let x_f32 = x.to_device(&Device::Cpu)?.to_dtype(DType::F32)?;
+                let x_flat = x_f32.reshape((if x_has_topk { batch * topk } else { batch }, k))?;
+                let mut rows_out = Vec::with_capacity(batch * topk);
+                for slot in 0..batch * topk {
+                    let e = ids_vec[slot] as usize;
+                    let xr = if x_has_topk { slot } else { slot / topk };
+                    let w_e = w_f32.narrow(0, e, 1)?.squeeze(0)?; // [n, k]
+                    let x_r = x_flat.narrow(0, xr, 1)?; // [1, k]
+                    rows_out.push(x_r.matmul(&w_e.t()?)?); // [1, n]
+                }
+                let out = Tensor::cat(&rows_out, 0)?.reshape((batch, topk, n))?;
+                out.to_device(x.device())?.to_dtype(in_dtype)
             }
         }
     }

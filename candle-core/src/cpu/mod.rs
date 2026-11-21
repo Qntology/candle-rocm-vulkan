@@ -397,3 +397,274 @@ pub(crate) unsafe fn vec_scalar_add_bf16(scalar: bf16, xs: *const bf16, ys: *mut
         *ys.add(i) = *xs.add(i) + scalar;
     }
 }
+
+// ---------------------------------------------------------------------------
+// Runtime-dispatched SIMD FP32-accumulating dot & fmadd (F32 / F16 / BF16)
+// ---------------------------------------------------------------------------
+
+#[cfg(target_arch = "x86_64")]
+mod x86_simd {
+    use core::arch::x86_64::*;
+    use half::{bf16, f16};
+
+    #[target_feature(enable = "avx2", enable = "fma")]
+    pub(super) unsafe fn hsum256_ps(v: __m256) -> f32 {
+        let lo = _mm256_castps256_ps128(v);
+        let hi = _mm256_extractf128_ps(v, 1);
+        let sum = _mm_add_ps(lo, hi);
+        let shuf = _mm_movehdup_ps(sum);
+        let sums = _mm_add_ps(sum, shuf);
+        let shuf2 = _mm_movehl_ps(shuf, sums);
+        _mm_cvtss_f32(_mm_add_ss(sums, shuf2))
+    }
+
+    #[target_feature(enable = "avx2", enable = "fma")]
+    pub(super) unsafe fn dot_f32_avx2(a: *const f32, b: *const f32, n: usize) -> f32 {
+        let mut s0 = _mm256_setzero_ps();
+        let mut s1 = _mm256_setzero_ps();
+        let mut i = 0;
+        while i + 16 <= n {
+            s0 = _mm256_fmadd_ps(_mm256_loadu_ps(a.add(i)), _mm256_loadu_ps(b.add(i)), s0);
+            s1 = _mm256_fmadd_ps(
+                _mm256_loadu_ps(a.add(i + 8)),
+                _mm256_loadu_ps(b.add(i + 8)),
+                s1,
+            );
+            i += 16;
+        }
+        if i + 8 <= n {
+            s0 = _mm256_fmadd_ps(_mm256_loadu_ps(a.add(i)), _mm256_loadu_ps(b.add(i)), s0);
+            i += 8;
+        }
+        let mut acc = hsum256_ps(_mm256_add_ps(s0, s1));
+        while i < n {
+            acc = (*a.add(i)).mul_add(*b.add(i), acc);
+            i += 1;
+        }
+        acc
+    }
+
+    #[target_feature(enable = "avx2", enable = "fma")]
+    pub(super) unsafe fn fmadd_f32_avx2(acc: *mut f32, v: *const f32, w: f32, n: usize) {
+        let wv = _mm256_set1_ps(w);
+        let mut i = 0;
+        while i + 16 <= n {
+            let a0 = _mm256_loadu_ps(acc.add(i));
+            let a1 = _mm256_loadu_ps(acc.add(i + 8));
+            _mm256_storeu_ps(acc.add(i), _mm256_fmadd_ps(_mm256_loadu_ps(v.add(i)), wv, a0));
+            _mm256_storeu_ps(
+                acc.add(i + 8),
+                _mm256_fmadd_ps(_mm256_loadu_ps(v.add(i + 8)), wv, a1),
+            );
+            i += 16;
+        }
+        if i + 8 <= n {
+            let a0 = _mm256_loadu_ps(acc.add(i));
+            _mm256_storeu_ps(acc.add(i), _mm256_fmadd_ps(_mm256_loadu_ps(v.add(i)), wv, a0));
+            i += 8;
+        }
+        while i < n {
+            *acc.add(i) = (*v.add(i)).mul_add(w, *acc.add(i));
+            i += 1;
+        }
+    }
+
+    #[target_feature(enable = "avx2", enable = "fma", enable = "f16c")]
+    pub(super) unsafe fn dot_f16_avx2(a: *const f16, b: *const f16, n: usize) -> f32 {
+        let mut s0 = _mm256_setzero_ps();
+        let mut s1 = _mm256_setzero_ps();
+        let mut i = 0;
+        while i + 16 <= n {
+            let a0 = _mm256_cvtph_ps(_mm_loadu_si128(a.add(i) as *const __m128i));
+            let b0 = _mm256_cvtph_ps(_mm_loadu_si128(b.add(i) as *const __m128i));
+            let a1 = _mm256_cvtph_ps(_mm_loadu_si128(a.add(i + 8) as *const __m128i));
+            let b1 = _mm256_cvtph_ps(_mm_loadu_si128(b.add(i + 8) as *const __m128i));
+            s0 = _mm256_fmadd_ps(a0, b0, s0);
+            s1 = _mm256_fmadd_ps(a1, b1, s1);
+            i += 16;
+        }
+        if i + 8 <= n {
+            let a0 = _mm256_cvtph_ps(_mm_loadu_si128(a.add(i) as *const __m128i));
+            let b0 = _mm256_cvtph_ps(_mm_loadu_si128(b.add(i) as *const __m128i));
+            s0 = _mm256_fmadd_ps(a0, b0, s0);
+            i += 8;
+        }
+        let mut acc = hsum256_ps(_mm256_add_ps(s0, s1));
+        while i < n {
+            acc = (*a.add(i)).to_f32().mul_add((*b.add(i)).to_f32(), acc);
+            i += 1;
+        }
+        acc
+    }
+
+    #[target_feature(enable = "avx2", enable = "fma", enable = "f16c")]
+    pub(super) unsafe fn fmadd_f16_avx2(acc: *mut f32, v: *const f16, w: f32, n: usize) {
+        let wv = _mm256_set1_ps(w);
+        let mut i = 0;
+        while i + 8 <= n {
+            let vf = _mm256_cvtph_ps(_mm_loadu_si128(v.add(i) as *const __m128i));
+            let a0 = _mm256_loadu_ps(acc.add(i));
+            _mm256_storeu_ps(acc.add(i), _mm256_fmadd_ps(vf, wv, a0));
+            i += 8;
+        }
+        while i < n {
+            *acc.add(i) = (*v.add(i)).to_f32().mul_add(w, *acc.add(i));
+            i += 1;
+        }
+    }
+
+    #[target_feature(enable = "avx2", enable = "fma")]
+    pub(super) unsafe fn dot_bf16_avx2(a: *const bf16, b: *const bf16, n: usize) -> f32 {
+        let mut s0 = _mm256_setzero_ps();
+        let mut s1 = _mm256_setzero_ps();
+        let mut i = 0;
+        while i + 16 <= n {
+            let a0 = _mm256_castsi256_ps(_mm256_slli_epi32(
+                _mm256_cvtepu16_epi32(_mm_loadu_si128(a.add(i) as *const __m128i)),
+                16,
+            ));
+            let b0 = _mm256_castsi256_ps(_mm256_slli_epi32(
+                _mm256_cvtepu16_epi32(_mm_loadu_si128(b.add(i) as *const __m128i)),
+                16,
+            ));
+            let a1 = _mm256_castsi256_ps(_mm256_slli_epi32(
+                _mm256_cvtepu16_epi32(_mm_loadu_si128(a.add(i + 8) as *const __m128i)),
+                16,
+            ));
+            let b1 = _mm256_castsi256_ps(_mm256_slli_epi32(
+                _mm256_cvtepu16_epi32(_mm_loadu_si128(b.add(i + 8) as *const __m128i)),
+                16,
+            ));
+            s0 = _mm256_fmadd_ps(a0, b0, s0);
+            s1 = _mm256_fmadd_ps(a1, b1, s1);
+            i += 16;
+        }
+        if i + 8 <= n {
+            let a0 = _mm256_castsi256_ps(_mm256_slli_epi32(
+                _mm256_cvtepu16_epi32(_mm_loadu_si128(a.add(i) as *const __m128i)),
+                16,
+            ));
+            let b0 = _mm256_castsi256_ps(_mm256_slli_epi32(
+                _mm256_cvtepu16_epi32(_mm_loadu_si128(b.add(i) as *const __m128i)),
+                16,
+            ));
+            s0 = _mm256_fmadd_ps(a0, b0, s0);
+            i += 8;
+        }
+        let mut acc = hsum256_ps(_mm256_add_ps(s0, s1));
+        while i < n {
+            acc = (*a.add(i)).to_f32().mul_add((*b.add(i)).to_f32(), acc);
+            i += 1;
+        }
+        acc
+    }
+
+    #[target_feature(enable = "avx2", enable = "fma")]
+    pub(super) unsafe fn fmadd_bf16_avx2(acc: *mut f32, v: *const bf16, w: f32, n: usize) {
+        let wv = _mm256_set1_ps(w);
+        let mut i = 0;
+        while i + 8 <= n {
+            let vf = _mm256_castsi256_ps(_mm256_slli_epi32(
+                _mm256_cvtepu16_epi32(_mm_loadu_si128(v.add(i) as *const __m128i)),
+                16,
+            ));
+            let a0 = _mm256_loadu_ps(acc.add(i));
+            _mm256_storeu_ps(acc.add(i), _mm256_fmadd_ps(vf, wv, a0));
+            i += 8;
+        }
+        while i < n {
+            *acc.add(i) = (*v.add(i)).to_f32().mul_add(w, *acc.add(i));
+            i += 1;
+        }
+    }
+}
+
+#[inline]
+pub(crate) unsafe fn vec_dot_f32_simd(a: *const f32, b: *const f32, n: usize) -> f32 {
+    #[cfg(target_arch = "x86_64")]
+    {
+        if std::is_x86_feature_detected!("avx2") && std::is_x86_feature_detected!("fma") {
+            return x86_simd::dot_f32_avx2(a, b, n);
+        }
+    }
+    let mut res = 0.0f32;
+    vec_dot_f32(a, b, &mut res, n);
+    res
+}
+
+#[inline]
+pub(crate) fn vec_fmadd_f32_simd(acc: &mut [f32], v: &[f32], w: f32) {
+    let n = acc.len().min(v.len());
+    #[cfg(target_arch = "x86_64")]
+    {
+        if std::is_x86_feature_detected!("avx2") && std::is_x86_feature_detected!("fma") {
+            unsafe { x86_simd::fmadd_f32_avx2(acc.as_mut_ptr(), v.as_ptr(), w, n) };
+            return;
+        }
+    }
+    for i in 0..n {
+        acc[i] = v[i].mul_add(w, acc[i]);
+    }
+}
+
+#[inline]
+pub(crate) unsafe fn vec_dot_f16_to_f32_simd(a: *const f16, b: *const f16, n: usize) -> f32 {
+    #[cfg(target_arch = "x86_64")]
+    {
+        if std::is_x86_feature_detected!("avx2")
+            && std::is_x86_feature_detected!("fma")
+            && std::is_x86_feature_detected!("f16c")
+        {
+            return x86_simd::dot_f16_avx2(a, b, n);
+        }
+    }
+    let mut res = 0.0f32;
+    vec_dot_f16(a, b, &mut res, n);
+    res
+}
+
+#[inline]
+pub(crate) fn vec_fmadd_f16_to_f32_simd(acc: &mut [f32], v: &[f16], w: f32) {
+    let n = acc.len().min(v.len());
+    #[cfg(target_arch = "x86_64")]
+    {
+        if std::is_x86_feature_detected!("avx2")
+            && std::is_x86_feature_detected!("fma")
+            && std::is_x86_feature_detected!("f16c")
+        {
+            unsafe { x86_simd::fmadd_f16_avx2(acc.as_mut_ptr(), v.as_ptr(), w, n) };
+            return;
+        }
+    }
+    for i in 0..n {
+        acc[i] = v[i].to_f32().mul_add(w, acc[i]);
+    }
+}
+
+#[inline]
+pub(crate) unsafe fn vec_dot_bf16_to_f32_simd(a: *const bf16, b: *const bf16, n: usize) -> f32 {
+    #[cfg(target_arch = "x86_64")]
+    {
+        if std::is_x86_feature_detected!("avx2") && std::is_x86_feature_detected!("fma") {
+            return x86_simd::dot_bf16_avx2(a, b, n);
+        }
+    }
+    let mut res = 0.0f32;
+    vec_dot_bf16(a, b, &mut res, n);
+    res
+}
+
+#[inline]
+pub(crate) fn vec_fmadd_bf16_to_f32_simd(acc: &mut [f32], v: &[bf16], w: f32) {
+    let n = acc.len().min(v.len());
+    #[cfg(target_arch = "x86_64")]
+    {
+        if std::is_x86_feature_detected!("avx2") && std::is_x86_feature_detected!("fma") {
+            unsafe { x86_simd::fmadd_bf16_avx2(acc.as_mut_ptr(), v.as_ptr(), w, n) };
+            return;
+        }
+    }
+    for i in 0..n {
+        acc[i] = v[i].to_f32().mul_add(w, acc[i]);
+    }
+}

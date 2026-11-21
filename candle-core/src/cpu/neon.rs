@@ -370,15 +370,25 @@ mod bf16 {
             }
 
             unsafe fn vec_add(a: Self::Unit, b: Self::Unit) -> Self::Unit {
-                let result: Self::Unit;
-                asm!(
-                    "fadd {v:v}.4s, {a:v}.4s, {b:v}.4s",
-                    v = out(vreg) result,
-                    a = in(vreg) a,
-                    b = in(vreg) b,
-                    options(pure, nomem, nostack)
-                );
-                result
+                // `a` and `b` hold 8 bf16 values (`uint16x8_t`). Widen to two f32x4 vectors,
+                // add in IEEE FP32, and round-to-nearest-even back to bf16x8.
+                let a_lo = vreinterpretq_f32_u32(vshll_n_u16::<16>(vget_low_u16(a)));
+                let b_lo = vreinterpretq_f32_u32(vshll_n_u16::<16>(vget_low_u16(b)));
+                let a_hi = vreinterpretq_f32_u32(vshll_n_u16::<16>(vget_high_u16(a)));
+                let b_hi = vreinterpretq_f32_u32(vshll_n_u16::<16>(vget_high_u16(b)));
+                let s_lo = vreinterpretq_u32_f32(vaddq_f32(a_lo, b_lo));
+                let s_hi = vreinterpretq_u32_f32(vaddq_f32(a_hi, b_hi));
+                let bias = vdupq_n_u32(0x7fff);
+                let one = vdupq_n_u32(1);
+                let r_lo = vshrn_n_u32::<16>(vaddq_u32(
+                    vaddq_u32(s_lo, bias),
+                    vandq_u32(vshrq_n_u32::<16>(s_lo), one),
+                ));
+                let r_hi = vshrn_n_u32::<16>(vaddq_u32(
+                    vaddq_u32(s_hi, bias),
+                    vandq_u32(vshrq_n_u32::<16>(s_hi), one),
+                ));
+                vcombine_u16(r_lo, r_hi)
             }
 
             unsafe fn vec_fma(a: Self::Unit, b: Self::Unit, c: Self::Unit) -> Self::Unit {
@@ -411,7 +421,7 @@ mod bf16 {
             }
 
             unsafe fn from_f32(v: f32) -> Self::Unit {
-                vreinterpretq_u16_f32(vdupq_n_f32(v))
+                vdupq_n_u16(bf16::from_f32(v).to_bits())
             }
 
             unsafe fn vec_store(mem_addr: *mut bf16, a: Self::Unit) {

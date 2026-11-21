@@ -6,11 +6,11 @@
 //!   quantized `QMatMul` sub-logits `[M, V_core]` without expanding to `[M, V_full]`.
 
 use crate::accel::lm_head::{self as lmh, better_argmax};
-#[cfg(any(feature = "cuda", feature = "rocm"))]
+#[cfg(any(feature = "cuda", feature = "rocm", feature = "vulkan"))]
 use crate::op::BackpropOp;
-#[cfg(any(feature = "cuda", feature = "rocm"))]
+#[cfg(any(feature = "cuda", feature = "rocm", feature = "vulkan"))]
 use crate::storage::Storage;
-#[cfg(any(feature = "cuda", feature = "rocm"))]
+#[cfg(any(feature = "cuda", feature = "rocm", feature = "vulkan"))]
 use crate::tensor::from_storage;
 use crate::{bail, DType, Device, Layout, Result, Tensor};
 
@@ -49,6 +49,57 @@ impl CsGuardParams {
             .sqrt()?
             .max(0)?
             .to_scalar::<f32>()?;
+        let b_rest_max = match b_rest {
+            Some(b) => b.to_dtype(DType::F32)?.max(0)?.to_scalar::<f32>()?,
+            None => 0.0,
+        };
+        Ok(Self {
+            mu_rest,
+            w_rest_bound: max_norm * (1.0 + safety_margin.max(1e-3)),
+            b_rest_max,
+        })
+    }
+
+    /// Precomputes `mu_rest` and `w_rest_bound` from a quantized REST weight `[V_rest, K]` using
+    /// the exact dequantized rows (`dequantize_rows_to` in bounded chunks), guaranteeing zero
+    /// false-negative REST rescues even with quantized weights.
+    pub fn from_quant_rest_weight(
+        q_rest: &crate::quantized::QTensor,
+        b_rest: Option<&Tensor>,
+        safety_margin: f32,
+        device: &Device,
+    ) -> Result<Self> {
+        let (v_rest, k) = q_rest.shape().dims2()?;
+        if v_rest == 0 {
+            bail!("CsGuardParams::from_quant_rest_weight: q_rest must have at least 1 row");
+        }
+        const CHUNK: usize = 4096;
+        let mut sum = Tensor::zeros((k,), DType::F32, device)?;
+        let mut r0 = 0usize;
+        while r0 < v_rest {
+            let rn = (v_rest - r0).min(CHUNK);
+            let w_chunk = q_rest.dequantize_rows_to(r0, rn, DType::F32, device)?;
+            sum = (sum + w_chunk.sum(0)?)?;
+            r0 += rn;
+        }
+        let mu_rest = (sum / (v_rest as f64))?.contiguous()?;
+        let mut max_norm = 0.0f32;
+        let mut r0 = 0usize;
+        while r0 < v_rest {
+            let rn = (v_rest - r0).min(CHUNK);
+            let w_chunk = q_rest.dequantize_rows_to(r0, rn, DType::F32, device)?;
+            let c_max = w_chunk
+                .broadcast_sub(&mu_rest)?
+                .sqr()?
+                .sum(1)?
+                .sqrt()?
+                .max(0)?
+                .to_scalar::<f32>()?;
+            if c_max > max_norm {
+                max_norm = c_max;
+            }
+            r0 += rn;
+        }
         let b_rest_max = match b_rest {
             Some(b) => b.to_dtype(DType::F32)?.max(0)?.to_scalar::<f32>()?,
             None => 0.0,
@@ -287,6 +338,62 @@ pub fn fused_linear_argmax_cs(
                 },
             })
         }
+        #[cfg(feature = "vulkan")]
+        Device::Vulkan(vdev) if crate::vulkan_backend::decoder_ops::vk_fused_ready(vdev) => {
+            let (xs, xl) = x_c.storage_and_layout();
+            let (ws, wl) = w_c.storage_and_layout();
+            let (Storage::Vulkan(xv), Storage::Vulkan(wv)) = (&*xs, &*ws) else {
+                unreachable!()
+            };
+            let bg = bias_f32.as_ref().map(|t| t.storage_and_layout());
+            let cg = cids_u32.as_ref().map(|t| t.storage_and_layout());
+            let mg = mu_f32.as_ref().map(|t| t.storage_and_layout());
+            let b_arg = bg.as_ref().map(|(s, l)| match &**s {
+                Storage::Vulkan(c) => (c, l.start_offset()),
+                _ => unreachable!(),
+            });
+            let c_arg = cg.as_ref().map(|(s, l)| match &**s {
+                Storage::Vulkan(c) => (c, l.start_offset()),
+                _ => unreachable!(),
+            });
+            let m_arg = mg.as_ref().map(|(s, l)| match &**s {
+                Storage::Vulkan(c) => (c, l.start_offset()),
+                _ => unreachable!(),
+            });
+            let (id_s, val_s, res_s) = xv.fused_linear_argmax_cs(
+                xl.start_offset(),
+                wv,
+                wl.start_offset(),
+                b_arg,
+                c_arg,
+                m_arg,
+                w_bound,
+                b_max,
+                check_cs,
+                m,
+                v_valid,
+                k,
+            )?;
+            Ok(ArgmaxCsOutput {
+                ids: from_storage(Storage::Vulkan(id_s), (m,), BackpropOp::none(), false),
+                max_vals: Some(from_storage(
+                    Storage::Vulkan(val_s),
+                    (m,),
+                    BackpropOp::none(),
+                    false,
+                )),
+                rescue_mask: if check_cs {
+                    Some(from_storage(
+                        Storage::Vulkan(res_s),
+                        (m,),
+                        BackpropOp::none(),
+                        false,
+                    ))
+                } else {
+                    None
+                },
+            })
+        }
         _ => {
             // Chunked matmul + deterministic tie-break fallback (keeps logits memory tiny).
             let x_2d = x_c.reshape((m, k))?.to_dtype(DType::F32)?;
@@ -360,6 +467,156 @@ pub fn fused_linear_argmax_cs(
             })
         }
     }
+}
+
+/// Quantized Mode A: Fused quantized `lm_head` matmul + in-register argmax + optional CS guard.
+///
+/// - On ROCm with `M <= 8` and `Q8_0 | Q4_0 | Q4K | Q5K | Q6K` weights, executes the single-source
+///   `w8a16_lm{1,8}_*` + `lm_stage2_reduce_cs_*` kernels with **0 bytes** of `[M, V]` logits
+///   materialization.
+/// - On other backends or `M > 8`, computes exact quantized sub-logits via `QTensor::forward_exact`
+///   and reduces them via [`logits_argmax_cs`] (Mode B, GPU-accelerated on CUDA, ROCm, and Vulkan).
+pub fn fused_quant_argmax_cs(
+    hidden: &Tensor,
+    qweight: &crate::quantized::QTensor,
+    bias: Option<&Tensor>,
+    core_ids: Option<&Tensor>,
+    cs_guard: Option<&CsGuardParams>,
+) -> Result<ArgmaxCsOutput> {
+    let dev = hidden.device().clone();
+    let dtype = hidden.dtype();
+    check_float_dtype(dtype, "fused_quant_argmax_cs")?;
+    let (v_valid, k) = qweight.shape().dims2()?;
+    if hidden.dims().is_empty() || *hidden.dims().last().unwrap() != k {
+        bail!(
+            "fused_quant_argmax_cs: hidden shape {:?} incompatible with weight [{v_valid}, {k}]",
+            hidden.dims()
+        );
+    }
+    let m = hidden.elem_count() / k.max(1);
+
+    #[cfg(feature = "rocm")]
+    if let (Device::Rocm(_), crate::quantized::QStorage::Rocm(qr)) = (&dev, qweight.storage()) {
+        let q_sfx = match qr.dtype() {
+            crate::quantized::GgmlDType::Q8_0 => Some("q8_0"),
+            crate::quantized::GgmlDType::Q4_0 => Some("q4_0"),
+            crate::quantized::GgmlDType::Q4K => Some("q4k"),
+            crate::quantized::GgmlDType::Q5K => Some("q5k"),
+            crate::quantized::GgmlDType::Q6K => Some("q6k"),
+            _ => None,
+        };
+        let bs = qr.dtype().block_size();
+        if let Some(q_sfx) = q_sfx {
+            if m <= 8 && k.is_multiple_of(bs) && qweight.device().same_device(&dev) {
+                let esz = dtype.size_in_bytes();
+                let x_c = if hidden.is_contiguous()
+                    && (hidden.layout().start_offset() * esz).is_multiple_of(32)
+                {
+                    hidden.clone()
+                } else {
+                    hidden.force_contiguous()?
+                };
+                let bias_f32 = match bias {
+                    Some(b) => {
+                        if b.dims() != [v_valid] {
+                            bail!("fused_quant_argmax_cs: bias shape {:?} != [{v_valid}]", b.dims());
+                        }
+                        Some(b.to_device(&dev)?.to_dtype(DType::F32)?.contiguous()?)
+                    }
+                    None => None,
+                };
+                let cids_u32 = match core_ids {
+                    Some(c) => {
+                        if c.dims() != [v_valid] {
+                            bail!("fused_quant_argmax_cs: core_ids shape {:?} != [{v_valid}]", c.dims());
+                        }
+                        Some(c.to_device(&dev)?.to_dtype(DType::U32)?.contiguous()?)
+                    }
+                    None => None,
+                };
+                let (mu_f32, w_bound, b_max, check_cs) = match cs_guard {
+                    Some(g) => {
+                        if g.mu_rest.dims() != [k] {
+                            bail!("fused_quant_argmax_cs: mu_rest shape {:?} != [{k}]", g.mu_rest.dims());
+                        }
+                        (
+                            Some(g.mu_rest.to_device(&dev)?.to_dtype(DType::F32)?.contiguous()?),
+                            g.w_rest_bound,
+                            g.b_rest_max,
+                            true,
+                        )
+                    }
+                    None => (None, 0.0f32, 0.0f32, false),
+                };
+
+                let (xs, xl) = x_c.storage_and_layout();
+                let Storage::Rocm(xr) = &*xs else {
+                    unreachable!()
+                };
+                let bg = bias_f32.as_ref().map(|t| t.storage_and_layout());
+                let cg = cids_u32.as_ref().map(|t| t.storage_and_layout());
+                let mg = mu_f32.as_ref().map(|t| t.storage_and_layout());
+                let b_arg = bg.as_ref().map(|(s, l)| match &**s {
+                    Storage::Rocm(c) => (c, l.start_offset()),
+                    _ => unreachable!(),
+                });
+                let c_arg = cg.as_ref().map(|(s, l)| match &**s {
+                    Storage::Rocm(c) => (c, l.start_offset()),
+                    _ => unreachable!(),
+                });
+                let m_arg = mg.as_ref().map(|(s, l)| match &**s {
+                    Storage::Rocm(c) => (c, l.start_offset()),
+                    _ => unreachable!(),
+                });
+                let row_bytes = (k / bs) * qr.dtype().type_size();
+                let (id_s, val_s, res_s) = xr.fused_quant_argmax_cs(
+                    xl.start_offset(),
+                    qr.device_ptr()?,
+                    q_sfx,
+                    row_bytes,
+                    b_arg,
+                    c_arg,
+                    m_arg,
+                    w_bound,
+                    b_max,
+                    check_cs,
+                    m,
+                    v_valid,
+                    k,
+                )?;
+                return Ok(ArgmaxCsOutput {
+                    ids: from_storage(Storage::Rocm(id_s), (m,), BackpropOp::none(), false),
+                    max_vals: Some(from_storage(
+                        Storage::Rocm(val_s),
+                        (m,),
+                        BackpropOp::none(),
+                        false,
+                    )),
+                    rescue_mask: if check_cs {
+                        Some(from_storage(
+                            Storage::Rocm(res_s),
+                            (m,),
+                            BackpropOp::none(),
+                            false,
+                        ))
+                    } else {
+                        None
+                    },
+                });
+            }
+        }
+    }
+
+    let x_2d = hidden.contiguous()?.reshape((m, k))?;
+    let mut sub_logits = qweight.forward_exact(&x_2d)?;
+    if let Some(b) = bias {
+        if b.dims() != [v_valid] {
+            bail!("fused_quant_argmax_cs: bias shape {:?} != [{v_valid}]", b.dims());
+        }
+        let b_dev = b.to_device(&dev)?.to_dtype(sub_logits.dtype())?;
+        sub_logits = sub_logits.broadcast_add(&b_dev.unsqueeze(0)?)?;
+    }
+    logits_argmax_cs(&sub_logits, Some(&x_2d), core_ids, cs_guard)
 }
 
 /// Mode B: 1-Stage Argmax + `core_ids` Remap + Mean-Centered CS Guard directly over
@@ -552,6 +809,60 @@ pub fn logits_argmax_cs(
                 rescue_mask: if check_cs {
                     Some(from_storage(
                         Storage::Rocm(res_s),
+                        (m,),
+                        BackpropOp::none(),
+                        false,
+                    ))
+                } else {
+                    None
+                },
+            })
+        }
+        #[cfg(feature = "vulkan")]
+        Device::Vulkan(vdev) if crate::vulkan_backend::decoder_ops::vk_fused_ready(vdev) => {
+            let (ls, ll) = l_ref.storage_and_layout();
+            let Storage::Vulkan(lv) = &*ls else {
+                unreachable!()
+            };
+            let cg = cids_u32.as_ref().map(|t| t.storage_and_layout());
+            let hg = h_c.as_ref().map(|t| t.storage_and_layout());
+            let mg = mu_f32.as_ref().map(|t| t.storage_and_layout());
+            let c_arg = cg.as_ref().map(|(s, l)| match &**s {
+                Storage::Vulkan(c) => (c, l.start_offset()),
+                _ => unreachable!(),
+            });
+            let h_arg = hg.as_ref().map(|(s, l)| match &**s {
+                Storage::Vulkan(c) => (c, l.start_offset()),
+                _ => unreachable!(),
+            });
+            let m_arg = mg.as_ref().map(|(s, l)| match &**s {
+                Storage::Vulkan(c) => (c, l.start_offset()),
+                _ => unreachable!(),
+            });
+            let (id_s, val_s, res_s) = lv.logits_argmax_cs(
+                ll.start_offset(),
+                l_stride,
+                c_arg,
+                h_arg,
+                m_arg,
+                w_bound,
+                b_max,
+                check_cs,
+                m,
+                v_valid,
+                k,
+            )?;
+            Ok(ArgmaxCsOutput {
+                ids: from_storage(Storage::Vulkan(id_s), (m,), BackpropOp::none(), false),
+                max_vals: Some(from_storage(
+                    Storage::Vulkan(val_s),
+                    (m,),
+                    BackpropOp::none(),
+                    false,
+                )),
+                rescue_mask: if check_cs {
+                    Some(from_storage(
+                        Storage::Vulkan(res_s),
                         (m,),
                         BackpropOp::none(),
                         false,

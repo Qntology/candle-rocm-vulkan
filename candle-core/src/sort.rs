@@ -244,6 +244,107 @@ impl crate::CustomOp1 for ArgSort {
         let dst = crate::MetalStorage::new(dst, device.clone(), el, DType::U32);
         Ok((dst, layout.shape().clone()))
     }
+
+    #[cfg(feature = "rocm")]
+    fn rocm_fwd(
+        &self,
+        storage: &crate::RocmStorage,
+        layout: &crate::Layout,
+    ) -> Result<(crate::RocmStorage, crate::Shape)> {
+        use crate::backend::{BackendDevice, BackendStorage};
+        use crate::rocm_backend::kernels::Module;
+        use crate::rocm_backend::utils::{grid_1d, LaunchArgs};
+        use crate::DType;
+
+        let sfx = match storage.dtype() {
+            DType::F32 => "f32",
+            DType::F64 => "f64",
+            DType::F16 => "f16",
+            DType::BF16 => "bf16",
+            DType::U8 => "u8",
+            DType::U32 => "u32",
+            DType::I16 => "i16",
+            DType::I32 => "i32",
+            DType::I64 => "i64",
+            _ => {
+                let cpu = storage.to_cpu_storage()?;
+                let (out_cpu, shape) = self.cpu_fwd(&cpu, layout)?;
+                let out_rocm = storage.device().storage_from_cpu_storage(&out_cpu)?;
+                return Ok((out_rocm, shape));
+            }
+        };
+        let dev = storage.device();
+        let el = layout.shape().elem_count();
+        let ncols = self.last_dim;
+        if el == 0 || ncols == 0 {
+            let out = dev.alloc(0)?;
+            return Ok((
+                crate::RocmStorage::new(out, DType::U32, dev.clone()),
+                layout.shape().clone(),
+            ));
+        }
+        let nrows = el / ncols;
+        let ncols_pad = next_power_of_2(ncols);
+        let src_owned;
+        let src_ptr = if layout.is_contiguous() {
+            unsafe { storage.device_ptr().add(layout.start_offset() * storage.dtype().size_in_bytes()) }
+        } else {
+            src_owned = storage.contiguous_copy(layout)?;
+            src_owned.device_ptr()
+        };
+        let dir = if self.asc { "asc" } else { "desc" };
+        let dst = dev.alloc(el * 4)?;
+        if ncols_pad <= 2048 {
+            let func = dev.get_func(Module::Sort, &format!("asort_lds_{dir}_{sfx}"))?;
+            let mut args = LaunchArgs::new();
+            args.ptr(src_ptr)
+                .ptr(dst.as_ptr())
+                .usize(nrows)
+                .u32(ncols as u32)
+                .u32(ncols_pad as u32);
+            dev.launch(func, (nrows.min(65535) as u32, 1, 1), (256, 1, 1), 0, &mut args)?;
+        } else {
+            let pad_total = nrows * ncols_pad;
+            let buf = dev.alloc(pad_total * 4)?;
+            let init_fn = dev.get_func(Module::Sort, "asort_init_pad")?;
+            let mut ia = LaunchArgs::new();
+            ia.ptr(buf.as_ptr()).usize(nrows).u32(ncols_pad as u32);
+            dev.launch(init_fn, (grid_1d(pad_total, 256), 1, 1), (256, 1, 1), 0, &mut ia)?;
+
+            let step_fn = dev.get_func(Module::Sort, &format!("asort_step_{dir}_{sfx}"))?;
+            let pairs = nrows * (ncols_pad / 2);
+            let grid_step = grid_1d(pairs, 256);
+            let mut k = 2usize;
+            while k <= ncols_pad {
+                let mut j = k >> 1;
+                while j > 0 {
+                    let mut sa = LaunchArgs::new();
+                    sa.ptr(src_ptr)
+                        .ptr(buf.as_ptr())
+                        .usize(nrows)
+                        .u32(ncols as u32)
+                        .u32(ncols_pad as u32)
+                        .u32(k as u32)
+                        .u32(j as u32);
+                    dev.launch(step_fn, (grid_step, 1, 1), (256, 1, 1), 0, &mut sa)?;
+                    j >>= 1;
+                }
+                k <<= 1;
+            }
+            let copy_fn = dev.get_func(Module::Sort, "asort_copy_out")?;
+            let mut ca = LaunchArgs::new();
+            ca.ptr(buf.as_ptr())
+                .ptr(dst.as_ptr())
+                .usize(nrows)
+                .u32(ncols as u32)
+                .u32(ncols_pad as u32);
+            dev.launch(copy_fn, (grid_1d(el, 256), 1, 1), (256, 1, 1), 0, &mut ca)?;
+        }
+        Ok((
+            crate::RocmStorage::new(dst, DType::U32, dev.clone()),
+            layout.shape().clone(),
+        ))
+    }
 }
 
 #[allow(unused)]

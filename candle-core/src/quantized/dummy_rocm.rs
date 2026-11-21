@@ -1,6 +1,6 @@
 #![allow(unused)]
 use super::GgmlDType;
-use crate::{CpuStorage, Error, Layout, Result, RocmDevice, RocmStorage, Shape};
+use crate::{CpuStorage, DType, Error, Layout, Result, RocmDevice, RocmStorage, Shape};
 
 pub struct QRocmStorage {
     dtype: GgmlDType,
@@ -36,6 +36,10 @@ impl QRocmStorage {
         Err(Error::NotCompiledWithRocmSupport)
     }
 
+    pub fn dequantize_range_to(&self, _: usize, _: usize, _: DType) -> Result<RocmStorage> {
+        Err(Error::NotCompiledWithRocmSupport)
+    }
+
     pub fn quantize(&mut self, _: &RocmStorage) -> Result<()> {
         Err(Error::NotCompiledWithRocmSupport)
     }
@@ -61,6 +65,10 @@ impl QRocmStorage {
     }
 
     pub fn fwd(&self, _: &Shape, _: &RocmStorage, _: &Layout) -> Result<(RocmStorage, Shape)> {
+        Err(Error::NotCompiledWithRocmSupport)
+    }
+
+    pub fn fwd_exact(&self, _: &Shape, _: &RocmStorage, _: &Layout) -> Result<(RocmStorage, Shape)> {
         Err(Error::NotCompiledWithRocmSupport)
     }
 

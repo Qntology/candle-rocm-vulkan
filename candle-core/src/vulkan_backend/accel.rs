@@ -762,6 +762,123 @@ void main() {
 }
 "#;
 
+/// Specialized NVFP4 (mode 3) fast-path TurboQuant attention: decodes 16 FP4 elements per
+/// iteration from two 32-bit code words and one E4M3 scale byte (zero per-element bit-extract
+/// overhead, bit-exact with `TQ_ATTN`).
+const TQ_ATTN_NVFP4: &str = r#"
+layout(set = 0, binding = 0) readonly buffer Qb { float qx[]; };
+layout(set = 0, binding = 1) readonly buffer Kb { uint kd[]; };
+layout(set = 0, binding = 2) readonly buffer Vb { uint vd[]; };
+layout(set = 0, binding = 3) readonly buffer Tb { float tab[]; };
+layout(set = 0, binding = 4) readonly buffer ALb { float alibi[]; };
+layout(set = 0, binding = 5) buffer Ob { float o[]; };
+layout(set = 0, binding = 6) buffer POb { float part_o[]; };
+layout(set = 0, binding = 7) buffer PLb { float part_lse[]; };
+layout(set = 0, binding = 8) readonly buffer Pb { uint prm[]; };
+shared float qr[256];
+shared float pr[128];
+uint kbyte(uint base, uint kb) { return (kd[base + (kb >> 2u)] >> ((kb & 3u) * 8u)) & 0xffu; }
+uint vbyte(uint base, uint kb) { return (vd[base + (kb >> 2u)] >> ((kb & 3u) * 8u)) & 0xffu; }
+float v_nvfp4(uint row, uint j, uint cw) {
+    uint c = (vd[row + (j >> 3u)] >> ((j & 7u) * 4u)) & 0xfu;
+    return fp4_to_f(c) * e4m3_to_f(vbyte(row + cw, j >> 4u));
+}
+void main() {
+    uint t = gl_LocalInvocationID.x;
+    uint split = gl_WorkGroupID.y;
+    uint b = gl_WorkGroupID.z;
+    uint Lq = prm[0]; uint Lk = prm[1]; uint Hq = prm[2]; uint Hkv = prm[3]; uint D = prm[4];
+    uint k_cw = prm[16]; uint k_rsc = prm[17];
+    uint v_cw = prm[20]; uint v_rsc = prm[21];
+    float scale = uintBitsToFloat(prm[22]); float softcap = uintBitsToFloat(prm[23]);
+    int wl = int(prm[24]); int wr = int(prm[25]);
+    uint n_splits = prm[26];
+    uint group = Hq / Hkv;
+    for (uint rowi = gl_WorkGroupID.x; rowi < Lq * Hq; rowi += gl_NumWorkGroups.x) {
+        uint i = rowi / Hq;
+        uint h = rowi % Hq;
+        uint hk = h / group;
+        uint qb = prm[29] + b * prm[5] + h * prm[6] + i * prm[7];
+        barrier();
+        for (uint d = t; d < D; d += 128u) { qr[d] = qx[qb + d]; }
+        barrier();
+        int pos = int(i) + int(Lk) - int(Lq);
+        int lo = 0; int hi = int(Lk);
+        if (wl >= 0) { lo = max(pos - wl, 0); }
+        if (wr >= 0) { hi = min(pos + wr + 1, int(Lk)); }
+        if (lo > int(Lk)) { lo = int(Lk); }
+        if (hi < lo) { hi = lo; }
+        int chunk = (hi - lo + int(n_splits) - 1) / int(n_splits);
+        int s_lo = lo + int(split) * chunk;
+        int s_hi = min(s_lo + chunk, hi);
+        if (s_lo > hi) { s_lo = hi; }
+        if (s_hi < s_lo) { s_hi = s_lo; }
+        float slope = 0.0;
+        if (prm[33] != 0u) { slope = alibi[prm[34] + b * prm[27] + h]; }
+        uint kbase = prm[30] + b * prm[8] + hk * prm[9];
+        uint vbase = prm[31] + b * prm[11] + hk * prm[12];
+        float m = ninf(); float l = 0.0; float acc0 = 0.0; float acc1 = 0.0;
+        uint nblk = D >> 4u;
+        for (int kb = s_lo; kb < s_hi; kb += 128) {
+            int j = kb + int(t);
+            float s = ninf();
+            float vscale = 0.0;
+            if (j < s_hi) {
+                uint kr = kbase + uint(j) * prm[10];
+                float dot = 0.0;
+                for (uint bk = 0u; bk < nblk; bk++) {
+                    float bs = e4m3_to_f(kbyte(kr + k_cw, bk));
+                    uint w0 = kd[kr + bk * 2u];
+                    uint w1 = kd[kr + bk * 2u + 1u];
+                    uint d0 = bk * 16u;
+                    for (uint e = 0u; e < 8u; e++) {
+                        dot += (fp4_to_f((w0 >> (e * 4u)) & 0xfu) * bs) * qr[d0 + e];
+                    }
+                    for (uint e = 0u; e < 8u; e++) {
+                        dot += (fp4_to_f((w1 >> (e * 4u)) & 0xfu) * bs) * qr[d0 + 8u + e];
+                    }
+                }
+                float r0 = uintBitsToFloat(kd[kr + k_rsc]);
+                s = logit((r0 * dot) * scale, softcap, slope, pos - j);
+                vscale = uintBitsToFloat(vd[vbase + uint(j) * prm[13] + v_rsc]);
+            }
+            float m_new = max(m, block_max(s));
+            float p = 0.0;
+            if (s != ninf()) { p = exp(s - m_new); }
+            pr[t] = p * vscale;
+            float lt = block_sum(p);
+            float alpha = 0.0;
+            if (m != ninf()) { alpha = exp(m - m_new); }
+            l = l * alpha + lt;
+            acc0 *= alpha; acc1 *= alpha;
+            int cnt = min(128, s_hi - kb);
+            for (int u = 0; u < cnt; u++) {
+                float pu = pr[u];
+                if (pu != 0.0) {
+                    uint vr = vbase + uint(kb + u) * prm[13];
+                    if (t < D) { acc0 += pu * v_nvfp4(vr, t, v_cw); }
+                    if (t + 128u < D) { acc1 += pu * v_nvfp4(vr, t + 128u, v_cw); }
+                }
+            }
+            m = m_new;
+            barrier();
+        }
+        float inv = 0.0;
+        if (l > 0.0) { inv = 1.0 / l; }
+        uint orow = (b * Hq + h) * Lq + i;
+        if (n_splits == 1u) {
+            if (t < D) { o[orow * D + t] = acc0 * inv; }
+            if (t + 128u < D) { o[orow * D + t + 128u] = acc1 * inv; }
+        } else {
+            uint prow = split * prm[28] + orow;
+            if (t < D) { part_o[prow * D + t] = acc0 * inv; }
+            if (t + 128u < D) { part_o[prow * D + t + 128u] = acc1 * inv; }
+            if (t == 0u) { if (l > 0.0) { part_lse[prow] = m + log(l); } else { part_lse[prow] = ninf(); } }
+        }
+    }
+}
+"#;
+
 fn header() -> String {
     "#version 450\nlayout(local_size_x = 128) in;\n".to_string()
 }
@@ -816,11 +933,9 @@ fn tq_source(body: &str, words: &str) -> String {
     )
 }
 
-/// Params buffer for a dispatch.
+/// Params buffer for a dispatch (fresh upload; does not flush open GPU batches).
 fn params(dev: &VulkanDevice, vals: &[u32]) -> Result<VulkanStorage> {
-    let mut p = dev.alloc_buffer(vals.len(), DType::U32)?;
-    p.as_mut_slice::<u32>()?.copy_from_slice(vals);
-    Ok(p)
+    dev.upload_u32_slice(vals)
 }
 
 fn fits(n: usize) -> Result<u32> {
@@ -1206,9 +1321,16 @@ impl VulkanStorage {
             fits(alibi.map(|(_, o)| o).unwrap_or(0))?,
         ];
         let prm = params(dev, &vals)?;
-        let kern = kernel(dev, "accel_tq_attn", 9, 0, || {
-            format!("{}{}{}{}", header(), COMMON, REDUCE, TQ_ATTN)
-        })?;
+        let use_nvfp4 = a.k.mode == 3 && a.v.mode == 3 && d.is_multiple_of(16);
+        let kern = if use_nvfp4 {
+            kernel(dev, "accel_tq_attn_nvfp4", 9, 0, || {
+                format!("{}{}{}{}", header(), COMMON, REDUCE, TQ_ATTN_NVFP4)
+            })?
+        } else {
+            kernel(dev, "accel_tq_attn", 9, 0, || {
+                format!("{}{}{}{}", header(), COMMON, REDUCE, TQ_ATTN)
+            })?
+        };
         let al = alibi.map(|(s, _)| s).unwrap_or(self);
         let po = part_o.as_ref().unwrap_or(&out);
         let pl = part_lse.as_ref().unwrap_or(&out);
@@ -1268,5 +1390,6 @@ mod tests {
             "data",
         ));
         validate(&format!("{}{}{}{}", header(), COMMON, REDUCE, TQ_ATTN));
+        validate(&format!("{}{}{}{}", header(), COMMON, REDUCE, TQ_ATTN_NVFP4));
     }
 }

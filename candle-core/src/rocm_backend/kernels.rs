@@ -22,6 +22,10 @@ pub enum Module {
     DecoderOps,
     /// Fused lm_head tile argmax + CS guard (`lm_head_argmax.hip`).
     LmHeadArgmax,
+    /// Single-source exact weight-only W8A16, MoE, Quantized Mode A lm_head, and NVFP4/NVFP8 (`w8a16.hip`).
+    W8A16,
+    /// Native GPU bitonic arg_sort_last_dim (`sort.hip`).
+    Sort,
 }
 
 pub const UNARY: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/unary.co"));
@@ -39,6 +43,8 @@ pub const TURBO_QUANT: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/turbo_q
 pub const DELTA_RULE: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/delta_rule.co"));
 pub const DECODER_OPS: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/decoder_ops.co"));
 pub const LM_HEAD_ARGMAX: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/lm_head_argmax.co"));
+pub const W8A16: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/w8a16.co"));
+pub const SORT: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/sort.co"));
 
 /// GPU architectures the embedded code objects were built for.
 pub const COMPILED_ARCHS: &str = env!("CANDLE_ROCM_ARCHS");
@@ -57,7 +63,7 @@ pub fn compiled_for(arch: &str) -> bool {
 }
 
 impl Module {
-    pub const ALL: [Module; 15] = [
+    pub const ALL: [Module; 17] = [
         Module::Unary,
         Module::Binary,
         Module::Cast,
@@ -73,6 +79,8 @@ impl Module {
         Module::DeltaRule,
         Module::DecoderOps,
         Module::LmHeadArgmax,
+        Module::W8A16,
+        Module::Sort,
     ];
 
     pub fn index(self) -> usize {
@@ -96,6 +104,8 @@ impl Module {
             Module::DeltaRule => "delta_rule",
             Module::DecoderOps => "decoder_ops",
             Module::LmHeadArgmax => "lm_head_argmax",
+            Module::W8A16 => "w8a16",
+            Module::Sort => "sort",
         }
     }
 
@@ -116,6 +126,8 @@ impl Module {
             Module::DeltaRule => DELTA_RULE,
             Module::DecoderOps => DECODER_OPS,
             Module::LmHeadArgmax => LM_HEAD_ARGMAX,
+            Module::W8A16 => W8A16,
+            Module::Sort => SORT,
         }
     }
 }

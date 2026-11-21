@@ -175,6 +175,60 @@ impl SplitMix64 {
     }
 }
 
+/// Packed sign bits (`ceil(dim / 32)` words, bit `j` = 1 means `-1.0`, 0 means `+1.0`) matching
+/// the `RotationKind::Hadamard` diagonal in [`rotation_matrix`].
+pub fn hadamard_sign_bits(dim: usize, seed: u64) -> Result<Vec<u32>> {
+    if !dim.is_power_of_two() {
+        bail!("hadamard rotation needs a power of two length, got {dim}")
+    }
+    let mut rng = SplitMix64::new(seed ^ 0x4841_4441_4d41_5244);
+    let mut bits = vec![0u32; dim.div_ceil(32)];
+    for j in 0..dim {
+        if rng.next_u64() & 1 != 0 {
+            bits[j >> 5] |= 1u32 << (j & 31);
+        }
+    }
+    Ok(bits)
+}
+
+/// In-place `O(d log d)` Fast Walsh-Hadamard rotation matching [`rotation_matrix`]:
+/// - `forward == true`: `y = (H * (signs ⊙ x)) / sqrt(d)` (matches `x @ Π^T`)
+/// - `forward == false`: `z = signs ⊙ (H * y) / sqrt(d)` (matches `y @ Π`)
+pub fn fwht_f32_inplace(buf: &mut [f32], sign_bits: &[u32], forward: bool) {
+    let d = buf.len();
+    debug_assert!(d.is_power_of_two());
+    let inv_sqrt_d = 1.0f32 / (d as f32).sqrt();
+    if forward {
+        for (j, v) in buf.iter_mut().enumerate() {
+            let neg = (sign_bits[j >> 5] >> (j & 31)) & 1 != 0;
+            *v = if neg { -*v } else { *v } * inv_sqrt_d;
+        }
+    }
+    let mut h = 1usize;
+    while h < d {
+        let step = h << 1;
+        let mut base = 0usize;
+        while base < d {
+            for k in 0..h {
+                let i0 = base + k;
+                let i1 = i0 + h;
+                let a = buf[i0];
+                let b = buf[i1];
+                buf[i0] = a + b;
+                buf[i1] = a - b;
+            }
+            base += step;
+        }
+        h = step;
+    }
+    if !forward {
+        for (j, v) in buf.iter_mut().enumerate() {
+            let neg = (sign_bits[j >> 5] >> (j & 31)) & 1 != 0;
+            *v = if neg { -*v } else { *v } * inv_sqrt_d;
+        }
+    }
+}
+
 /// Row-major `dim x dim` orthogonal matrix `Π` (forward rotation `y = Π x`).
 /// `kind` must be resolved (see [`RotationKind::resolve`]); `None` gives the identity.
 pub fn rotation_matrix(dim: usize, kind: RotationKind, seed: u64) -> Result<Vec<f32>> {
@@ -529,25 +583,66 @@ pub struct TqAttnArgs {
     pub alibi_bstride: usize,
 }
 
-/// Kernel of a `tq_attn` call: the FP8 specialization when keys and values are both per-vector
-/// FP8 rows (bit-identical results to the generic kernel; switched off with
+/// Kernel of a `tq_attn` call: specialized fast paths for `(FP8, FP8)`, `(NVFP4, NVFP4)`, and
+/// `(NVFP4, FP8)` rows (bit-identical results to the generic kernel; switched off with
 /// `TurboQuantOptions::fp8_fast_path` / `CANDLE_TURBO_QUANT_FP8_FAST=0`), the `tq_attnp*`
 /// variants for paged block tables, `tq_attng{G}*` / `tq_attnpg{G}*` when `group` > 1 query
 /// heads share a workgroup (see [`tq_attn_group`]).
 pub fn tq_attn_kernel(k: &TqSide, v: &TqSide, paged: bool, group: usize) -> String {
     use super::formats::mode;
-    let fp8 = k.mode == mode::FP8 && v.mode == mode::FP8 && super::config().turbo_quant.fp8_fast_path;
     let base = match (paged, group > 1) {
         (false, false) => "tq_attn".to_string(),
         (true, false) => "tq_attnp".to_string(),
         (false, true) => format!("tq_attng{group}"),
         (true, true) => format!("tq_attnpg{group}"),
     };
-    if fp8 {
-        base + "_fp8"
-    } else {
-        base
+    if !super::config().turbo_quant.fp8_fast_path {
+        return base;
     }
+    match (k.mode, v.mode) {
+        (mode::FP8, mode::FP8) => base + "_fp8",
+        (mode::NVFP4, mode::NVFP4) => base + "_nvfp4",
+        (mode::NVFP4, mode::FP8) => base + "_nvfp4_fp8",
+        _ => base,
+    }
+}
+
+/// Shared memory bytes of `tq_tile*` for head dim `d` and tile `(br, bc)`.
+pub fn tq_tile_smem_bytes(d: usize, br: usize, bc: usize) -> usize {
+    super::attention::tile_smem_bytes(d, br, bc) + 32 * 4
+}
+
+/// Launch plan for cooperative tiled prefill (`tq_tile*` / `tq_tilep*`) when `lq > FA_DECODE_MAX_Q`
+/// and keys are non-`TurboProd`. Returns `(kernel_name, br, bc, smem_bytes)` when eligible.
+pub fn tq_tile_launch(
+    args: &TqAttnArgs,
+    version: super::config::FlashAttnVersion,
+    max_smem: usize,
+    paged: bool,
+) -> Option<(String, usize, usize, usize)> {
+    use super::attention::{tile_config, FA_DECODE_MAX_Q, FA_MAX_HEAD_DIM};
+    use super::config::FlashAttnVersion;
+    use super::formats::mode;
+    if args.lq <= FA_DECODE_MAX_Q
+        || args.d > FA_MAX_HEAD_DIM
+        || args.k.mode == mode::TURBO_PROD
+        || version == FlashAttnVersion::V1
+    {
+        return None;
+    }
+    for v in [version, FlashAttnVersion::V2] {
+        let (dmax, br, bc) = tile_config(v, args.d);
+        let smem = tq_tile_smem_bytes(args.d, br, bc);
+        if smem <= max_smem {
+            let vn = match v {
+                FlashAttnVersion::V3 => 3,
+                _ => 2,
+            };
+            let prefix = if paged { "tq_tilep" } else { "tq_tile" };
+            return Some((format!("{prefix}{vn}_d{dmax}"), br, bc, smem));
+        }
+    }
+    None
 }
 
 /// Query heads per workgroup of the CUDA / ROCm `tq_attn*` kernels: the GQA packing of

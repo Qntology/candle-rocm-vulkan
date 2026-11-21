@@ -28,12 +28,13 @@ use ash::vk;
 use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock};
 
-const MAX_BINDINGS: u32 = 8;
-pub(crate) const MAX_SETS: u32 = 32;
+const MAX_BINDINGS: u32 = 16;
+pub(crate) const MAX_SETS: u32 = 512;
 const MAX_RANK: usize = 6;
 const WG: u32 = 256;
 
 static NATIVE_EXEC: AtomicUsize = AtomicUsize::new(0);
+static SUBMIT_COUNT: AtomicUsize = AtomicUsize::new(0);
 static NATIVE_OVERRIDE: AtomicU8 = AtomicU8::new(0);
 static MIN_ELEMS_OVERRIDE: AtomicUsize = AtomicUsize::new(usize::MAX);
 static MIN_FLOPS_OVERRIDE: AtomicUsize = AtomicUsize::new(usize::MAX);
@@ -170,6 +171,40 @@ pub fn native_enabled(dev: &VulkanDevice) -> bool {
 pub fn native_exec_count() -> usize {
     NATIVE_EXEC.load(Ordering::Relaxed)
 }
+
+/// Number of `vkQueueSubmit` flushes so far (diagnostic counter for async batching).
+pub fn submit_count() -> usize {
+    SUBMIT_COUNT.load(Ordering::Relaxed)
+}
+
+fn sync_submit_enabled() -> bool {
+    static FLAG: OnceLock<bool> = OnceLock::new();
+    *FLAG.get_or_init(|| env_flag(&["CANDLE_VULKAN_SYNC_SUBMIT"]).unwrap_or(false))
+}
+
+/// Shared GLSL helpers for packed 16-bit (F16 / BF16) reads and race-free paired writes.
+pub(crate) const GLSL_PACK16_HELPERS: &str = r#"
+float ld_f16(uint w, uint idx) {
+    vec2 h = unpackHalf2x16(w);
+    return ((idx & 1u) == 0u) ? h.x : h.y;
+}
+float ld_bf16(uint w, uint idx) {
+    uint bits = ((idx & 1u) == 0u) ? (w << 16u) : (w & 0xffff0000u);
+    return uintBitsToFloat(bits);
+}
+uint f32_to_bf16_u16(float x) {
+    uint bits = floatBitsToUint(x);
+    if ((bits & 0x7fffffffu) > 0x7f800000u) {
+        return (bits >> 16u) | 0x0040u;
+    }
+    uint lsb = (bits >> 16u) & 1u;
+    uint rounded = bits + 0x7fffu + lsb;
+    return rounded >> 16u;
+}
+uint pack_bf16x2(float a, float b) {
+    return f32_to_bf16_u16(a) | (f32_to_bf16_u16(b) << 16u);
+}
+"#;
 
 fn log_fallback(op: &str, err: &Error) {
     if debug_enabled() {
@@ -386,15 +421,22 @@ pub(crate) fn kernel(
 
 /// Reusable command buffer, descriptor pool and fence. Guarded by the
 /// context's `exec` mutex, which also serializes access to the queue.
+///
+/// Dispatches are recorded lazily into `cmd` with compute/transfer pipeline
+/// barriers between consecutive ops, and flushed in a single `vkQueueSubmit`
+/// on host readback (`VulkanStorage::ensure_host_visible`), `synchronize()`,
+/// `run_ops_sync`, or when the batch reaches `MAX_SETS` dispatches.
 pub(crate) struct ExecState {
     pool: vk::CommandPool,
     cmd: vk::CommandBuffer,
     desc_pool: vk::DescriptorPool,
     fence: vk::Fence,
+    recording: bool,
+    recorded_dispatches: u32,
 }
 
 impl ExecState {
-    pub(crate) fn new(device: &ash::Device, queue_family: u32) -> Result<Self> {
+    pub(crate) fn new(device: &ash::Device, queue_family: u32, max_bindings: u32) -> Result<Self> {
         let err = |what: &str, e: vk::Result| Error::Msg(format!("vulkan {what} failed: {e:?}"));
         let pool = unsafe {
             device.create_command_pool(
@@ -419,9 +461,10 @@ impl ExecState {
                 return Err(err("allocate_command_buffers", e));
             }
         };
+        let bindings_per_set = max_bindings.clamp(8, MAX_BINDINGS);
         let sizes = [vk::DescriptorPoolSize {
             ty: vk::DescriptorType::STORAGE_BUFFER,
-            descriptor_count: MAX_BINDINGS * MAX_SETS,
+            descriptor_count: bindings_per_set * MAX_SETS,
         }];
         let desc_pool = match unsafe {
             device.create_descriptor_pool(
@@ -452,6 +495,8 @@ impl ExecState {
             cmd,
             desc_pool,
             fence,
+            recording: false,
+            recorded_dispatches: 0,
         })
     }
 
@@ -464,340 +509,66 @@ impl ExecState {
     }
 }
 
-/// Records and runs one dispatch of `k` over `buffers` and waits for it.
-pub(crate) fn run(
-    dev: &VulkanDevice,
-    k: &Kernel,
-    buffers: &[&VulkanStorage],
-    push: &[u8],
-    groups: [u32; 3],
-) -> Result<()> {
-    if buffers.len() as u32 != k.bindings || push.len() as u32 != k.push_size {
-        crate::bail!("vulkan dispatch: binding/push constant mismatch")
+fn emit_gpu_barrier(d: &ash::Device, cmd: vk::CommandBuffer) {
+    let all_writes = vk::AccessFlags::SHADER_WRITE | vk::AccessFlags::TRANSFER_WRITE;
+    let all_stages = vk::PipelineStageFlags::COMPUTE_SHADER | vk::PipelineStageFlags::TRANSFER;
+    let b = [vk::MemoryBarrier::default()
+        .src_access_mask(all_writes)
+        .dst_access_mask(
+            vk::AccessFlags::SHADER_READ
+                | vk::AccessFlags::SHADER_WRITE
+                | vk::AccessFlags::TRANSFER_READ
+                | vk::AccessFlags::TRANSFER_WRITE,
+        )];
+    unsafe {
+        d.cmd_pipeline_barrier(
+            cmd,
+            all_stages,
+            all_stages,
+            vk::DependencyFlags::empty(),
+            &b,
+            &[],
+            &[],
+        );
     }
-    let limits = dev.limits();
-    if push.len() as u32 > limits.max_push_constants_size {
-        crate::bail!(
-            "vulkan dispatch: {} bytes of push constants exceed the device limit",
-            push.len()
-        )
-    }
-    for (i, g) in groups.iter().enumerate() {
-        if *g == 0 {
-            return Ok(());
-        }
-        if *g > limits.max_workgroup_count[i] {
-            crate::bail!("vulkan dispatch: {g} workgroups exceed the device limit on axis {i}")
-        }
-    }
-    for b in buffers {
-        if b.capacity_bytes as u64 > limits.max_storage_buffer_range {
-            crate::bail!(
-                "vulkan dispatch: buffer of {} bytes exceeds maxStorageBufferRange",
-                b.capacity_bytes
-            )
-        }
-    }
-    let ctx = dev.ctx();
+}
+
+fn begin_batch_locked(dev: &VulkanDevice, exec: &mut ExecState) -> Result<()> {
     let d = dev.device();
-    let exec = ctx
-        .exec
-        .lock()
-        .map_err(|_| Error::Msg("vulkan: exec state poisoned".into()))?;
+    let ctx = dev.ctx();
     unsafe {
         d.reset_descriptor_pool(exec.desc_pool, vk::DescriptorPoolResetFlags::empty())
             .map_err(|e| vk_err(dev, "reset_descriptor_pool", e))?;
-        let set_layouts = [k.set_layout];
-        let set = d
-            .allocate_descriptor_sets(
-                &vk::DescriptorSetAllocateInfo::default()
-                    .descriptor_pool(exec.desc_pool)
-                    .set_layouts(&set_layouts),
-            )
-            .map_err(|e| vk_err(dev, "allocate_descriptor_sets", e))?[0];
-        let infos: Vec<[vk::DescriptorBufferInfo; 1]> = buffers
-            .iter()
-            .map(|b| {
-                [vk::DescriptorBufferInfo {
-                    buffer: b.buffer,
-                    offset: 0,
-                    range: (b.capacity_bytes.max(4).div_ceil(4) * 4) as vk::DeviceSize,
-                }]
-            })
-            .collect();
-        let writes: Vec<_> = infos
-            .iter()
-            .enumerate()
-            .map(|(i, info)| {
-                vk::WriteDescriptorSet::default()
-                    .dst_set(set)
-                    .dst_binding(i as u32)
-                    .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
-                    .buffer_info(info)
-            })
-            .collect();
-        d.update_descriptor_sets(&writes, &[]);
-
-        let cmd = exec.cmd;
-        d.reset_command_buffer(cmd, vk::CommandBufferResetFlags::empty())
+        d.reset_command_buffer(exec.cmd, vk::CommandBufferResetFlags::empty())
             .map_err(|e| vk_err(dev, "reset_command_buffer", e))?;
         d.begin_command_buffer(
-            cmd,
+            exec.cmd,
             &vk::CommandBufferBeginInfo::default()
                 .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT),
         )
         .map_err(|e| vk_err(dev, "begin_command_buffer", e))?;
-        d.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::COMPUTE, k.pipeline);
-        d.cmd_bind_descriptor_sets(
-            cmd,
-            vk::PipelineBindPoint::COMPUTE,
-            k.layout,
-            0,
-            &[set],
-            &[],
-        );
-        if !push.is_empty() {
-            d.cmd_push_constants(cmd, k.layout, vk::ShaderStageFlags::COMPUTE, 0, push);
-        }
-        d.cmd_dispatch(cmd, groups[0], groups[1], groups[2]);
-        let barrier = [vk::MemoryBarrier::default()
-            .src_access_mask(vk::AccessFlags::SHADER_WRITE)
-            .dst_access_mask(vk::AccessFlags::HOST_READ | vk::AccessFlags::HOST_WRITE)];
-        d.cmd_pipeline_barrier(
-            cmd,
-            vk::PipelineStageFlags::COMPUTE_SHADER,
-            vk::PipelineStageFlags::HOST,
-            vk::DependencyFlags::empty(),
-            &barrier,
-            &[],
-            &[],
-        );
-        d.end_command_buffer(cmd)
-            .map_err(|e| vk_err(dev, "end_command_buffer", e))?;
-        let cmds = [cmd];
-        let submit = [vk::SubmitInfo::default().command_buffers(&cmds)];
-        d.queue_submit(ctx.queue, &submit, exec.fence)
-            .map_err(|e| vk_err(dev, "queue_submit", e))?;
-        let mut done = false;
-        let spin = spin_us();
-        if spin > 0 {
-            let t0 = std::time::Instant::now();
-            while t0.elapsed().as_micros() < spin as u128 {
-                match d.get_fence_status(exec.fence) {
-                    Ok(true) => {
-                        done = true;
-                        break;
-                    }
-                    Ok(false) => std::hint::spin_loop(),
-                    Err(_) => break,
-                }
-            }
-        }
-        let wait = if done {
-            Ok(())
-        } else {
-            d.wait_for_fences(&[exec.fence], true, u64::MAX)
-        };
-        let reset = d.reset_fences(&[exec.fence]);
-        wait.map_err(|e| vk_err(dev, "wait_for_fences", e))?;
-        reset.map_err(|e| vk_err(dev, "reset_fences", e))?;
     }
-    NATIVE_EXEC.fetch_add(1, Ordering::Relaxed);
+    exec.recording = true;
+    exec.recorded_dispatches = 0;
+    ctx.has_pending_gpu_work.store(true, Ordering::Release);
     Ok(())
 }
 
-#[derive(Clone, Copy, Debug)]
-pub(crate) struct Bind {
-    pub(crate) buffer: vk::Buffer,
-    pub(crate) offset: u64,
-    pub(crate) range: u64,
-}
-
-pub(crate) enum Op<'a> {
-    Copy {
-        src: vk::Buffer,
-        src_off: u64,
-        dst: vk::Buffer,
-        dst_off: u64,
-        size: u64,
-    },
-    Dispatch {
-        kernel: &'a Kernel,
-        binds: Vec<Bind>,
-        push: Vec<u8>,
-        groups: [u32; 3],
-    },
-    Barrier,
-}
-
-fn spin_us() -> u64 {
-    static V: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
-    *V.get_or_init(|| {
-        std::env::var("CANDLE_VULKAN_SPIN_US")
-            .ok()
-            .and_then(|v| v.trim().parse::<u64>().ok())
-            .unwrap_or(1000)
-    })
-}
-
-pub(crate) fn run_ops(dev: &VulkanDevice, ops: &[Op<'_>]) -> Result<()> {
-    let limits = dev.limits();
-    let mut dispatches = 0u32;
-    for op in ops {
-        if let Op::Dispatch {
-            kernel,
-            binds,
-            push,
-            groups,
-        } = op
-        {
-            dispatches += 1;
-            if binds.len() as u32 != kernel.bindings || push.len() as u32 != kernel.push_size {
-                crate::bail!("vulkan dispatch: binding/push constant mismatch")
-            }
-            if push.len() as u32 > limits.max_push_constants_size {
-                crate::bail!("vulkan dispatch: push constants exceed the device limit")
-            }
-            for (i, g) in groups.iter().enumerate() {
-                if *g == 0 || *g > limits.max_workgroup_count[i] {
-                    crate::bail!("vulkan dispatch: {g} workgroups on axis {i} out of range")
-                }
-            }
-            for b in binds {
-                if b.range == 0 || b.range > limits.max_storage_buffer_range {
-                    crate::bail!(
-                        "vulkan dispatch: binding of {} bytes outside maxStorageBufferRange",
-                        b.range
-                    )
-                }
-            }
-        }
-    }
-    if dispatches > MAX_SETS {
-        crate::bail!("vulkan run_ops: {dispatches} dispatches exceed {MAX_SETS} per submission")
-    }
-    if ops.is_empty() {
-        return Ok(());
+fn flush_locked(dev: &VulkanDevice, exec: &mut ExecState) -> Result<bool> {
+    if !exec.recording {
+        dev.ctx()
+            .has_pending_gpu_work
+            .store(false, Ordering::Release);
+        return Ok(false);
     }
     let ctx = dev.ctx();
     let d = dev.device();
-    let exec = ctx
-        .exec
-        .lock()
-        .map_err(|_| Error::Msg("vulkan: exec state poisoned".into()))?;
+    let cmd = exec.cmd;
     let all_writes = vk::AccessFlags::SHADER_WRITE | vk::AccessFlags::TRANSFER_WRITE;
     let all_stages = vk::PipelineStageFlags::COMPUTE_SHADER | vk::PipelineStageFlags::TRANSFER;
-    unsafe {
-        d.reset_descriptor_pool(exec.desc_pool, vk::DescriptorPoolResetFlags::empty())
-            .map_err(|e| vk_err(dev, "reset_descriptor_pool", e))?;
-        let cmd = exec.cmd;
-        d.reset_command_buffer(cmd, vk::CommandBufferResetFlags::empty())
-            .map_err(|e| vk_err(dev, "reset_command_buffer", e))?;
-        d.begin_command_buffer(
-            cmd,
-            &vk::CommandBufferBeginInfo::default()
-                .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT),
-        )
-        .map_err(|e| vk_err(dev, "begin_command_buffer", e))?;
-        for op in ops {
-            match op {
-                Op::Copy {
-                    src,
-                    src_off,
-                    dst,
-                    dst_off,
-                    size,
-                } => {
-                    if *size > 0 {
-                        d.cmd_copy_buffer(
-                            cmd,
-                            *src,
-                            *dst,
-                            &[vk::BufferCopy {
-                                src_offset: *src_off,
-                                dst_offset: *dst_off,
-                                size: *size,
-                            }],
-                        );
-                    }
-                }
-                Op::Barrier => {
-                    let b = [vk::MemoryBarrier::default()
-                        .src_access_mask(all_writes)
-                        .dst_access_mask(
-                            vk::AccessFlags::SHADER_READ
-                                | vk::AccessFlags::SHADER_WRITE
-                                | vk::AccessFlags::TRANSFER_READ
-                                | vk::AccessFlags::TRANSFER_WRITE,
-                        )];
-                    d.cmd_pipeline_barrier(
-                        cmd,
-                        all_stages,
-                        all_stages,
-                        vk::DependencyFlags::empty(),
-                        &b,
-                        &[],
-                        &[],
-                    );
-                }
-                Op::Dispatch {
-                    kernel,
-                    binds,
-                    push,
-                    groups,
-                } => {
-                    let set_layouts = [kernel.set_layout];
-                    let set = d
-                        .allocate_descriptor_sets(
-                            &vk::DescriptorSetAllocateInfo::default()
-                                .descriptor_pool(exec.desc_pool)
-                                .set_layouts(&set_layouts),
-                        )
-                        .map_err(|e| vk_err(dev, "allocate_descriptor_sets", e))?[0];
-                    let infos: Vec<[vk::DescriptorBufferInfo; 1]> = binds
-                        .iter()
-                        .map(|b| {
-                            [vk::DescriptorBufferInfo {
-                                buffer: b.buffer,
-                                offset: b.offset,
-                                range: b.range,
-                            }]
-                        })
-                        .collect();
-                    let writes: Vec<_> = infos
-                        .iter()
-                        .enumerate()
-                        .map(|(i, info)| {
-                            vk::WriteDescriptorSet::default()
-                                .dst_set(set)
-                                .dst_binding(i as u32)
-                                .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
-                                .buffer_info(info)
-                        })
-                        .collect();
-                    d.update_descriptor_sets(&writes, &[]);
-                    d.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::COMPUTE, kernel.pipeline);
-                    d.cmd_bind_descriptor_sets(
-                        cmd,
-                        vk::PipelineBindPoint::COMPUTE,
-                        kernel.layout,
-                        0,
-                        &[set],
-                        &[],
-                    );
-                    if !push.is_empty() {
-                        d.cmd_push_constants(
-                            cmd,
-                            kernel.layout,
-                            vk::ShaderStageFlags::COMPUTE,
-                            0,
-                            push,
-                        );
-                    }
-                    d.cmd_dispatch(cmd, groups[0], groups[1], groups[2]);
-                }
-            }
-        }
+    exec.recording = false;
+    exec.recorded_dispatches = 0;
+    let res = unsafe {
         let host = [vk::MemoryBarrier::default()
             .src_access_mask(all_writes)
             .dst_access_mask(vk::AccessFlags::HOST_READ | vk::AccessFlags::HOST_WRITE)];
@@ -839,12 +610,355 @@ pub(crate) fn run_ops(dev: &VulkanDevice, ops: &[Op<'_>]) -> Result<()> {
         let reset = d.reset_fences(&[exec.fence]);
         wait.map_err(|e| vk_err(dev, "wait_for_fences", e))?;
         reset.map_err(|e| vk_err(dev, "reset_fences", e))?;
+        Ok(())
+    };
+    ctx.has_pending_gpu_work.store(false, Ordering::Release);
+    SUBMIT_COUNT.fetch_add(1, Ordering::Relaxed);
+    res.map(|()| true)
+}
+
+/// Submits any lazily recorded dispatches and waits for the fence to complete,
+/// then recycles any storages dropped while the batch was pending.
+pub(crate) fn flush(dev: &VulkanDevice) -> Result<()> {
+    let ctx = dev.ctx();
+    if !ctx.has_pending_gpu_work.load(Ordering::Acquire) {
+        return Ok(());
     }
-    NATIVE_EXEC.fetch_add(dispatches as usize, Ordering::Relaxed);
+    let flushed = {
+        let mut exec = ctx
+            .exec
+            .lock()
+            .map_err(|_| Error::Msg("vulkan: exec state poisoned".into()))?;
+        flush_locked(dev, &mut exec)?
+    };
+    if flushed {
+        ctx.drain_deferred_returns();
+    }
     Ok(())
 }
 
+/// Records one dispatch of `k` over `buffers` into the active command batch.
+/// Flushes automatically on batch overflow, host readback, or `CANDLE_VULKAN_SYNC_SUBMIT=1`.
+pub(crate) fn run(
+    dev: &VulkanDevice,
+    k: &Kernel,
+    buffers: &[&VulkanStorage],
+    push: &[u8],
+    groups: [u32; 3],
+) -> Result<()> {
+    if buffers.len() as u32 != k.bindings || push.len() as u32 != k.push_size {
+        crate::bail!("vulkan dispatch: binding/push constant mismatch")
+    }
+    let limits = dev.limits();
+    if k.bindings > limits.max_storage_bindings {
+        crate::bail!(
+            "vulkan dispatch: {} bindings exceed max_storage_bindings ({})",
+            k.bindings,
+            limits.max_storage_bindings
+        )
+    }
+    if push.len() as u32 > limits.max_push_constants_size {
+        crate::bail!(
+            "vulkan dispatch: {} bytes of push constants exceed the device limit",
+            push.len()
+        )
+    }
+    for (i, g) in groups.iter().enumerate() {
+        if *g == 0 {
+            return Ok(());
+        }
+        if *g > limits.max_workgroup_count[i] {
+            crate::bail!("vulkan dispatch: {g} workgroups exceed the device limit on axis {i}")
+        }
+    }
+    for b in buffers {
+        if b.capacity_bytes as u64 > limits.max_storage_buffer_range {
+            crate::bail!(
+                "vulkan dispatch: buffer of {} bytes exceeds maxStorageBufferRange",
+                b.capacity_bytes
+            )
+        }
+    }
+    let ctx = dev.ctx();
+    let d = dev.device();
+    let mut drained = false;
+    {
+        let mut exec = ctx
+            .exec
+            .lock()
+            .map_err(|_| Error::Msg("vulkan: exec state poisoned".into()))?;
+        if exec.recording && exec.recorded_dispatches >= MAX_SETS {
+            drained |= flush_locked(dev, &mut exec)?;
+        }
+        if !exec.recording {
+            begin_batch_locked(dev, &mut exec)?;
+        } else {
+            emit_gpu_barrier(d, exec.cmd);
+        }
+        unsafe {
+            let set_layouts = [k.set_layout];
+            let set = d
+                .allocate_descriptor_sets(
+                    &vk::DescriptorSetAllocateInfo::default()
+                        .descriptor_pool(exec.desc_pool)
+                        .set_layouts(&set_layouts),
+                )
+                .map_err(|e| vk_err(dev, "allocate_descriptor_sets", e))?[0];
+            let infos: Vec<[vk::DescriptorBufferInfo; 1]> = buffers
+                .iter()
+                .map(|b| {
+                    [vk::DescriptorBufferInfo {
+                        buffer: b.buffer,
+                        offset: 0,
+                        range: (b.capacity_bytes.max(4).div_ceil(4) * 4) as vk::DeviceSize,
+                    }]
+                })
+                .collect();
+            let writes: Vec<_> = infos
+                .iter()
+                .enumerate()
+                .map(|(i, info)| {
+                    vk::WriteDescriptorSet::default()
+                        .dst_set(set)
+                        .dst_binding(i as u32)
+                        .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                        .buffer_info(info)
+                })
+                .collect();
+            d.update_descriptor_sets(&writes, &[]);
+
+            let cmd = exec.cmd;
+            d.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::COMPUTE, k.pipeline);
+            d.cmd_bind_descriptor_sets(
+                cmd,
+                vk::PipelineBindPoint::COMPUTE,
+                k.layout,
+                0,
+                &[set],
+                &[],
+            );
+            if !push.is_empty() {
+                d.cmd_push_constants(cmd, k.layout, vk::ShaderStageFlags::COMPUTE, 0, push);
+            }
+            d.cmd_dispatch(cmd, groups[0], groups[1], groups[2]);
+        }
+        exec.recorded_dispatches += 1;
+        NATIVE_EXEC.fetch_add(1, Ordering::Relaxed);
+        if sync_submit_enabled() {
+            drained |= flush_locked(dev, &mut exec)?;
+        }
+    }
+    if drained {
+        ctx.drain_deferred_returns();
+    }
+    Ok(())
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct Bind {
+    pub(crate) buffer: vk::Buffer,
+    pub(crate) offset: u64,
+    pub(crate) range: u64,
+}
+
+pub(crate) enum Op<'a> {
+    Copy {
+        src: vk::Buffer,
+        src_off: u64,
+        dst: vk::Buffer,
+        dst_off: u64,
+        size: u64,
+    },
+    Dispatch {
+        kernel: &'a Kernel,
+        binds: Vec<Bind>,
+        push: Vec<u8>,
+        groups: [u32; 3],
+    },
+    Barrier,
+}
+
+fn spin_us() -> u64 {
+    static V: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *V.get_or_init(|| {
+        std::env::var("CANDLE_VULKAN_SPIN_US")
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .unwrap_or(1000)
+    })
+}
+
+fn record_ops(dev: &VulkanDevice, ops: &[Op<'_>], force_flush: bool) -> Result<()> {
+    let limits = dev.limits();
+    let mut dispatches = 0u32;
+    for op in ops {
+        if let Op::Dispatch {
+            kernel,
+            binds,
+            push,
+            groups,
+        } = op
+        {
+            dispatches += 1;
+            if binds.len() as u32 != kernel.bindings || push.len() as u32 != kernel.push_size {
+                crate::bail!("vulkan dispatch: binding/push constant mismatch")
+            }
+            if kernel.bindings > limits.max_storage_bindings {
+                crate::bail!(
+                    "vulkan dispatch: {} bindings exceed max_storage_bindings ({})",
+                    kernel.bindings,
+                    limits.max_storage_bindings
+                )
+            }
+            if push.len() as u32 > limits.max_push_constants_size {
+                crate::bail!("vulkan dispatch: push constants exceed the device limit")
+            }
+            for (i, g) in groups.iter().enumerate() {
+                if *g == 0 || *g > limits.max_workgroup_count[i] {
+                    crate::bail!("vulkan dispatch: {g} workgroups on axis {i} out of range")
+                }
+            }
+            for b in binds {
+                if b.range == 0 || b.range > limits.max_storage_buffer_range {
+                    crate::bail!(
+                        "vulkan dispatch: binding of {} bytes outside maxStorageBufferRange",
+                        b.range
+                    )
+                }
+            }
+        }
+    }
+    if dispatches > MAX_SETS {
+        crate::bail!("vulkan run_ops: {dispatches} dispatches exceed {MAX_SETS} per submission")
+    }
+    if ops.is_empty() {
+        return if force_flush { flush(dev) } else { Ok(()) };
+    }
+    let ctx = dev.ctx();
+    let d = dev.device();
+    let mut drained = false;
+    {
+        let mut exec = ctx
+            .exec
+            .lock()
+            .map_err(|_| Error::Msg("vulkan: exec state poisoned".into()))?;
+        if exec.recording && exec.recorded_dispatches.saturating_add(dispatches) > MAX_SETS {
+            drained |= flush_locked(dev, &mut exec)?;
+        }
+        if !exec.recording {
+            begin_batch_locked(dev, &mut exec)?;
+        } else {
+            emit_gpu_barrier(d, exec.cmd);
+        }
+        let cmd = exec.cmd;
+        unsafe {
+            for op in ops {
+                match op {
+                    Op::Copy {
+                        src,
+                        src_off,
+                        dst,
+                        dst_off,
+                        size,
+                    } => {
+                        if *size > 0 {
+                            d.cmd_copy_buffer(
+                                cmd,
+                                *src,
+                                *dst,
+                                &[vk::BufferCopy {
+                                    src_offset: *src_off,
+                                    dst_offset: *dst_off,
+                                    size: *size,
+                                }],
+                            );
+                        }
+                    }
+                    Op::Barrier => emit_gpu_barrier(d, cmd),
+                    Op::Dispatch {
+                        kernel,
+                        binds,
+                        push,
+                        groups,
+                    } => {
+                        let set_layouts = [kernel.set_layout];
+                        let set = d
+                            .allocate_descriptor_sets(
+                                &vk::DescriptorSetAllocateInfo::default()
+                                    .descriptor_pool(exec.desc_pool)
+                                    .set_layouts(&set_layouts),
+                            )
+                            .map_err(|e| vk_err(dev, "allocate_descriptor_sets", e))?[0];
+                        let infos: Vec<[vk::DescriptorBufferInfo; 1]> = binds
+                            .iter()
+                            .map(|b| {
+                                [vk::DescriptorBufferInfo {
+                                    buffer: b.buffer,
+                                    offset: b.offset,
+                                    range: b.range,
+                                }]
+                            })
+                            .collect();
+                        let writes: Vec<_> = infos
+                            .iter()
+                            .enumerate()
+                            .map(|(i, info)| {
+                                vk::WriteDescriptorSet::default()
+                                    .dst_set(set)
+                                    .dst_binding(i as u32)
+                                    .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                                    .buffer_info(info)
+                            })
+                            .collect();
+                        d.update_descriptor_sets(&writes, &[]);
+                        d.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::COMPUTE, kernel.pipeline);
+                        d.cmd_bind_descriptor_sets(
+                            cmd,
+                            vk::PipelineBindPoint::COMPUTE,
+                            kernel.layout,
+                            0,
+                            &[set],
+                            &[],
+                        );
+                        if !push.is_empty() {
+                            d.cmd_push_constants(
+                                cmd,
+                                kernel.layout,
+                                vk::ShaderStageFlags::COMPUTE,
+                                0,
+                                push,
+                            );
+                        }
+                        d.cmd_dispatch(cmd, groups[0], groups[1], groups[2]);
+                    }
+                }
+            }
+        }
+        exec.recorded_dispatches += dispatches;
+        NATIVE_EXEC.fetch_add(dispatches as usize, Ordering::Relaxed);
+        if force_flush || sync_submit_enabled() {
+            drained |= flush_locked(dev, &mut exec)?;
+        }
+    }
+    if drained {
+        ctx.drain_deferred_returns();
+    }
+    Ok(())
+}
+
+/// Records `ops` into the active command batch (deferred submit).
+pub(crate) fn run_ops(dev: &VulkanDevice, ops: &[Op<'_>]) -> Result<()> {
+    record_ops(dev, ops, false)
+}
+
+/// Records `ops` and flushes immediately (required when staging or shared scratch
+/// buffers are reused or read on the host right after this call).
+pub(crate) fn run_ops_sync(dev: &VulkanDevice, ops: &[Op<'_>]) -> Result<()> {
+    record_ops(dev, ops, true)
+}
+
 pub(crate) fn wait_idle(dev: &VulkanDevice) -> Result<()> {
+    flush(dev)?;
     let ctx = dev.ctx();
     let _exec = ctx
         .exec
@@ -1206,8 +1320,36 @@ pub(crate) fn cmp(
     Ok(None)
 }
 
-pub(crate) fn to_dtype(_: &VulkanStorage, _: &Layout, _: DType) -> Result<Option<VulkanStorage>> {
-    Ok(None)
+pub(crate) fn to_dtype(
+    src: &VulkanStorage,
+    layout: &Layout,
+    dtype: DType,
+) -> Result<Option<VulkanStorage>> {
+    if src.dtype == dtype || exec_mode() != ExecMode::Auto || !super::qgpu::enabled(&src.device) {
+        return Ok(None);
+    }
+    let Some((a, b)) = layout.contiguous_offsets() else {
+        return Ok(None);
+    };
+    let n = b - a;
+    if n == 0 || !fits_u32(b) {
+        return Ok(None);
+    }
+    // Run on GPU when the tensor is large enough OR when pending GPU work is already batched
+    // (avoids forcing a costly host flush just to cast F16/BF16 <-> F32 between GPU kernels).
+    let pending = src.device.ctx().has_pending_gpu_work.load(Ordering::Acquire);
+    if !pending && n < 4096 {
+        return Ok(None);
+    }
+    match (src.dtype, dtype) {
+        (DType::F16 | DType::BF16, DType::F32) => attempt("to_dtype_to_f32", || {
+            super::qgpu::f16_bf16_to_f32_gpu(&src.device, src, a, n)
+        }),
+        (DType::F32, DType::F16 | DType::BF16) if a == 0 => attempt("to_dtype_from_f32", || {
+            super::qgpu::f32_to_f16_bf16_gpu(&src.device, src, dtype)
+        }),
+        _ => Ok(None),
+    }
 }
 
 pub(crate) fn where_cond(

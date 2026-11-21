@@ -14,9 +14,9 @@
 //! against the CPU kernel. Other devices return an error ([`fused_gdn_supported`] is false)
 //! so that callers keep their tensor-op path.
 
-#[cfg(any(feature = "cuda", feature = "rocm"))]
+#[cfg(any(feature = "cuda", feature = "rocm", feature = "vulkan"))]
 use crate::accel::delta::{self as gd, GdnScanArgs};
-#[cfg(any(feature = "cuda", feature = "rocm"))]
+#[cfg(any(feature = "cuda", feature = "rocm", feature = "vulkan"))]
 use crate::{op::BackpropOp, Storage};
 use crate::{bail, DType, Device, Result, Tensor};
 use rayon::prelude::*;
@@ -131,7 +131,9 @@ pub fn fused_gdn_supported(device: &Device) -> bool {
             .image()
             .is_empty(),
         #[cfg(feature = "vulkan")]
-        Device::Vulkan(v) => v.host_shared_memory(),
+        Device::Vulkan(v) => {
+            v.host_shared_memory() || crate::vulkan_backend::delta_rule::self_check(v)
+        }
         #[cfg(feature = "metal")]
         Device::Metal(m) => metal_gdn::self_check(m),
         _ => false,
@@ -141,9 +143,19 @@ pub fn fused_gdn_supported(device: &Device) -> bool {
 /// [`fused_gdn_supported`] for a given geometry (the GPU kernels take `head_k_dim <=`
 /// [`GDN_MAX_HEAD_K_DIM`]).
 pub fn fused_gdn_supported_for(device: &Device, cfg: &GdnConfig) -> bool {
+    let vulkan_host = {
+        #[cfg(feature = "vulkan")]
+        {
+            matches!(device, Device::Vulkan(v) if v.host_shared_memory())
+        }
+        #[cfg(not(feature = "vulkan"))]
+        {
+            false
+        }
+    };
     fused_gdn_supported(device)
         && cfg.validate().is_ok()
-        && (device.is_cpu() || device.is_vulkan() || cfg.head_k_dim <= GDN_MAX_HEAD_K_DIM)
+        && (device.is_cpu() || vulkan_host || cfg.head_k_dim <= GDN_MAX_HEAD_K_DIM)
 }
 
 fn float_dtype(dtype: DType, what: &str) -> Result<()> {
@@ -291,6 +303,10 @@ pub fn fused_gated_delta_rule(
         Device::Cuda(_) | Device::Rocm(_) => gpu_gated_delta_rule(&inputs, cfg),
         #[cfg(feature = "vulkan")]
         Device::Vulkan(v) if v.host_shared_memory() => host_gated_delta_rule(&inputs, cfg),
+        #[cfg(feature = "vulkan")]
+        Device::Vulkan(v) if crate::vulkan_backend::delta_rule::self_check(v) => {
+            gpu_gated_delta_rule(&inputs, cfg)
+        }
         #[cfg(feature = "metal")]
         Device::Metal(_) => metal_gdn::gated_delta_rule(&inputs, cfg),
         d => bail!(
@@ -354,7 +370,7 @@ fn host_gated_delta_rule(inp: &GdnInputs, cfg: &GdnConfig) -> Result<GdnOutput> 
 }
 
 /// `t` with a unit stride on its last dim; returns it with (offset, stride 0, stride 1).
-#[cfg(any(feature = "cuda", feature = "rocm"))]
+#[cfg(any(feature = "cuda", feature = "rocm", feature = "vulkan"))]
 fn rows_view(t: &Tensor) -> Result<(Tensor, [usize; 3])> {
     let t = if t.stride()[2] == 1 { t.clone() } else { t.contiguous()? };
     let off = t.layout().start_offset();
@@ -363,7 +379,7 @@ fn rows_view(t: &Tensor) -> Result<(Tensor, [usize; 3])> {
     Ok((t, [off, s0, s1]))
 }
 
-#[cfg(any(feature = "cuda", feature = "rocm"))]
+#[cfg(any(feature = "cuda", feature = "rocm", feature = "vulkan"))]
 fn f32_contiguous(t: &Tensor) -> Result<Tensor> {
     t.to_dtype(DType::F32)?.contiguous()
 }
@@ -384,7 +400,15 @@ fn as_rocm(s: &Storage) -> Result<&crate::RocmStorage> {
     }
 }
 
-#[cfg(any(feature = "cuda", feature = "rocm"))]
+#[cfg(feature = "vulkan")]
+fn as_vulkan(s: &Storage) -> Result<&crate::VulkanStorage> {
+    match s {
+        Storage::Vulkan(s) => Ok(s),
+        _ => bail!("gated delta rule: inputs on different backends"),
+    }
+}
+
+#[cfg(any(feature = "cuda", feature = "rocm", feature = "vulkan"))]
 fn gpu_gated_delta_rule(inp: &GdnInputs, cfg: &GdnConfig) -> Result<GdnOutput> {
     let x = inp.mixed_qkv;
     let dtype = x.dtype();
@@ -495,6 +519,21 @@ fn gpu_gated_delta_rule(inp: &GdnInputs, cfg: &GdnConfig) -> Result<GdnOutput> {
             )?;
             (Storage::Rocm(o), Storage::Rocm(c), Storage::Rocm(s))
         }
+        #[cfg(feature = "vulkan")]
+        Storage::Vulkan(xs) => {
+            let (o, c, s) = xs.gdn_scan(
+                as_vulkan(&ga)?,
+                as_vulkan(&gb)?,
+                as_vulkan(&gcw)?,
+                gcb.as_deref().map(as_vulkan).transpose()?,
+                gcs.as_deref().map(as_vulkan).transpose()?,
+                as_vulkan(&gna)?,
+                as_vulkan(&gdt)?,
+                gst.as_deref().map(as_vulkan).transpose()?,
+                &args,
+            )?;
+            (Storage::Vulkan(o), Storage::Vulkan(c), Storage::Vulkan(s))
+        }
         _ => bail!(
             "gated delta rule: this build has no fused kernel for {:?}",
             dev.location()
@@ -538,8 +577,16 @@ pub fn fused_gated_rms_norm(x: &Tensor, z: &Tensor, weight: &Tensor, eps: f64) -
     expect_device(weight, &dev, "weight")?;
     match &dev {
         Device::Cpu => cpu::gated_rms_norm(x, z, weight, eps),
-        #[cfg(any(feature = "cuda", feature = "rocm"))]
-        Device::Cuda(_) | Device::Rocm(_) => {
+        #[cfg(any(feature = "cuda", feature = "rocm", feature = "vulkan"))]
+        Device::Cuda(_) | Device::Rocm(_) | Device::Vulkan(_) => {
+            #[cfg(feature = "vulkan")]
+            if let Device::Vulkan(vdev) = &dev {
+                if !crate::vulkan_backend::decoder_ops::vk_fused_ready(vdev)
+                    || (dtype != DType::F32 && d % 2 != 0)
+                {
+                    return gated_rms_norm_tensor_ops(x, z, weight, eps);
+                }
+            }
             let rows = if d == 0 { 0 } else { x.elem_count() / d };
             let x = x.contiguous()?;
             let z = z.to_dtype(dtype)?.contiguous()?;
@@ -570,6 +617,17 @@ pub fn fused_gated_rms_norm(x: &Tensor, z: &Tensor, weight: &Tensor, eps: f64) -
                     as_rocm(&gz)?,
                     zo,
                     as_rocm(&gw)?,
+                    wo,
+                    rows,
+                    d,
+                    eps as f32,
+                )?),
+                #[cfg(feature = "vulkan")]
+                Storage::Vulkan(xs) => Storage::Vulkan(xs.gdn_gated_rms_norm(
+                    xo,
+                    as_vulkan(&gz)?,
+                    zo,
+                    as_vulkan(&gw)?,
                     wo,
                     rows,
                     d,

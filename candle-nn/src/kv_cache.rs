@@ -682,29 +682,38 @@ impl ScatteredCacheBuilder {
 /// ```
 #[derive(Debug, Clone)]
 pub struct ConcatKvCache {
+    k_buf: Option<Tensor>,
+    v_buf: Option<Tensor>,
     k: Option<Tensor>,
     v: Option<Tensor>,
     dim: usize,
+    current_seq_len: usize,
+    capacity: usize,
+    grow_by: usize,
 }
 
 impl ConcatKvCache {
-    /// Create a new empty concatenation-based KV-cache
+    /// Create a new empty KV-cache backed by a geometrically growing in-place buffer.
     ///
     /// # Arguments
-    /// * `dim` - The dimension along which to concatenate
+    /// * `dim` - The dimension along which to append
     ///   - For attention with shape `[batch, heads, seq, head_dim]`, use `dim=2`
     ///   - For attention with shape `[batch, seq, heads, head_dim]`, use `dim=1`
-    ///
-    /// # Example
-    /// ```ignore
-    /// // For standard transformer attention: [B, H, S, D]
-    /// let cache = ConcatKvCache::new(2);
-    /// ```
     pub fn new(dim: usize) -> Self {
+        Self::with_capacity(dim, 256)
+    }
+
+    /// Create a new empty KV-cache with a custom initial / minimum growth capacity.
+    pub fn with_capacity(dim: usize, initial_capacity: usize) -> Self {
         Self {
+            k_buf: None,
+            v_buf: None,
             k: None,
             v: None,
             dim,
+            current_seq_len: 0,
+            capacity: 0,
+            grow_by: initial_capacity.max(1),
         }
     }
 
@@ -712,15 +721,17 @@ impl ConcatKvCache {
     ///
     /// Returns 0 if the cache is empty.
     pub fn current_seq_len(&self) -> usize {
-        self.k
-            .as_ref()
-            .and_then(|k| k.dims().get(self.dim).copied())
-            .unwrap_or(0)
+        self.current_seq_len
+    }
+
+    /// Current reserved capacity along `dim`.
+    pub fn capacity(&self) -> usize {
+        self.capacity
     }
 
     /// Check if cache is empty
     pub fn is_empty(&self) -> bool {
-        self.k.is_none()
+        self.current_seq_len == 0
     }
 
     /// Get the concatenation dimension
@@ -728,36 +739,59 @@ impl ConcatKvCache {
         self.dim
     }
 
-    /// Append key and value tensors to the cache
-    ///
-    /// This is the core operation that uses optimized concatenation kernels.
-    ///
-    /// # Arguments
-    /// * `k` - Key tensor to append (shape: [..., seq_len, ...])
-    /// * `v` - Value tensor to append (shape: [..., seq_len, ...])
-    ///
-    /// # Returns
-    /// Tuple of `(full_k, full_v)` containing all cached keys and values,
-    /// including the newly appended data.
+    fn grown_capacity(&self, need: usize) -> usize {
+        let mut cap = self.capacity;
+        if cap == 0 {
+            cap = self.grow_by;
+        }
+        while cap < need {
+            cap += self.grow_by.max(cap / 2).max(1);
+        }
+        cap
+    }
+
+    /// Append key and value tensors to the cache in-place (`O(seq_new)` per step, zero per-token
+    /// full-cache `Tensor::cat` reallocation).
     pub fn append(&mut self, k: &Tensor, v: &Tensor) -> Result<(Tensor, Tensor)> {
-        // Detach inputs to break BackpropOp chain - KV caches are inference-only.
         let k = k.contiguous()?.detach();
         let v = v.contiguous()?.detach();
+        let seq_len = k.dim(self.dim)?;
+        let need = self.current_seq_len + seq_len;
 
-        self.k = Some(match &self.k {
-            None => k,
-            Some(k_cache) => Tensor::cat(&[k_cache, &k], self.dim)?.detach(),
-        });
+        if self.k_buf.is_none() || need > self.capacity {
+            let cap = self.grown_capacity(need);
+            let mut k_shape = k.dims().to_vec();
+            k_shape[self.dim] = cap;
+            let mut v_shape = v.dims().to_vec();
+            v_shape[self.dim] = cap;
+            let next_k = Tensor::zeros(k_shape, k.dtype(), k.device())?.detach();
+            let next_v = Tensor::zeros(v_shape, v.dtype(), v.device())?.detach();
+            if self.current_seq_len > 0 {
+                if let Some(old_k) = self.k.as_ref() {
+                    next_k.slice_set(&old_k.contiguous()?, self.dim, 0)?;
+                }
+                if let Some(old_v) = self.v.as_ref() {
+                    next_v.slice_set(&old_v.contiguous()?, self.dim, 0)?;
+                }
+            }
+            self.k_buf = Some(next_k);
+            self.v_buf = Some(next_v);
+            self.capacity = cap;
+        }
 
-        self.v = Some(match &self.v {
-            None => v,
-            Some(v_cache) => Tensor::cat(&[v_cache, &v], self.dim)?.detach(),
-        });
+        let kb = self.k_buf.as_ref().unwrap();
+        let vb = self.v_buf.as_ref().unwrap();
+        if seq_len > 0 {
+            kb.slice_set(&k, self.dim, self.current_seq_len)?;
+            vb.slice_set(&v, self.dim, self.current_seq_len)?;
+        }
+        self.current_seq_len = need;
+        let kv_k = kb.narrow(self.dim, 0, self.current_seq_len)?;
+        let kv_v = vb.narrow(self.dim, 0, self.current_seq_len)?;
+        self.k = Some(kv_k.clone());
+        self.v = Some(kv_v.clone());
 
-        Ok((
-            self.k.as_ref().unwrap().clone(),
-            self.v.as_ref().unwrap().clone(),
-        ))
+        Ok((kv_k, kv_v))
     }
 
     /// Reset the cache (clear all stored keys and values)
@@ -765,8 +799,12 @@ impl ConcatKvCache {
     /// After calling this, `is_empty()` will return `true` and
     /// `current_seq_len()` will return 0.
     pub fn reset(&mut self) {
+        self.k_buf = None;
+        self.v_buf = None;
         self.k = None;
         self.v = None;
+        self.current_seq_len = 0;
+        self.capacity = 0;
     }
 
     /// Get reference to current K cache data
@@ -992,6 +1030,41 @@ mod tests {
 
         Ok(())
     }
+
+    #[test]
+    fn test_concat_and_interleaved_capacity_growth_exact() -> Result<()> {
+        let device = Device::Cpu;
+        let mut cc = ConcatKvCache::with_capacity(2, 4);
+        let mut ic = InterleavedKvCache::with_capacity(8, 4);
+        let mut ks = Vec::new();
+        let mut vs = Vec::new();
+        for step in 0..9 {
+            let t = if step == 0 { 3 } else { 1 };
+            let k = Tensor::randn(0f32, 1.0, (1, 2, t, 8), &device)?;
+            let v = Tensor::randn(0f32, 1.0, (1, 2, t, 8), &device)?;
+            ks.push(k.clone());
+            vs.push(v.clone());
+            let (ck, cv) = cc.append(&k, &v)?;
+            let ikv = ic.append(&k, &v)?;
+            let expected_k = Tensor::cat(&ks, 2)?;
+            let expected_v = Tensor::cat(&vs, 2)?;
+            let dk = (&ck - &expected_k)?.abs()?.max_all()?.to_scalar::<f32>()?;
+            let dv = (&cv - &expected_v)?.abs()?.max_all()?.to_scalar::<f32>()?;
+            assert_eq!(dk, 0.0, "concat K mismatch at step {step}");
+            assert_eq!(dv, 0.0, "concat V mismatch at step {step}");
+
+            let exp_k_seq = expected_k.squeeze(0)?.transpose(0, 1)?; // [S, H, D]
+            let exp_v_seq = expected_v.squeeze(0)?.transpose(0, 1)?;
+            let exp_kv = Tensor::cat(&[&exp_k_seq, &exp_v_seq], 2)?;
+            let dikv = (&ikv - &exp_kv)?.abs()?.max_all()?.to_scalar::<f32>()?;
+            assert_eq!(dikv, 0.0, "interleaved KV mismatch at step {step}");
+        }
+        assert_eq!(cc.current_seq_len(), 11);
+        assert!(cc.capacity() >= 11);
+        assert_eq!(ic.current_seq_len(), 11);
+        assert!(ic.capacity() >= 11);
+        Ok(())
+    }
 }
 
 /// Stores a single tensor with shape `(S, H_kv, 2*D)` where the first D
@@ -1004,40 +1077,86 @@ mod tests {
 /// and are transposed+interleaved on append.
 #[derive(Debug, Clone)]
 pub struct InterleavedKvCache {
+    kv_buf: Option<Tensor>,
     kv: Option<Tensor>,
     head_dim: usize,
+    current_seq_len: usize,
+    capacity: usize,
+    grow_by: usize,
 }
 
 impl InterleavedKvCache {
     pub fn new(head_dim: usize) -> Self {
-        Self { kv: None, head_dim }
+        Self::with_capacity(head_dim, 256)
+    }
+
+    pub fn with_capacity(head_dim: usize, initial_capacity: usize) -> Self {
+        Self {
+            kv_buf: None,
+            kv: None,
+            head_dim,
+            current_seq_len: 0,
+            capacity: 0,
+            grow_by: initial_capacity.max(1),
+        }
     }
 
     pub fn current_seq_len(&self) -> usize {
-        self.kv
-            .as_ref()
-            .and_then(|kv| kv.dims().first().copied())
-            .unwrap_or(0)
+        self.current_seq_len
+    }
+
+    pub fn capacity(&self) -> usize {
+        self.capacity
     }
 
     pub fn is_empty(&self) -> bool {
-        self.kv.is_none()
+        self.current_seq_len == 0
+    }
+
+    fn grown_capacity(&self, need: usize) -> usize {
+        let mut cap = self.capacity;
+        if cap == 0 {
+            cap = self.grow_by;
+        }
+        while cap < need {
+            cap += self.grow_by.max(cap / 2).max(1);
+        }
+        cap
     }
 
     /// Append K, V of shape `(1, H_kv, S_new, D)`. Batch must be 1.
-    /// Returns the full cache `(S_total, H_kv, 2*D)`.
+    /// Returns the full cache `(S_total, H_kv, 2*D)` via zero-copy `narrow` over a
+    /// geometrically reserved backing buffer.
     pub fn append(&mut self, k: &Tensor, v: &Tensor) -> Result<Tensor> {
         // Detach to break BackpropOp chain - KV caches are inference-only.
         let k_seq = k.squeeze(0)?.transpose(0, 1)?.contiguous()?.detach();
         let v_seq = v.squeeze(0)?.transpose(0, 1)?.contiguous()?.detach();
-        let kv_new = Tensor::cat(&[&k_seq, &v_seq], 2)?.detach();
+        let kv_new = Tensor::cat(&[&k_seq, &v_seq], 2)?.contiguous()?.detach();
+        let seq_len = kv_new.dim(0)?;
+        let need = self.current_seq_len + seq_len;
 
-        self.kv = Some(match &self.kv {
-            None => kv_new,
-            Some(kv_cache) => Tensor::cat(&[kv_cache, &kv_new], 0)?.detach(),
-        });
+        if self.kv_buf.is_none() || need > self.capacity {
+            let cap = self.grown_capacity(need);
+            let mut shape = kv_new.dims().to_vec();
+            shape[0] = cap;
+            let next_buf = Tensor::zeros(shape, kv_new.dtype(), kv_new.device())?.detach();
+            if self.current_seq_len > 0 {
+                if let Some(old_kv) = self.kv.as_ref() {
+                    next_buf.slice_set(&old_kv.contiguous()?, 0, 0)?;
+                }
+            }
+            self.kv_buf = Some(next_buf);
+            self.capacity = cap;
+        }
 
-        Ok(self.kv.as_ref().unwrap().clone())
+        let buf = self.kv_buf.as_ref().unwrap();
+        if seq_len > 0 {
+            buf.slice_set(&kv_new, 0, self.current_seq_len)?;
+        }
+        self.current_seq_len = need;
+        let view = buf.narrow(0, 0, self.current_seq_len)?;
+        self.kv = Some(view.clone());
+        Ok(view)
     }
 
     /// Get the raw interleaved KV tensor `(S, H_kv, 2*D)`.
@@ -1050,7 +1169,10 @@ impl InterleavedKvCache {
     }
 
     pub fn reset(&mut self) {
+        self.kv_buf = None;
         self.kv = None;
+        self.current_seq_len = 0;
+        self.capacity = 0;
     }
 }
 
