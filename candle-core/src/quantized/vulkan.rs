@@ -115,6 +115,10 @@ fn dequantize_into<T: GgmlType>(blocks: &[T], out: &mut [f32]) -> Result<()> {
 }
 
 impl QVulkanStorage {
+    /// Whether this quantized tensor's weights live in device-local GPU VRAM (`GpuQuant`).
+    pub fn is_on_gpu(&self) -> bool {
+        self.gpu.is_some()
+    }
     pub fn zeros(device: &VulkanDevice, elem_count: usize, dtype: GgmlDType) -> Result<Self> {
         let bytes = elem_count / dtype.block_size() * dtype.type_size();
         let mut data = device.alloc_buffer(bytes, DType::U8)?;
@@ -167,10 +171,6 @@ impl QVulkanStorage {
 
     pub fn device(&self) -> &VulkanDevice {
         &self.device
-    }
-
-    pub fn is_on_gpu(&self) -> bool {
-        self.gpu.is_some()
     }
 
     pub fn storage_size_in_bytes(&self) -> usize {
@@ -387,6 +387,14 @@ impl QVulkanStorage {
     ) -> Result<(VulkanStorage, Shape)> {
         let (n_exp, n, k) = self_shape.dims3()?;
         let (bsz, topk) = ids_l.shape().dims2()?;
+        let x_dims = x_l.dims();
+        let x_stride_t = match x_dims {
+            [b, k_in] if *b == bsz && *k_in == k => 1,
+            [b, tk, k_in] if *b == bsz && (*tk == 1 || *tk == topk) && *k_in == k => *tk,
+            _ => crate::bail!(
+                "vulkan indexed_moe_forward: incompatible x shape {x_dims:?} for batch={bsz}, topk={topk}, k={k}"
+            ),
+        };
         let out_shape = Shape::from((bsz, topk, n));
         let in_dtype = x.dtype();
         if let Some(g) = &self.gpu {
@@ -405,12 +413,10 @@ impl QVulkanStorage {
             }
         }
         // Host fallback over mapped buffers for formats/shapes not resident in GPU VRAM.
-        let x_f32_cpu = x.host_view().to_dtype(x_l, DType::F32)?;
+        let x_f32_cpu = x.try_host_view()?.to_dtype(x_l, DType::F32)?;
         let x_f32 = x_f32_cpu.as_slice::<f32>()?;
-        let ids_u32_cpu = ids.host_view().to_dtype(ids_l, DType::U32)?;
+        let ids_u32_cpu = ids.try_host_view()?.to_dtype(ids_l, DType::U32)?;
         let ids_u32 = ids_u32_cpu.as_slice::<u32>()?;
-        let x_dims = x_l.dims();
-        let x_stride_t = if x_dims.len() == 3 { x_dims[1] } else { 1 };
         let exp_bytes = (n * k / self.dtype.block_size()) * self.dtype.type_size();
         let mut out = self.device.alloc_buffer(bsz * topk * n, DType::F32)?;
         let dst = out.as_mut_slice::<f32>()?;

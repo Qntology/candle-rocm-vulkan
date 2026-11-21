@@ -493,10 +493,47 @@ fn main() {
         .map(|s| s.split_whitespace().map(|s| s.to_string()).collect())
         .unwrap_or_default();
 
-    let compile = |k: &str, legacy_driver: bool| -> Result<(), String> {
+    // On Windows with Visual Studio 2022 17.15+ (MSVC 14.51+), `<cmath>` defines Clang builtins
+    // for `isgreater`/`isless` that conflict with ROCm 7.2's `__clang_hip_cmath.h`. If
+    // `VCToolsInstallDir` is not explicitly set and an earlier 14.4x MSVC toolset is installed
+    // alongside 14.5x, fall back to it automatically when the first compile hits that conflict.
+    let windows_msvc144_dir: Option<PathBuf> = if cfg!(windows) && std::env::var_os("VCToolsInstallDir").is_none() {
+        let mut found = None;
+        for edition in ["Community", "Professional", "Enterprise", "BuildTools"] {
+            let root = PathBuf::from(format!(
+                r"C:\Program Files\Microsoft Visual Studio\2022\{edition}\VC\Tools\MSVC"
+            ));
+            if let Ok(entries) = std::fs::read_dir(&root) {
+                let mut v144: Vec<PathBuf> = entries
+                    .filter_map(|e| e.ok().map(|e| e.path()))
+                    .filter(|p| {
+                        p.file_name()
+                            .and_then(|n| n.to_str())
+                            .map(|s| s.starts_with("14.4"))
+                            .unwrap_or(false)
+                    })
+                    .collect();
+                v144.sort();
+                if let Some(p) = v144.pop() {
+                    found = Some(p);
+                    break;
+                }
+            }
+        }
+        found
+    } else {
+        None
+    };
+
+    let compile = |k: &str, legacy_driver: bool, vc_override: Option<&Path>| -> Result<(), String> {
         let src = kernel_dir.join(format!("{k}.hip"));
         let out = out_dir.join(format!("{k}.co"));
         let mut cmd = base_command(&compiler, root.as_deref());
+        if let Some(vc) = vc_override {
+            let mut s = vc.as_os_str().to_os_string();
+            s.push("\\");
+            cmd.env("VCToolsInstallDir", s);
+        }
         for a in archs.iter() {
             cmd.arg(format!("--offload-arch={a}"));
         }
@@ -533,13 +570,21 @@ fn main() {
             .iter()
             .map(|k| {
                 let compile = &compile;
+                let vc_fallback = windows_msvc144_dir.as_deref();
                 scope.spawn(move || {
-                    let mut res = compile(k, false);
+                    let mut res = compile(k, false, None);
+                    if let Err(e) = &res {
+                        if let Some(vc) = vc_fallback {
+                            if e.contains("__clang_hip_cmath.h") && e.contains("cannot overload") {
+                                res = compile(k, false, Some(vc));
+                            }
+                        }
+                    }
                     if let Err(e) = &res {
                         if e.contains("is not an offload bundle") {
                             // A newer offload driver may package device code differently; the
                             // classic driver always emits a HIP fat binary.
-                            res = compile(k, true);
+                            res = compile(k, true, vc_fallback);
                         }
                     }
                     (k.to_string(), res)

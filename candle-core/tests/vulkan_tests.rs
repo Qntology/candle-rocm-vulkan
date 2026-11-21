@@ -1194,6 +1194,12 @@ fn fixed_exec_modes_are_batch_invariant() -> Result<()> {
 fn vulkan_async_batching_reduces_submits() -> Result<()> {
     let _guard = MODE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let dev = vulkan();
+    if dev.as_vulkan_device()?.is_cpu_device()
+        && std::env::var("CANDLE_VULKAN_TEST_FORCE_FUSED").ok().as_deref() != Some("1")
+    {
+        eprintln!("skipping vulkan_async_batching_reduces_submits on CPU Vulkan device (set CANDLE_VULKAN_TEST_FORCE_FUSED=1 to force)");
+        return Ok(());
+    }
     let x = randn(&[4, 256], DType::F32)?.to_device(&dev)?;
     let w = randn(&[256], DType::F32)?.to_device(&dev)?;
     let up = randn(&[4, 256], DType::F32)?.to_device(&dev)?;
@@ -1221,6 +1227,94 @@ fn vulkan_async_batching_reduces_submits() -> Result<()> {
         sub_delta <= 2,
         "expected async batching to coalesce 12 dispatches into <= 2 submits, got {sub_delta}"
     );
+    Ok(())
+}
+
+/// Verifies that discrete Vulkan K-Quant matmuls coalesce into a single batched submit (P3b-F01),
+/// that `trim_memory_pool` during an open batch flushes safely (P3a-F04), and that concurrent
+/// multi-threaded batching produces bit-identical results to single-threaded execution (P3a-F01).
+#[test]
+fn vulkan_quant_batching_trim_and_multithread_safety() -> Result<()> {
+    let _guard = MODE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let dev = vulkan();
+    let is_cpu = dev.as_vulkan_device()?.is_cpu_device();
+    if is_cpu && std::env::var("CANDLE_VULKAN_TEST_FORCE_FUSED").ok().as_deref() != Some("1") {
+        return Ok(());
+    }
+    let w = randn(&[64, 256], DType::F32)?;
+    let q = QTensor::quantize_onto(&w, GgmlDType::Q4K, &dev)?;
+    let qmm = QMatMul::from_qtensor(q)?;
+    let x = randn(&[1, 256], DType::F32)?.to_device(&dev)?;
+    let w_norm = randn(&[256], DType::F32)?.to_device(&dev)?;
+    // Warm up
+    let _ = qmm.forward(&x)?.to_device(&Device::Cpu)?;
+
+    let sub_before = shaders::submit_count();
+    let mut last = x.clone();
+    for _ in 0..8 {
+        let (_, y) = candle_core::decoder_ops::residual_rmsnorm(&last, None, &w_norm, 1e-5, false)?;
+        let out = qmm.forward(&y)?;
+        last = y;
+        let _ = out;
+    }
+    // Call trim_memory_pool while batch is open — must flush safely before freeing pool (P3a-F04)
+    dev.as_vulkan_device()?.trim_memory_pool()?;
+    let ref_host = last.to_device(&Device::Cpu)?.flatten_all()?.to_vec1::<f32>()?;
+    let sub_delta = shaders::submit_count() - sub_before;
+    assert!(
+        sub_delta <= 3,
+        "expected K-Quant + fused ops to coalesce submits (<= 3), got {sub_delta}"
+    );
+
+    // Multi-threaded record + drop + read parity against single-threaded bits (P3a-F01)
+    let single_out = qmm.forward(&x)?.to_device(&Device::Cpu)?.flatten_all()?.to_vec1::<f32>()?;
+    let qmm = std::sync::Arc::new(qmm);
+    let handles: Vec<_> = (0..4)
+        .map(|_| {
+            let dev_c = dev.clone();
+            let qmm_c = qmm.clone();
+            let x_c = x.clone();
+            std::thread::spawn(move || -> Result<Vec<f32>> {
+                let mut acc = Vec::new();
+                for _ in 0..8 {
+                    let tmp = qmm_c.forward(&x_c)?;
+                    let tmp2 = qmm_c.forward(&x_c)?;
+                    drop(tmp);
+                    acc = tmp2.to_device(&Device::Cpu)?.flatten_all()?.to_vec1::<f32>()?;
+                }
+                let _ = dev_c;
+                Ok(acc)
+            })
+        })
+        .collect();
+    for h in handles {
+        let got = h.join().expect("thread panicked")?;
+        assert_eq!(
+            got.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+            single_out.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+            "multi-threaded Vulkan batching must be bit-exact"
+        );
+    }
+    assert_eq!(ref_host.len(), 256);
+    Ok(())
+}
+
+/// Verifies invalid `x` shapes in Vulkan `indexed_moe_forward` return Err instead of OOB GPU reads (P3b-F07).
+#[test]
+fn vulkan_moe_invalid_shape_errors() -> Result<()> {
+    let _guard = MODE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let dev = vulkan();
+    let q = QTensor::quantize_onto(&randn(&[4, 32, 256], DType::F32)?, GgmlDType::Q4K, &dev)?;
+    let ids = Tensor::from_vec(vec![0u32, 1, 2, 3], (2, 2), &dev)?;
+    // Wrong batch size
+    let bad_b = randn(&[3, 1, 256], DType::F32)?.to_device(&dev)?;
+    assert!(q.indexed_moe_forward(&bad_b, &ids).is_err());
+    // Wrong topk
+    let bad_tk = randn(&[2, 3, 256], DType::F32)?.to_device(&dev)?;
+    assert!(q.indexed_moe_forward(&bad_tk, &ids).is_err());
+    // Wrong k
+    let bad_k = randn(&[2, 1, 128], DType::F32)?.to_device(&dev)?;
+    assert!(q.indexed_moe_forward(&bad_k, &ids).is_err());
     Ok(())
 }
 
@@ -1273,78 +1367,90 @@ fn vulkan_kquant_gpu_moe_forward() -> Result<()> {
 fn vulkan_gdn_2stage_and_gated_rmsnorm() -> Result<()> {
     let _guard = MODE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let dev = vulkan();
+    if dev.as_vulkan_device()?.is_cpu_device()
+        && std::env::var("CANDLE_VULKAN_TEST_FORCE_FUSED").ok().as_deref() != Some("1")
+    {
+        return Ok(());
+    }
     assert!(
         candle_core::delta_rule::fused_gdn_supported(&dev),
         "expected fused_gdn_supported to be true on Vulkan GPU"
     );
-    let cfg = candle_core::delta_rule::GdnConfig::new(2, 4, 64, 64);
-    let (bsz, t, c, k) = (1, 6, cfg.conv_dim(), cfg.conv_kernel);
-    let hv = cfg.num_v_heads;
+    for &(dk, dv) in &[(64usize, 64usize), (128, 128)] {
+        let cfg = candle_core::delta_rule::GdnConfig::new(2, 4, dk, dv);
+        let (bsz, t, c, k) = (1, 6, cfg.conv_dim(), cfg.conv_kernel);
+        let hv = cfg.num_v_heads;
 
-    for dtype in [DType::F32, DType::F16] {
-        let x = randn(&[bsz, t, c], dtype)?;
-        let cw = randn(&[c, k], dtype)?;
-        let cb = randn(&[c], dtype)?;
-        let cs = randn(&[bsz, c, k - 1], dtype)?;
-        let a = randn(&[bsz, t, hv], dtype)?;
-        let b = randn(&[bsz, t, hv], dtype)?;
-        let na = Tensor::from_vec(vec![-0.35f32; hv], hv, &Device::Cpu)?.to_dtype(dtype)?;
-        let dtb = Tensor::from_vec(vec![0.1f32; hv], hv, &Device::Cpu)?.to_dtype(dtype)?;
-        let st = randn(&[bsz, hv, cfg.head_k_dim, cfg.head_v_dim], DType::F32)?;
+        for dtype in [DType::F32, DType::F16, DType::BF16] {
+            let x = randn(&[bsz, t, c], dtype)?;
+            let cw = randn(&[c, k], dtype)?;
+            let cb = randn(&[c], dtype)?;
+            let cs = randn(&[bsz, c, k - 1], dtype)?;
+            let a = randn(&[bsz, t, hv], dtype)?;
+            let b = randn(&[bsz, t, hv], dtype)?;
+            let na = Tensor::from_vec(vec![-0.35f32; hv], hv, &Device::Cpu)?.to_dtype(dtype)?;
+            let dtb = Tensor::from_vec(vec![0.1f32; hv], hv, &Device::Cpu)?.to_dtype(dtype)?;
+            let st = randn(&[bsz, hv, cfg.head_k_dim, cfg.head_v_dim], DType::F32)?;
 
-        let ref_out = candle_core::delta_rule::fused_gated_delta_rule(
-            &x,
-            &cw,
-            Some(&cb),
-            Some(&cs),
-            &a,
-            &b,
-            &na,
-            &dtb,
-            Some(&st),
-            &cfg,
-        )?;
-        let vk_out = candle_core::delta_rule::fused_gated_delta_rule(
-            &x.to_device(&dev)?,
-            &cw.to_device(&dev)?,
-            Some(&cb.to_device(&dev)?),
-            Some(&cs.to_device(&dev)?),
-            &a.to_device(&dev)?,
-            &b.to_device(&dev)?,
-            &na.to_device(&dev)?,
-            &dtb.to_device(&dev)?,
-            Some(&st.to_device(&dev)?),
-            &cfg,
-        )?;
-        let tol = if dtype == DType::F32 { 1e-3 } else { 2e-2 };
-        let o_err = (vk_out.out.to_device(&Device::Cpu)?.to_dtype(DType::F32)?
-            - ref_out.out.to_dtype(DType::F32)?)?
-            .abs()?
-            .max_all()?
-            .to_scalar::<f32>()?;
-        let s_err = (vk_out.recurrent_state.to_device(&Device::Cpu)? - &ref_out.recurrent_state)?
-            .abs()?
-            .max_all()?
-            .to_scalar::<f32>()?;
-        assert!(o_err < tol, "vulkan GDN {dtype:?} out err={o_err}");
-        assert!(s_err < tol, "vulkan GDN {dtype:?} state err={s_err}");
+            let ref_out = candle_core::delta_rule::fused_gated_delta_rule(
+                &x,
+                &cw,
+                Some(&cb),
+                Some(&cs),
+                &a,
+                &b,
+                &na,
+                &dtb,
+                Some(&st),
+                &cfg,
+            )?;
+            let vk_out = candle_core::delta_rule::fused_gated_delta_rule(
+                &x.to_device(&dev)?,
+                &cw.to_device(&dev)?,
+                Some(&cb.to_device(&dev)?),
+                Some(&cs.to_device(&dev)?),
+                &a.to_device(&dev)?,
+                &b.to_device(&dev)?,
+                &na.to_device(&dev)?,
+                &dtb.to_device(&dev)?,
+                Some(&st.to_device(&dev)?),
+                &cfg,
+            )?;
+            let tol = match dtype {
+                DType::F32 => 1e-3,
+                DType::F16 => 2e-2,
+                DType::BF16 => 8e-2,
+                _ => 1e-3,
+            };
+            let o_err = (vk_out.out.to_device(&Device::Cpu)?.to_dtype(DType::F32)?
+                - ref_out.out.to_dtype(DType::F32)?)?
+                .abs()?
+                .max_all()?
+                .to_scalar::<f32>()?;
+            let s_err = (vk_out.recurrent_state.to_device(&Device::Cpu)? - &ref_out.recurrent_state)?
+                .abs()?
+                .max_all()?
+                .to_scalar::<f32>()?;
+            assert!(o_err < tol, "vulkan GDN dk={dk} {dtype:?} out err={o_err}");
+            assert!(s_err < tol, "vulkan GDN dk={dk} {dtype:?} state err={s_err}");
 
-        // Also test fused_gated_rms_norm
-        let z = randn(&[bsz, t, hv, cfg.head_v_dim], dtype)?;
-        let nw = randn(&[cfg.head_v_dim], dtype)?;
-        let g_ref = candle_core::delta_rule::fused_gated_rms_norm(&ref_out.out, &z, &nw, 1e-6)?;
-        let g_vk = candle_core::delta_rule::fused_gated_rms_norm(
-            &vk_out.out,
-            &z.to_device(&dev)?,
-            &nw.to_device(&dev)?,
-            1e-6,
-        )?;
-        let g_err = (g_vk.to_device(&Device::Cpu)?.to_dtype(DType::F32)?
-            - g_ref.to_dtype(DType::F32)?)?
-            .abs()?
-            .max_all()?
-            .to_scalar::<f32>()?;
-        assert!(g_err < tol, "vulkan gated_rms_norm {dtype:?} err={g_err}");
+            // Also test fused_gated_rms_norm
+            let z = randn(&[bsz, t, hv, cfg.head_v_dim], dtype)?;
+            let nw = randn(&[cfg.head_v_dim], dtype)?;
+            let g_ref = candle_core::delta_rule::fused_gated_rms_norm(&ref_out.out, &z, &nw, 1e-6)?;
+            let g_vk = candle_core::delta_rule::fused_gated_rms_norm(
+                &vk_out.out,
+                &z.to_device(&dev)?,
+                &nw.to_device(&dev)?,
+                1e-6,
+            )?;
+            let g_err = (g_vk.to_device(&Device::Cpu)?.to_dtype(DType::F32)?
+                - g_ref.to_dtype(DType::F32)?)?
+                .abs()?
+                .max_all()?
+                .to_scalar::<f32>()?;
+            assert!(g_err < tol, "vulkan gated_rms_norm dk={dk} {dtype:?} err={g_err}");
+        }
     }
     Ok(())
 }

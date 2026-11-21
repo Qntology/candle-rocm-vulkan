@@ -182,6 +182,16 @@ fn sync_submit_enabled() -> bool {
     *FLAG.get_or_init(|| env_flag(&["CANDLE_VULKAN_SYNC_SUBMIT"]).unwrap_or(false))
 }
 
+/// Test-only switch (`CANDLE_VULKAN_TEST_FORCE_FUSED=1`) allowing fused GLSL, GpuQuant, and GDN
+/// shaders to execute on CPU-type Vulkan devices (such as Mesa lavapipe) in CI verification.
+pub(crate) fn test_force_fused() -> bool {
+    env_flag(&["CANDLE_VULKAN_TEST_FORCE_FUSED"]).unwrap_or(false)
+}
+
+/// Maximum cumulative FLOPs recorded into a single submission on unified/iGPU devices before
+/// auto-flushing to stay safely below driver watchdog (TDR / amdgpu job timeout) limits.
+pub(crate) const MAX_IGPU_BATCH_FLOPS: u64 = 1u64 << 34;
+
 /// Shared GLSL helpers for packed 16-bit (F16 / BF16) reads and race-free paired writes.
 pub(crate) const GLSL_PACK16_HELPERS: &str = r#"
 float ld_f16(uint w, uint idx) {
@@ -433,6 +443,8 @@ pub(crate) struct ExecState {
     fence: vk::Fence,
     recording: bool,
     recorded_dispatches: u32,
+    recorded_flops: u64,
+    active_epoch: u64,
 }
 
 impl ExecState {
@@ -497,6 +509,8 @@ impl ExecState {
             fence,
             recording: false,
             recorded_dispatches: 0,
+            recorded_flops: 0,
+            active_epoch: 0,
         })
     }
 
@@ -536,6 +550,7 @@ fn emit_gpu_barrier(d: &ash::Device, cmd: vk::CommandBuffer) {
 fn begin_batch_locked(dev: &VulkanDevice, exec: &mut ExecState) -> Result<()> {
     let d = dev.device();
     let ctx = dev.ctx();
+    ctx.check_batch_error()?;
     unsafe {
         d.reset_descriptor_pool(exec.desc_pool, vk::DescriptorPoolResetFlags::empty())
             .map_err(|e| vk_err(dev, "reset_descriptor_pool", e))?;
@@ -548,27 +563,38 @@ fn begin_batch_locked(dev: &VulkanDevice, exec: &mut ExecState) -> Result<()> {
         )
         .map_err(|e| vk_err(dev, "begin_command_buffer", e))?;
     }
+    let epoch = ctx.batch_epoch.fetch_add(1, Ordering::AcqRel) + 1;
     exec.recording = true;
     exec.recorded_dispatches = 0;
+    exec.recorded_flops = 0;
+    exec.active_epoch = epoch;
     ctx.has_pending_gpu_work.store(true, Ordering::Release);
     Ok(())
 }
 
-fn flush_locked(dev: &VulkanDevice, exec: &mut ExecState) -> Result<bool> {
-    if !exec.recording {
-        dev.ctx()
-            .has_pending_gpu_work
-            .store(false, Ordering::Release);
-        return Ok(false);
-    }
+/// Submits the open command batch while holding `exec`, waits for completion, advances
+/// `completed_epoch`, and extracts deferred buffers whose epoch has finished so the caller can
+/// recycle them *after* dropping `exec`. Always cleans up `recording` and `has_pending_gpu_work`
+/// even on submission/wait error, recording any failure as a sticky batch error.
+fn flush_locked(
+    dev: &VulkanDevice,
+    exec: &mut ExecState,
+) -> Result<Vec<super::PooledBuffer>> {
     let ctx = dev.ctx();
+    if !exec.recording {
+        ctx.has_pending_gpu_work.store(false, Ordering::Release);
+        return Ok(Vec::new());
+    }
     let d = dev.device();
     let cmd = exec.cmd;
+    let epoch = exec.active_epoch;
     let all_writes = vk::AccessFlags::SHADER_WRITE | vk::AccessFlags::TRANSFER_WRITE;
     let all_stages = vk::PipelineStageFlags::COMPUTE_SHADER | vk::PipelineStageFlags::TRANSFER;
     exec.recording = false;
     exec.recorded_dispatches = 0;
-    let res = unsafe {
+    exec.recorded_flops = 0;
+
+    let res: Result<()> = (|| unsafe {
         let host = [vk::MemoryBarrier::default()
             .src_access_mask(all_writes)
             .dst_access_mask(vk::AccessFlags::HOST_READ | vk::AccessFlags::HOST_WRITE)];
@@ -611,10 +637,26 @@ fn flush_locked(dev: &VulkanDevice, exec: &mut ExecState) -> Result<bool> {
         wait.map_err(|e| vk_err(dev, "wait_for_fences", e))?;
         reset.map_err(|e| vk_err(dev, "reset_fences", e))?;
         Ok(())
-    };
+    })();
+
     ctx.has_pending_gpu_work.store(false, Ordering::Release);
     SUBMIT_COUNT.fetch_add(1, Ordering::Relaxed);
-    res.map(|()| true)
+    match res {
+        Ok(()) => {
+            ctx.completed_epoch.store(epoch, Ordering::Release);
+            Ok(ctx.take_deferred_completed(epoch))
+        }
+        Err(e) => {
+            ctx.record_batch_error(e.to_string());
+            // Ensure device is idle before advancing completed_epoch so deferred buffers do not leak.
+            let _ = unsafe { d.device_wait_idle() };
+            ctx.completed_epoch.store(epoch, Ordering::Release);
+            let ready = ctx.take_deferred_completed(epoch);
+            // Recycle safely outside caller's error path.
+            ctx.recycle_buffers(ready);
+            Err(e)
+        }
+    }
 }
 
 /// Submits any lazily recorded dispatches and waits for the fence to complete,
@@ -622,17 +664,17 @@ fn flush_locked(dev: &VulkanDevice, exec: &mut ExecState) -> Result<bool> {
 pub(crate) fn flush(dev: &VulkanDevice) -> Result<()> {
     let ctx = dev.ctx();
     if !ctx.has_pending_gpu_work.load(Ordering::Acquire) {
-        return Ok(());
+        return ctx.check_batch_error();
     }
-    let flushed = {
+    let to_recycle = {
         let mut exec = ctx
             .exec
             .lock()
             .map_err(|_| Error::Msg("vulkan: exec state poisoned".into()))?;
         flush_locked(dev, &mut exec)?
     };
-    if flushed {
-        ctx.drain_deferred_returns();
+    if !to_recycle.is_empty() {
+        ctx.recycle_buffers(to_recycle);
     }
     Ok(())
 }
@@ -645,6 +687,17 @@ pub(crate) fn run(
     buffers: &[&VulkanStorage],
     push: &[u8],
     groups: [u32; 3],
+) -> Result<()> {
+    run_with_flops(dev, k, buffers, push, groups, 0)
+}
+
+pub(crate) fn run_with_flops(
+    dev: &VulkanDevice,
+    k: &Kernel,
+    buffers: &[&VulkanStorage],
+    push: &[u8],
+    groups: [u32; 3],
+    est_flops: u64,
 ) -> Result<()> {
     if buffers.len() as u32 != k.bindings || push.len() as u32 != k.push_size {
         crate::bail!("vulkan dispatch: binding/push constant mismatch")
@@ -681,14 +734,18 @@ pub(crate) fn run(
     }
     let ctx = dev.ctx();
     let d = dev.device();
-    let mut drained = false;
+    let mut to_recycle = Vec::new();
     {
         let mut exec = ctx
             .exec
             .lock()
             .map_err(|_| Error::Msg("vulkan: exec state poisoned".into()))?;
-        if exec.recording && exec.recorded_dispatches >= MAX_SETS {
-            drained |= flush_locked(dev, &mut exec)?;
+        let igpu_flops_overflow = ctx.default_native
+            && exec.recording
+            && exec.recorded_flops > 0
+            && exec.recorded_flops.saturating_add(est_flops) > MAX_IGPU_BATCH_FLOPS;
+        if exec.recording && (exec.recorded_dispatches >= MAX_SETS || igpu_flops_overflow) {
+            to_recycle.extend(flush_locked(dev, &mut exec)?);
         }
         if !exec.recording {
             begin_batch_locked(dev, &mut exec)?;
@@ -704,6 +761,7 @@ pub(crate) fn run(
                         .set_layouts(&set_layouts),
                 )
                 .map_err(|e| vk_err(dev, "allocate_descriptor_sets", e))?[0];
+            exec.recorded_dispatches += 1;
             let infos: Vec<[vk::DescriptorBufferInfo; 1]> = buffers
                 .iter()
                 .map(|b| {
@@ -742,14 +800,14 @@ pub(crate) fn run(
             }
             d.cmd_dispatch(cmd, groups[0], groups[1], groups[2]);
         }
-        exec.recorded_dispatches += 1;
+        exec.recorded_flops = exec.recorded_flops.saturating_add(est_flops);
         NATIVE_EXEC.fetch_add(1, Ordering::Relaxed);
         if sync_submit_enabled() {
-            drained |= flush_locked(dev, &mut exec)?;
+            to_recycle.extend(flush_locked(dev, &mut exec)?);
         }
     }
-    if drained {
-        ctx.drain_deferred_returns();
+    if !to_recycle.is_empty() {
+        ctx.recycle_buffers(to_recycle);
     }
     Ok(())
 }
@@ -788,7 +846,12 @@ fn spin_us() -> u64 {
     })
 }
 
-fn record_ops(dev: &VulkanDevice, ops: &[Op<'_>], force_flush: bool) -> Result<()> {
+fn record_ops(
+    dev: &VulkanDevice,
+    ops: &[Op<'_>],
+    force_flush: bool,
+    est_flops: u64,
+) -> Result<()> {
     let limits = dev.limits();
     let mut dispatches = 0u32;
     for op in ops {
@@ -836,14 +899,21 @@ fn record_ops(dev: &VulkanDevice, ops: &[Op<'_>], force_flush: bool) -> Result<(
     }
     let ctx = dev.ctx();
     let d = dev.device();
-    let mut drained = false;
+    let mut to_recycle = Vec::new();
     {
         let mut exec = ctx
             .exec
             .lock()
             .map_err(|_| Error::Msg("vulkan: exec state poisoned".into()))?;
-        if exec.recording && exec.recorded_dispatches.saturating_add(dispatches) > MAX_SETS {
-            drained |= flush_locked(dev, &mut exec)?;
+        let igpu_flops_overflow = ctx.default_native
+            && exec.recording
+            && exec.recorded_flops > 0
+            && exec.recorded_flops.saturating_add(est_flops) > MAX_IGPU_BATCH_FLOPS;
+        if exec.recording
+            && (exec.recorded_dispatches.saturating_add(dispatches) > MAX_SETS
+                || igpu_flops_overflow)
+        {
+            to_recycle.extend(flush_locked(dev, &mut exec)?);
         }
         if !exec.recording {
             begin_batch_locked(dev, &mut exec)?;
@@ -851,6 +921,7 @@ fn record_ops(dev: &VulkanDevice, ops: &[Op<'_>], force_flush: bool) -> Result<(
             emit_gpu_barrier(d, exec.cmd);
         }
         let cmd = exec.cmd;
+        let mut recorded_here = 0u32;
         unsafe {
             for op in ops {
                 match op {
@@ -889,6 +960,8 @@ fn record_ops(dev: &VulkanDevice, ops: &[Op<'_>], force_flush: bool) -> Result<(
                                     .set_layouts(&set_layouts),
                             )
                             .map_err(|e| vk_err(dev, "allocate_descriptor_sets", e))?[0];
+                        exec.recorded_dispatches += 1;
+                        recorded_here += 1;
                         let infos: Vec<[vk::DescriptorBufferInfo; 1]> = binds
                             .iter()
                             .map(|b| {
@@ -934,27 +1007,36 @@ fn record_ops(dev: &VulkanDevice, ops: &[Op<'_>], force_flush: bool) -> Result<(
                 }
             }
         }
-        exec.recorded_dispatches += dispatches;
-        NATIVE_EXEC.fetch_add(dispatches as usize, Ordering::Relaxed);
+        exec.recorded_flops = exec.recorded_flops.saturating_add(est_flops);
+        NATIVE_EXEC.fetch_add(recorded_here as usize, Ordering::Relaxed);
         if force_flush || sync_submit_enabled() {
-            drained |= flush_locked(dev, &mut exec)?;
+            to_recycle.extend(flush_locked(dev, &mut exec)?);
         }
     }
-    if drained {
-        ctx.drain_deferred_returns();
+    if !to_recycle.is_empty() {
+        ctx.recycle_buffers(to_recycle);
     }
     Ok(())
 }
 
 /// Records `ops` into the active command batch (deferred submit).
 pub(crate) fn run_ops(dev: &VulkanDevice, ops: &[Op<'_>]) -> Result<()> {
-    record_ops(dev, ops, false)
+    record_ops(dev, ops, false, 0)
 }
 
-/// Records `ops` and flushes immediately (required when staging or shared scratch
-/// buffers are reused or read on the host right after this call).
+/// Records `ops` into the active command batch with a FLOPs hint for iGPU watchdog budgeting.
+pub(crate) fn run_ops_with_flops(
+    dev: &VulkanDevice,
+    ops: &[Op<'_>],
+    est_flops: u64,
+) -> Result<()> {
+    record_ops(dev, ops, false, est_flops)
+}
+
+/// Records `ops` and flushes immediately (required when host staging buffers are read or
+/// overwritten right after this call).
 pub(crate) fn run_ops_sync(dev: &VulkanDevice, ops: &[Op<'_>]) -> Result<()> {
-    record_ops(dev, ops, true)
+    record_ops(dev, ops, true, 0)
 }
 
 pub(crate) fn wait_idle(dev: &VulkanDevice) -> Result<()> {
@@ -1054,7 +1136,13 @@ pub(crate) fn span(layout: &Layout) -> usize {
 }
 
 fn ready(s: &VulkanStorage, n: usize) -> bool {
-    s.dtype == DType::F32 && native_enabled(&s.device) && n >= min_elems() && fits_u32(n)
+    if s.dtype != DType::F32 || !native_enabled(&s.device) || !fits_u32(n) {
+        return false;
+    }
+    // If a GPU batch is already open, keep small eligible F32 ops on GPU to avoid forcing a
+    // mid-step flush for a CPU fallback (P3a-F06 / P3a-O03).
+    n >= min_elems()
+        || (n > 0 && s.device.ctx().has_pending_gpu_work.load(Ordering::Acquire))
 }
 
 /// Runs `f` and turns an error into a CPU fallback.
@@ -1704,12 +1792,18 @@ pub(crate) fn matmul(
                     .u(sbi)
                     .u(r0)
                     .u(z0);
-                run(
+                let band_flops = (zb as u64)
+                    .saturating_mul(rb as u64)
+                    .saturating_mul(n as u64)
+                    .saturating_mul(k as u64)
+                    .saturating_mul(2);
+                run_with_flops(
                     dev,
                     &k_,
                     &[lhs, rhs, &out],
                     &push.0,
                     [gx as u32, rb.div_ceil(64) as u32, zb as u32],
+                    band_flops,
                 )?;
                 r0 += rb;
             }

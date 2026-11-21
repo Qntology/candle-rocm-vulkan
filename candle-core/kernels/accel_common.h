@@ -253,7 +253,15 @@ AX_DEV void ax_store(ax_bf16 *p, ax_u64 i, float v) { p[i].b = ax_f2bf(v); }
 // ---------------------------------------------------------------------------
 
 #if defined(CANDLE_ACCEL_HOST)
+#if defined(CANDLE_ACCEL_HOST_SHFL) && CANDLE_ACCEL_HOST_SHFL
+#define AX_HAS_WARP32_SHFL 1
+AX_DEV float ax_shfl_xor32(float v, int mask) { return candle_emu::shfl_xor_f32(v, (unsigned)mask); }
+AX_DEV ax_u32 ax_shfl_xor32_u32(ax_u32 v, int mask) {
+    return candle_emu::shfl_xor_u32(v, (unsigned)mask);
+}
+#else
 #define AX_HAS_WARP32_SHFL 0
+#endif
 #elif defined(__HIP__) || defined(__HIPCC__)
 #define AX_HAS_WARP32_SHFL 1
 AX_DEV float ax_shfl_xor32(float v, int mask) { return __shfl_xor(v, mask, 32); }
@@ -346,6 +354,7 @@ AX_DEV void ax_fwht_inplace(float *buf, ax_u32 D, const ax_u32 *sign_bits, float
 
 template <int NT>
 AX_DEV float ax_block_sum(float v, float *red) {
+    static_assert(NT >= 32 && (NT & (NT - 1)) == 0, "ax_block_sum: NT must be a power of two >= 32");
     const ax_u32 t = AX_TID;
     red[t] = v;
     AX_SYNC();
@@ -376,6 +385,7 @@ AX_DEV float ax_block_sum(float v, float *red) {
 
 template <int NT>
 AX_DEV float ax_block_max(float v, float *red) {
+    static_assert(NT >= 32 && (NT & (NT - 1)) == 0, "ax_block_max: NT must be a power of two >= 32");
     const ax_u32 t = AX_TID;
     red[t] = v;
     AX_SYNC();
@@ -408,6 +418,7 @@ AX_DEV float ax_block_max(float v, float *red) {
 // ax_block_max / ax_block_sum per head, bit-identical pairing order).
 template <int NT, int G, bool MAX>
 AX_DEV void ax_block_reduce_g(const float *v, float *red, float *out) {
+    static_assert(NT >= 32 && (NT & (NT - 1)) == 0, "ax_block_reduce_g: NT must be a power of two >= 32");
     const ax_u32 t = AX_TID;
     AX_UNROLL
     for (int g = 0; g < G; ++g) red[g * NT + t] = v[g];

@@ -304,7 +304,18 @@ pub fn fused_gated_delta_rule(
         #[cfg(feature = "vulkan")]
         Device::Vulkan(v) if v.host_shared_memory() => host_gated_delta_rule(&inputs, cfg),
         #[cfg(feature = "vulkan")]
-        Device::Vulkan(v) if crate::vulkan_backend::delta_rule::self_check(v) => {
+        Device::Vulkan(v)
+            if crate::vulkan_backend::delta_rule::self_check_for(
+                v,
+                cfg.head_k_dim,
+                mixed_qkv.dtype(),
+                if a.dtype() != mixed_qkv.dtype() || b.dtype() != mixed_qkv.dtype() {
+                    DType::F32
+                } else {
+                    mixed_qkv.dtype()
+                },
+            ) =>
+        {
             gpu_gated_delta_rule(&inputs, cfg)
         }
         #[cfg(feature = "metal")]

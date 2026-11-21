@@ -13,7 +13,27 @@ use hip_sys::hip_runtime::hipFunction_t;
 use std::collections::HashMap;
 use std::ffi::c_void;
 use std::sync::atomic::{AtomicU8, Ordering};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
+
+/// RAII lease over a named per-device workspace buffer. Keeps the workspace mutex locked until
+/// all kernel launches referencing the pointer have been queued on the NULL compute stream,
+/// preventing concurrent threads from aliasing, reallocating, or releasing the buffer mid-use.
+pub(crate) struct WorkspaceLease<'a> {
+    _guard: MutexGuard<'a, HashMap<&'static str, DeviceBuffer<u8>>>,
+    ptr: *mut u8,
+}
+
+impl WorkspaceLease<'_> {
+    #[inline]
+    pub(crate) fn as_mut_ptr(&self) -> *mut u8 {
+        self.ptr
+    }
+
+    #[inline]
+    pub(crate) fn as_ptr(&self) -> *const u8 {
+        self.ptr as *const u8
+    }
+}
 
 struct RngState {
     seed: Option<u64>,
@@ -430,12 +450,23 @@ impl RocmDevice {
     }
 
     /// Waits for the device, then returns the pool memory above `keep_bytes` to the driver
-    /// (`hipMemPoolTrimTo`).
+    /// (`hipMemPoolTrimTo`), while preserving up to `min(keep_bytes, cache_limit)` bytes in the
+    /// zero-cost buffer reuse cache when `keep_bytes > 0`.
     pub fn trim_memory_pool_to(&self, keep_bytes: usize) -> Result<()> {
         self.synchronize_all()?;
         if self.inner.stream_ordered {
-            self.release_buffer_cache()?;
-            hip_runtime::memory::trim_default_pool_to(self.inner.ordinal as i32, keep_bytes).w()?;
+            let ordinal = self.inner.ordinal as i32;
+            let cache_keep = if keep_bytes == 0 {
+                0
+            } else {
+                keep_bytes.min(hip_runtime::memory::cache_limit())
+            };
+            self.set_current()?;
+            let released = hip_runtime::memory::release_cached_to(ordinal, cache_keep).w()?;
+            if released > 0 {
+                self.inner.hip.synchronize().w()?;
+            }
+            hip_runtime::memory::trim_default_pool_to(ordinal, keep_bytes).w()?;
         }
         Ok(())
     }
@@ -461,27 +492,36 @@ impl RocmDevice {
         Ok(s)
     }
 
-    /// Ensures a named persistent scratch buffer holds at least `bytes` and returns its
-    /// device pointer (reallocated only when growing). Safe for stream-ordered sequential use
-    /// on the NULL compute stream.
-    pub(crate) fn workspace_ensure(&self, name: &'static str, bytes: usize) -> Result<*mut u8> {
+    /// Ensures a named persistent scratch buffer holds at least `bytes` and returns an RAII
+    /// [`WorkspaceLease`] keeping the workspace locked until all kernels using it are queued on
+    /// the NULL compute stream.
+    pub(crate) fn workspace_ensure(
+        &self,
+        name: &'static str,
+        bytes: usize,
+    ) -> Result<WorkspaceLease<'_>> {
         let bytes = bytes.max(256);
         let mut map = self
             .inner
             .workspaces
             .lock()
             .unwrap_or_else(|p| p.into_inner());
-        let needs_alloc = map
-            .get(name)
-            .map_or(true, |buf| buf.byte_size() < bytes);
-        if needs_alloc {
-            let buf = self.alloc(bytes)?;
+        let old_size = map.get(name).map(|b| b.byte_size()).unwrap_or(0);
+        let ptr = if old_size < bytes {
+            // Avoid step-by-step churn when split-KV / lm_head scratch grows modestly.
+            let alloc_bytes = if old_size > 0 && bytes < (16 << 20) {
+                bytes.max(old_size.saturating_mul(2))
+            } else {
+                bytes
+            };
+            let buf = self.alloc(alloc_bytes)?;
             let ptr = buf.as_mut_ptr();
             map.insert(name, buf);
-            Ok(ptr)
+            ptr
         } else {
-            Ok(map.get(name).unwrap().as_mut_ptr())
-        }
+            map.get(name).unwrap().as_mut_ptr()
+        };
+        Ok(WorkspaceLease { _guard: map, ptr })
     }
 
     /// Total bytes currently held by per-device reusable workspaces.
@@ -495,8 +535,10 @@ impl RocmDevice {
             .sum()
     }
 
-    /// Releases all persistent per-device workspaces (split-KV, lm_head, dequant tiles).
+    /// Synchronizes the device and releases all persistent per-device workspaces (split-KV,
+    /// `lm_head`, dequant tiles).
     pub fn release_workspaces(&self) -> Result<()> {
+        self.synchronize_all()?;
         self.inner
             .workspaces
             .lock()
@@ -677,9 +719,14 @@ impl RocmDevice {
         const TILE: usize = 64;
         const MAX_GRID: usize = 65535;
         let grid = if used_skinny {
+            let (gx, gy) = if c.n <= 8 {
+                (c.m.div_ceil(8), c.n)
+            } else {
+                (c.m, c.n.div_ceil(8))
+            };
             (
-                c.m.min(MAX_GRID) as u32,
-                c.n.min(MAX_GRID) as u32,
+                gx.min(MAX_GRID) as u32,
+                gy.min(MAX_GRID) as u32,
                 c.batch.min(MAX_GRID) as u32,
             )
         } else {

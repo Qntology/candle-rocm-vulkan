@@ -17,7 +17,7 @@ use crate::accel::turbo::{
 use crate::{bail, DType, Result};
 use cudarc::driver::{DevicePtr, DevicePtrMut, LaunchConfig, PushKernelArg, SyncOnDrop};
 use std::collections::HashMap;
-use std::sync::Mutex;
+use std::sync::{Mutex, MutexGuard};
 
 fn cc_arch(major: i32, minor: i32) -> &'static str {
     match (major, minor) {
@@ -187,34 +187,37 @@ fn grid_elems(n: usize) -> u32 {
 unsafe impl cudarc::driver::DeviceRepr for PageTable {}
 
 /// Partial outputs and log-sum-exps of a split-KV launch, backed by the per-device `"fa_split_kv"`
-/// workspace (zero per-call stream allocations).
-type Parts = Option<(u64, u64)>;
+/// workspace (zero per-call stream allocations). Holds the workspace lock until both the main
+/// kernel and the combine kernel have been queued on the device stream.
+type Parts<'a> = Option<(MutexGuard<'a, super::device::Workspaces>, u64, u64)>;
 
-fn alloc_parts(dev: &CudaDevice, splits: usize, rows: usize, d: usize) -> Result<Parts> {
+fn alloc_parts<'a>(
+    dev: &'a CudaDevice,
+    splits: usize,
+    rows: usize,
+    d: usize,
+) -> Result<Parts<'a>> {
     if splits <= 1 || rows == 0 || d == 0 {
         return Ok(None);
     }
     let po_bytes = (splits * rows * d * 4).div_ceil(256) * 256;
     let pl_bytes = splits * rows * 4;
-    let base = dev
-        .workspaces
-        .lock()
-        .unwrap_or_else(|p| p.into_inner())
-        .ensure(dev, "fa_split_kv", po_bytes + pl_bytes)?;
-    Ok(Some((base, base + po_bytes as u64)))
+    let mut ws = dev.workspaces();
+    let base = ws.ensure(dev, "fa_split_kv", po_bytes + pl_bytes)?;
+    Ok(Some((ws, base, base + po_bytes as u64)))
 }
 
 /// Merges the key splits in `part` into `out` with the combine kernel `name`.
 fn launch_combine(
     dev: &CudaDevice,
     name: &str,
-    part: Parts,
+    part: Parts<'_>,
     out: &mut CudaStorageSlice,
     rows: usize,
     d: usize,
     splits: usize,
 ) -> Result<()> {
-    let Some((po_p, pl_p)) = part else {
+    let Some((_ws, po_p, pl_p)) = part else {
         return Ok(());
     };
     let stream = dev.cuda_stream();
@@ -298,9 +301,7 @@ impl CudaStorage {
         let mut out = alloc(dev, self.dtype(), rows * d)?;
         if rows > 0 && d > 0 {
             let func = dev.accel_func(&name)?;
-            if smem > 48 * 1024 {
-                func.set_max_dynamic_shared_memory(smem)?;
-            }
+            dev.ensure_func_max_smem(&name, &func, smem)?;
             let stream = dev.cuda_stream();
             let part = alloc_parts(dev, splits, rows, d)?;
             {
@@ -308,7 +309,7 @@ impl CudaStorage {
                 let (k_p, _gk) = dptr(k, geom.k_offset, &stream);
                 let (v_p, _gv) = dptr(v, geom.v_offset, &stream);
                 let (o_p, _go) = dptr_mut(&mut out, &stream);
-                let (po_p, pl_p) = part.unwrap_or((0, 0));
+                let (po_p, pl_p) = part.as_ref().map(|(_, a, b)| (*a, *b)).unwrap_or((0, 0));
                 let (al_p, alibi_bs, _ga) = match extra.alibi {
                     Some((s, off, bs)) => {
                         let (p, g) = dptr(s, off, &stream);
@@ -426,9 +427,7 @@ impl CudaStorage {
         let mut out = alloc(dev, self.dtype(), rows * d)?;
         if rows > 0 && d > 0 {
             let func = dev.accel_func(&name)?;
-            if smem > 48 * 1024 {
-                func.set_max_dynamic_shared_memory(smem)?;
-            }
+            dev.ensure_func_max_smem(&name, &func, smem)?;
             let stream = dev.cuda_stream();
             let part = alloc_parts(dev, splits, rows, d)?;
             {
@@ -442,7 +441,7 @@ impl CudaStorage {
                 }
                 let (q_p, _gq) = dptr(self, geom.q_offset, &stream);
                 let (o_p, _go) = dptr_mut(&mut out, &stream);
-                let (po_p, pl_p) = part.unwrap_or((0, 0));
+                let (po_p, pl_p) = part.as_ref().map(|(_, a, b)| (*a, *b)).unwrap_or((0, 0));
                 let (al_p, alibi_bs, _ga) = match extra.alibi {
                     Some((s, off, bs)) => {
                         let (p, g) = dptr(s, off, &stream);
@@ -839,38 +838,36 @@ impl CudaStorage {
             } else {
                 None
             };
+            let group = tq_attn_group(a.hq, a.hkv);
+            let (kname, grid, smem) = if let Some((tname, br, _bc, tsmem)) = tile_plan {
+                (
+                    tname,
+                    (
+                        a.lq.div_ceil(br).clamp(1, MAX_GRID_X) as u32,
+                        a.hq as u32,
+                        a.b as u32,
+                    ),
+                    tsmem,
+                )
+            } else {
+                (
+                    tq_attn_kernel(&a.k, &a.v, dense.is_none(), group),
+                    (
+                        (a.lq * a.hq / group).clamp(1, MAX_GRID_X) as u32,
+                        splits as u32,
+                        a.b as u32,
+                    ),
+                    a.smem_bytes_for(group),
+                )
+            };
+            let func = dev.accel_func(&kname)?;
+            dev.ensure_func_max_smem(&kname, &func, smem)?;
             let part = if tile_plan.is_some() {
                 None
             } else {
                 alloc_parts(dev, splits, rows, d)?
             };
             {
-                let group = tq_attn_group(a.hq, a.hkv);
-                let (kname, grid, smem) = if let Some((tname, br, _bc, tsmem)) = tile_plan {
-                    (
-                        tname,
-                        (
-                            a.lq.div_ceil(br).clamp(1, MAX_GRID_X) as u32,
-                            a.hq as u32,
-                            a.b as u32,
-                        ),
-                        tsmem,
-                    )
-                } else {
-                    (
-                        tq_attn_kernel(&a.k, &a.v, dense.is_none(), group),
-                        (
-                            (a.lq * a.hq / group).clamp(1, MAX_GRID_X) as u32,
-                            splits as u32,
-                            a.b as u32,
-                        ),
-                        a.smem_bytes_for(group),
-                    )
-                };
-                let func = dev.accel_func(&kname)?;
-                if smem > 48 * 1024 {
-                    func.set_max_dynamic_shared_memory(smem)?;
-                }
                 let (table, _gt) = match dense {
                     Some(_) => (None, Vec::new()),
                     None => {
@@ -903,7 +900,7 @@ impl CudaStorage {
                     None => (0, None),
                 };
                 let (o_p, _g6) = dptr_mut(&mut out, &stream);
-                let (po_p, pl_p) = part.unwrap_or((0, 0));
+                let (po_p, pl_p) = part.as_ref().map(|(_, a, b)| (*a, *b)).unwrap_or((0, 0));
                 let ptrs: [u64; 8] = [q_p, k_p, v_p, t_p, al_p, o_p, po_p, pl_p];
                 let dims: [u32; 5] = [
                     a.lq as u32,

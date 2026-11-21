@@ -579,6 +579,102 @@ mod x86_simd {
     }
 }
 
+#[cfg(target_arch = "aarch64")]
+mod aarch64_simd {
+    use core::arch::aarch64::*;
+    use half::{bf16, f16};
+
+    /// Widening f16 -> f32 dot product accumulating strictly in f32 lanes (`Q6-F02`/`Q6-O02`).
+    /// Never narrows to f16 accumulation even when `+fp16` is enabled (e.g. Apple Silicon).
+    #[inline]
+    pub(super) unsafe fn dot_f16_to_f32_neon(a: *const f16, b: *const f16, n: usize) -> f32 {
+        let mut s0 = vdupq_n_f32(0.0);
+        let mut s1 = vdupq_n_f32(0.0);
+        let mut i = 0usize;
+        while i + 8 <= n {
+            let av = vld1q_u16(a.add(i) as *const u16);
+            let bv = vld1q_u16(b.add(i) as *const u16);
+            let a_lo = vcvt_f32_f16(vreinterpret_f16_u16(vget_low_u16(av)));
+            let b_lo = vcvt_f32_f16(vreinterpret_f16_u16(vget_low_u16(bv)));
+            let a_hi = vcvt_f32_f16(vreinterpret_f16_u16(vget_high_u16(av)));
+            let b_hi = vcvt_f32_f16(vreinterpret_f16_u16(vget_high_u16(bv)));
+            s0 = vfmaq_f32(s0, a_lo, b_lo);
+            s1 = vfmaq_f32(s1, a_hi, b_hi);
+            i += 8;
+        }
+        let mut sum = vaddvq_f32(vaddq_f32(s0, s1));
+        while i < n {
+            sum += (*a.add(i)).to_f32() * (*b.add(i)).to_f32();
+            i += 1;
+        }
+        sum
+    }
+
+    #[inline]
+    pub(super) unsafe fn fmadd_f16_to_f32_neon(acc: *mut f32, v: *const f16, w: f32, n: usize) {
+        let wv = vdupq_n_f32(w);
+        let mut i = 0usize;
+        while i + 8 <= n {
+            let vv = vld1q_u16(v.add(i) as *const u16);
+            let v_lo = vcvt_f32_f16(vreinterpret_f16_u16(vget_low_u16(vv)));
+            let v_hi = vcvt_f32_f16(vreinterpret_f16_u16(vget_high_u16(vv)));
+            let a_lo = vld1q_f32(acc.add(i));
+            let a_hi = vld1q_f32(acc.add(i + 4));
+            vst1q_f32(acc.add(i), vfmaq_f32(a_lo, v_lo, wv));
+            vst1q_f32(acc.add(i + 4), vfmaq_f32(a_hi, v_hi, wv));
+            i += 8;
+        }
+        while i < n {
+            *acc.add(i) += (*v.add(i)).to_f32() * w;
+            i += 1;
+        }
+    }
+
+    #[inline]
+    pub(super) unsafe fn dot_bf16_to_f32_neon(a: *const bf16, b: *const bf16, n: usize) -> f32 {
+        let mut s0 = vdupq_n_f32(0.0);
+        let mut s1 = vdupq_n_f32(0.0);
+        let mut i = 0usize;
+        while i + 8 <= n {
+            let av = vld1q_u16(a.add(i) as *const u16);
+            let bv = vld1q_u16(b.add(i) as *const u16);
+            let a_lo = vreinterpretq_f32_u32(vshll_n_u16::<16>(vget_low_u16(av)));
+            let b_lo = vreinterpretq_f32_u32(vshll_n_u16::<16>(vget_low_u16(bv)));
+            let a_hi = vreinterpretq_f32_u32(vshll_n_u16::<16>(vget_high_u16(av)));
+            let b_hi = vreinterpretq_f32_u32(vshll_n_u16::<16>(vget_high_u16(bv)));
+            s0 = vfmaq_f32(s0, a_lo, b_lo);
+            s1 = vfmaq_f32(s1, a_hi, b_hi);
+            i += 8;
+        }
+        let mut sum = vaddvq_f32(vaddq_f32(s0, s1));
+        while i < n {
+            sum += (*a.add(i)).to_f32() * (*b.add(i)).to_f32();
+            i += 1;
+        }
+        sum
+    }
+
+    #[inline]
+    pub(super) unsafe fn fmadd_bf16_to_f32_neon(acc: *mut f32, v: *const bf16, w: f32, n: usize) {
+        let wv = vdupq_n_f32(w);
+        let mut i = 0usize;
+        while i + 8 <= n {
+            let vv = vld1q_u16(v.add(i) as *const u16);
+            let v_lo = vreinterpretq_f32_u32(vshll_n_u16::<16>(vget_low_u16(vv)));
+            let v_hi = vreinterpretq_f32_u32(vshll_n_u16::<16>(vget_high_u16(vv)));
+            let a_lo = vld1q_f32(acc.add(i));
+            let a_hi = vld1q_f32(acc.add(i + 4));
+            vst1q_f32(acc.add(i), vfmaq_f32(a_lo, v_lo, wv));
+            vst1q_f32(acc.add(i + 4), vfmaq_f32(a_hi, v_hi, wv));
+            i += 8;
+        }
+        while i < n {
+            *acc.add(i) += (*v.add(i)).to_f32() * w;
+            i += 1;
+        }
+    }
+}
+
 #[inline]
 pub(crate) unsafe fn vec_dot_f32_simd(a: *const f32, b: *const f32, n: usize) -> f32 {
     #[cfg(target_arch = "x86_64")]
@@ -603,7 +699,7 @@ pub(crate) fn vec_fmadd_f32_simd(acc: &mut [f32], v: &[f32], w: f32) {
         }
     }
     for i in 0..n {
-        acc[i] = v[i].mul_add(w, acc[i]);
+        acc[i] += v[i] * w;
     }
 }
 
@@ -618,9 +714,16 @@ pub(crate) unsafe fn vec_dot_f16_to_f32_simd(a: *const f16, b: *const f16, n: us
             return x86_simd::dot_f16_avx2(a, b, n);
         }
     }
-    let mut res = 0.0f32;
-    vec_dot_f16(a, b, &mut res, n);
-    res
+    #[cfg(target_arch = "aarch64")]
+    {
+        return aarch64_simd::dot_f16_to_f32_neon(a, b, n);
+    }
+    #[cfg(not(target_arch = "aarch64"))]
+    {
+        let mut res = 0.0f32;
+        vec_dot_f16(a, b, &mut res, n);
+        res
+    }
 }
 
 #[inline]
@@ -636,8 +739,14 @@ pub(crate) fn vec_fmadd_f16_to_f32_simd(acc: &mut [f32], v: &[f16], w: f32) {
             return;
         }
     }
+    #[cfg(target_arch = "aarch64")]
+    {
+        unsafe { aarch64_simd::fmadd_f16_to_f32_neon(acc.as_mut_ptr(), v.as_ptr(), w, n) };
+        return;
+    }
+    #[cfg(not(target_arch = "aarch64"))]
     for i in 0..n {
-        acc[i] = v[i].to_f32().mul_add(w, acc[i]);
+        acc[i] += v[i].to_f32() * w;
     }
 }
 
@@ -649,9 +758,16 @@ pub(crate) unsafe fn vec_dot_bf16_to_f32_simd(a: *const bf16, b: *const bf16, n:
             return x86_simd::dot_bf16_avx2(a, b, n);
         }
     }
-    let mut res = 0.0f32;
-    vec_dot_bf16(a, b, &mut res, n);
-    res
+    #[cfg(target_arch = "aarch64")]
+    {
+        return aarch64_simd::dot_bf16_to_f32_neon(a, b, n);
+    }
+    #[cfg(not(target_arch = "aarch64"))]
+    {
+        let mut res = 0.0f32;
+        vec_dot_bf16(a, b, &mut res, n);
+        res
+    }
 }
 
 #[inline]
@@ -664,7 +780,13 @@ pub(crate) fn vec_fmadd_bf16_to_f32_simd(acc: &mut [f32], v: &[bf16], w: f32) {
             return;
         }
     }
+    #[cfg(target_arch = "aarch64")]
+    {
+        unsafe { aarch64_simd::fmadd_bf16_to_f32_neon(acc.as_mut_ptr(), v.as_ptr(), w, n) };
+        return;
+    }
+    #[cfg(not(target_arch = "aarch64"))]
     for i in 0..n {
-        acc[i] = v[i].to_f32().mul_add(w, acc[i]);
+        acc[i] += v[i].to_f32() * w;
     }
 }

@@ -18,6 +18,14 @@ fn null() -> *const u8 {
     std::ptr::null()
 }
 
+/// RAII lease over the per-device `"fa_split_kv"` workspace for `(part_o, part_lse)`.
+/// Keeps the workspace mutex locked until both the main kernel and combine kernel are queued.
+struct SplitKvLease<'a> {
+    _lease: super::device::WorkspaceLease<'a>,
+    po: *const u8,
+    pl: *const u8,
+}
+
 /// Ensures the per-device `"fa_split_kv"` workspace holds `(part_o, part_lse)` for `splits > 1`,
 /// returning 256-byte aligned pointers with zero per-call HIP allocations.
 fn split_kv_ptrs(
@@ -25,16 +33,20 @@ fn split_kv_ptrs(
     splits: usize,
     rows: usize,
     d: usize,
-) -> Result<Option<(*const u8, *const u8)>> {
+) -> Result<Option<SplitKvLease<'_>>> {
     if splits <= 1 || rows == 0 || d == 0 {
         return Ok(None);
     }
     let po_bytes = (splits * rows * d * 4).div_ceil(256) * 256;
     let pl_bytes = splits * rows * 4;
-    let base = dev.workspace_ensure("fa_split_kv", po_bytes + pl_bytes)?;
-    let po = base as *const u8;
-    let pl = unsafe { base.add(po_bytes) } as *const u8;
-    Ok(Some((po, pl)))
+    let lease = dev.workspace_ensure("fa_split_kv", po_bytes + pl_bytes)?;
+    let po = lease.as_ptr();
+    let pl = unsafe { lease.as_ptr().add(po_bytes) };
+    Ok(Some(SplitKvLease {
+        _lease: lease,
+        po,
+        pl,
+    }))
 }
 
 fn half_sfx(dtype: DType, op: &str) -> Result<&'static str> {
@@ -123,8 +135,8 @@ impl RocmStorage {
             .ptr(k.ptr_at(geom.k_offset))
             .ptr(v.ptr_at(geom.v_offset))
             .ptr(out.as_ptr())
-            .ptr(part.map(|p| p.0).unwrap_or(null()))
-            .ptr(part.map(|p| p.1).unwrap_or(null()))
+            .ptr(part.as_ref().map(|p| p.po).unwrap_or(null()))
+            .ptr(part.as_ref().map(|p| p.pl).unwrap_or(null()))
             .ptr(alibi)
             .ptr(cu_q)
             .ptr(cu_k)
@@ -148,14 +160,14 @@ impl RocmStorage {
             .usize(rows);
         self.device
             .launch(func, grid, (FA_THREADS as u32, 1, 1), smem as u32, &mut a)?;
-        if let Some((po, pl)) = part {
+        if let Some(p) = part {
             let sfx = half_sfx(self.dtype, "flash-attn")?;
             let comb = self
                 .device
                 .get_func(Module::FlashAttn, &format!("fa_combine_{sfx}"))?;
             let mut a = LaunchArgs::new();
-            a.ptr(po)
-                .ptr(pl)
+            a.ptr(p.po)
+                .ptr(p.pl)
                 .ptr(out.as_ptr())
                 .usize(rows)
                 .u32(d as u32)
@@ -232,8 +244,8 @@ impl RocmStorage {
             .ptr(null())
             .ptr(null())
             .ptr(out.as_ptr())
-            .ptr(part.map(|p| p.0).unwrap_or(null()))
-            .ptr(part.map(|p| p.1).unwrap_or(null()))
+            .ptr(part.as_ref().map(|p| p.po).unwrap_or(null()))
+            .ptr(part.as_ref().map(|p| p.pl).unwrap_or(null()))
             .ptr(alibi)
             .ptr(null())
             .ptr(null())
@@ -258,14 +270,14 @@ impl RocmStorage {
             .words(table.to_words());
         self.device
             .launch(func, grid, (FA_THREADS as u32, 1, 1), smem as u32, &mut a)?;
-        if let Some((po, pl)) = part {
+        if let Some(p) = part {
             let sfx = half_sfx(self.dtype, "flash-attn")?;
             let comb = self
                 .device
                 .get_func(Module::FlashAttn, &format!("fa_combine_{sfx}"))?;
             let mut a = LaunchArgs::new();
-            a.ptr(po)
-                .ptr(pl)
+            a.ptr(p.po)
+                .ptr(p.pl)
                 .ptr(out.as_ptr())
                 .usize(rows)
                 .u32(d as u32)
@@ -647,10 +659,10 @@ impl RocmStorage {
             }
         }
         let splits = a.splits.max(1);
-        let part = split_kv_ptrs(&self.device, splits, rows, d)?;
         let group = tq_attn_group(a.hq, a.hkv);
         let name = tq_attn_kernel(&a.k, &a.v, table.is_some(), group);
         let func = self.device.get_func(Module::TurboQuant, &name)?;
+        let part = split_kv_ptrs(&self.device, splits, rows, d)?;
         let mut l = LaunchArgs::new();
         l.ptr(self.ptr_at(a.q_offset))
             .ptr(k_p)
@@ -658,8 +670,8 @@ impl RocmStorage {
             .ptr(tab.ptr_at(tab_off))
             .ptr(alibi.map(|(s, o)| s.ptr_at(o)).unwrap_or(null()))
             .ptr(out.as_ptr())
-            .ptr(part.map(|p| p.0).unwrap_or(null()))
-            .ptr(part.map(|p| p.1).unwrap_or(null()))
+            .ptr(part.as_ref().map(|p| p.po).unwrap_or(null()))
+            .ptr(part.as_ref().map(|p| p.pl).unwrap_or(null()))
             .u32(a.lq as u32)
             .u32(a.lk as u32)
             .u32(a.hq as u32)
@@ -704,11 +716,11 @@ impl RocmStorage {
             a.smem_bytes_for(group) as u32,
             &mut l,
         )?;
-        if let Some((po, pl)) = part {
+        if let Some(p) = part {
             let comb = self.device.get_func(Module::TurboQuant, "tq_combine")?;
             let mut l = LaunchArgs::new();
-            l.ptr(po)
-                .ptr(pl)
+            l.ptr(p.po)
+                .ptr(p.pl)
                 .ptr(out.as_ptr())
                 .usize(rows)
                 .u32(d as u32)

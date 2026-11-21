@@ -346,7 +346,9 @@ impl QStorage {
             QStorage::Cpu(storage) => Ok(Storage::Cpu(storage.dequantize(elem_count)?)),
             QStorage::Metal(storage) => Ok(Storage::Metal(storage.dequantize(elem_count)?)),
             QStorage::Cuda(storage) => Ok(Storage::Cuda(storage.dequantize(elem_count)?)),
-            QStorage::Rocm(storage) => Ok(Storage::Rocm(storage.dequantize(elem_count)?)),
+            QStorage::Rocm(storage) => Ok(Storage::Rocm(
+                storage.dequantize_range_to(0, elem_count, DType::F32)?,
+            )),
             QStorage::OpenCl(storage) => {
                 let cpu = storage.to_cpu_storage()?;
                 Ok(Storage::OpenCl(storage.device.storage_from_cpu_storage(&cpu)?))
@@ -833,7 +835,7 @@ impl QTensor {
                     .to_device(device)
             }
             QStorage::Rocm(s) => {
-                let s = s.dequantize_f16(self.shape.elem_count())?;
+                let s = s.dequantize_range_to(0, self.shape.elem_count(), DType::F16)?;
                 let none = crate::op::BackpropOp::none();
                 crate::tensor::from_storage(Storage::Rocm(s), self.shape.clone(), none, false)
                     .to_device(device)
@@ -890,8 +892,7 @@ impl QTensor {
     }
 
     /// Rows `row0..row0 + nrows` of a 2D quantized matrix, dequantized to `dtype` on `device`
-    /// (see [`Self::dequantize_to`]). Only the selected rows are converted on CUDA; the other
-    /// backends dequantize the whole matrix and narrow it.
+    /// (see [`Self::dequantize_to`]). Only the selected rows are converted on CUDA, ROCm, and CPU.
     pub fn dequantize_rows_to(
         &self,
         row0: usize,
@@ -902,6 +903,9 @@ impl QTensor {
         let (n, k) = self.shape.dims2()?;
         if row0 + nrows > n {
             crate::bail!("dequantize_rows_to: rows {row0}..{} out of {n}", row0 + nrows)
+        }
+        if nrows == 0 {
+            return Tensor::zeros((0, k), dtype, device);
         }
         match &self.storage {
             QStorage::Cuda(s) => {
@@ -914,6 +918,21 @@ impl QTensor {
                 let st = s.dequantize_range_to(row0 * k, nrows * k, dtype)?;
                 let none = crate::op::BackpropOp::none();
                 crate::tensor::from_storage(Storage::Rocm(st), (nrows, k), none, false)
+                    .to_device(device)
+            }
+            QStorage::Cpu(_) if k.is_multiple_of(self.dtype().block_size()) => {
+                let raw = self.storage.data()?;
+                let row_bytes = (k / self.dtype().block_size()) * self.dtype().type_size();
+                let slice = &raw[row0 * row_bytes..(row0 + nrows) * row_bytes];
+                let qsub = QStorage::from_data(
+                    std::borrow::Cow::Borrowed(slice),
+                    &Device::Cpu,
+                    self.dtype(),
+                )?;
+                let st = qsub.dequantize(nrows * k)?;
+                let none = crate::op::BackpropOp::none();
+                crate::tensor::from_storage(st, (nrows, k), none, false)
+                    .to_dtype(dtype)?
                     .to_device(device)
             }
             _ => self.dequantize_to(dtype, device)?.narrow(0, row0, nrows),
@@ -987,6 +1006,18 @@ impl QTensor {
                 };
                 let none = crate::op::BackpropOp::none();
                 Ok(crate::tensor::from_storage(Storage::Rocm(st), shape, none, false))
+            }
+            // VRAM-resident GpuQuant on Vulkan already performs exact weight-only F32 matmul
+            // without activation quantization (avoids materializing a full dense weight matrix).
+            #[cfg(feature = "vulkan")]
+            QStorage::Vulkan(s) if s.is_on_gpu() => {
+                let xs = xs.contiguous()?;
+                let (st, shape) = match &*xs.storage() {
+                    Storage::Vulkan(x) => s.fwd(&self.shape, x, xs.layout())?,
+                    _ => crate::bail!("forward_exact: the input is not on the weight's Vulkan device"),
+                };
+                let none = crate::op::BackpropOp::none();
+                Ok(crate::tensor::from_storage(Storage::Vulkan(st), shape, none, false))
             }
             // Metal's native quantized matmul/matvec accepts F32 activations directly without
             // activation quantization, avoiding materializing a full F32 weight buffer every call.
@@ -1119,6 +1150,15 @@ impl QTensor {
             },
             QStorage::Vulkan(s) => match (&*x.storage(), &*ids.storage()) {
                 (Storage::Vulkan(x_storage), Storage::Vulkan(ids_storage)) => {
+                    let (_n_experts, _n, k) = self.shape().dims3()?;
+                    let (batch, topk) = ids.dims2()?;
+                    let x_dims = x.dims();
+                    match x_dims {
+                        [b, k_in] if *b == batch && *k_in == k => {}
+                        [b, tk, k_in]
+                            if *b == batch && (*tk == 1 || *tk == topk) && *k_in == k => {}
+                        _ => crate::bail!("indexed_moe_forward: incompatible x shape {x_dims:?}"),
+                    }
                     let (storage, out_shape) = s.indexed_moe_forward(
                         self.shape(),
                         x_storage,
@@ -1136,8 +1176,9 @@ impl QTensor {
                 _ => crate::bail!("indexed_moe_forward: inputs must be on the Vulkan weight device"),
             },
             _ => {
-                // Portable fallback (CPU / Metal / OpenCL): dequantize selected experts and multiply.
-                let (_n_experts, n, k) = self.shape().dims3()?;
+                // Portable fallback (CPU / Metal / OpenCL): dequantize only the selected unique
+                // experts rather than the entire `[E, n, k]` tensor (P5-F22 / P5-O17).
+                let (n_experts, n, k) = self.shape().dims3()?;
                 let (batch, topk) = ids.dims2()?;
                 let x_dims = x.dims();
                 let x_has_topk = match x_dims {
@@ -1148,17 +1189,69 @@ impl QTensor {
                     _ => crate::bail!("indexed_moe_forward: incompatible x shape {x_dims:?}"),
                 };
                 let in_dtype = x.dtype();
-                let ids_vec = ids.to_device(&Device::Cpu)?.to_dtype(DType::U32)?.flatten_all()?.to_vec1::<u32>()?;
-                let w_f32 = self.dequantize(&Device::Cpu)?;
+                if batch == 0 || topk == 0 || n == 0 {
+                    return Tensor::zeros((batch, topk, n), in_dtype, x.device());
+                }
+                let ids_vec = ids
+                    .to_device(&Device::Cpu)?
+                    .to_dtype(DType::U32)?
+                    .flatten_all()?
+                    .to_vec1::<u32>()?;
                 let x_f32 = x.to_device(&Device::Cpu)?.to_dtype(DType::F32)?;
                 let x_flat = x_f32.reshape((if x_has_topk { batch * topk } else { batch }, k))?;
+
+                let mut expert_weights: std::collections::HashMap<usize, Tensor> =
+                    std::collections::HashMap::new();
+                let bs = self.dtype().block_size();
+                if k.is_multiple_of(bs) {
+                    let raw = self.storage.data()?;
+                    let exp_bytes = (n * (k / bs)) * self.dtype().type_size();
+                    let none = crate::op::BackpropOp::none;
+                    for &eid in &ids_vec {
+                        let e = eid as usize;
+                        if e >= n_experts {
+                            crate::bail!(
+                                "indexed_moe_forward: expert id {e} out of bounds for {n_experts}"
+                            );
+                        }
+                        if let std::collections::hash_map::Entry::Vacant(ent) =
+                            expert_weights.entry(e)
+                        {
+                            let slice = &raw[e * exp_bytes..(e + 1) * exp_bytes];
+                            let qsub = QStorage::from_data(
+                    std::borrow::Cow::Borrowed(slice),
+                    &Device::Cpu,
+                    self.dtype(),
+                )?;
+                            let st = qsub.dequantize(n * k)?;
+                            let w_e = crate::tensor::from_storage(st, (n, k), none(), false);
+                            ent.insert(w_e.t()?);
+                        }
+                    }
+                } else {
+                    let w_f32 = self.dequantize(&Device::Cpu)?;
+                    for &eid in &ids_vec {
+                        let e = eid as usize;
+                        if e >= n_experts {
+                            crate::bail!(
+                                "indexed_moe_forward: expert id {e} out of bounds for {n_experts}"
+                            );
+                        }
+                        if let std::collections::hash_map::Entry::Vacant(ent) =
+                            expert_weights.entry(e)
+                        {
+                            ent.insert(w_f32.narrow(0, e, 1)?.squeeze(0)?.t()?);
+                        }
+                    }
+                }
+
                 let mut rows_out = Vec::with_capacity(batch * topk);
                 for slot in 0..batch * topk {
                     let e = ids_vec[slot] as usize;
                     let xr = if x_has_topk { slot } else { slot / topk };
-                    let w_e = w_f32.narrow(0, e, 1)?.squeeze(0)?; // [n, k]
+                    let w_et = &expert_weights[&e]; // [k, n]
                     let x_r = x_flat.narrow(0, xr, 1)?; // [1, k]
-                    rows_out.push(x_r.matmul(&w_e.t()?)?); // [1, n]
+                    rows_out.push(x_r.matmul(w_et)?); // [1, n]
                 }
                 let out = Tensor::cat(&rows_out, 0)?.reshape((batch, topk, n))?;
                 out.to_device(x.device())?.to_dtype(in_dtype)

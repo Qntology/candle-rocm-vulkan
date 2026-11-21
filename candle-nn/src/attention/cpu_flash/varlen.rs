@@ -7,6 +7,7 @@
 
 #![allow(clippy::cast_possible_truncation, clippy::cast_precision_loss)]
 
+use candle::cpu::kernels::VecOps;
 use candle::{DType, Device, Result, Storage, Tensor};
 use half::f16;
 use rayon::prelude::*;
@@ -257,9 +258,7 @@ pub fn flash_attn_varlen_cpu(
                         let v_base = ((start_k + j) * hv + v_head) * d;
                         let v_row = &v_data[v_base..v_base + d];
                         online_softmax_step(score, &mut m, &mut ssum, acc, |acc, w| {
-                            for t in 0..d {
-                                acc[t] += v_row[t] * w;
-                            }
+                            <f32 as VecOps>::vec_fmadd_to_f32(acc, v_row, w);
                         });
                     }
 
@@ -347,10 +346,9 @@ pub fn flash_attn_varlen_cpu(
                         }
 
                         let v_base = ((start_k + j) * hv + v_head) * d;
+                        let v_row = &v_data[v_base..v_base + d];
                         online_softmax_step(score, &mut m, &mut ssum, acc, |acc, w| {
-                            for t in 0..d {
-                                acc[t] += v_data[v_base + t].to_f32() * w;
-                            }
+                            <f16 as VecOps>::vec_fmadd_to_f32(acc, v_row, w);
                         });
                     }
 

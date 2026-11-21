@@ -58,7 +58,7 @@ fn vram_reserve() -> u64 {
 pub(crate) fn enabled(dev: &VulkanDevice) -> bool {
     shaders::exec_mode() != shaders::ExecMode::Host
         && weights_enabled_env()
-        && dev.ctx().device_type != vk::PhysicalDeviceType::CPU
+        && (dev.ctx().device_type != vk::PhysicalDeviceType::CPU || shaders::test_force_fused())
         && dev.ctx().native_ok.load(Ordering::Relaxed)
 }
 
@@ -67,7 +67,7 @@ fn pretend_integrated() -> bool {
     *V.get_or_init(|| env_on("CANDLE_VULKAN_PRETEND_INTEGRATED", false))
 }
 
-fn unified(ctx: &VulkanContext) -> bool {
+pub(crate) fn unified(ctx: &VulkanContext) -> bool {
     ctx.default_native || pretend_integrated()
 }
 
@@ -434,7 +434,26 @@ impl Scratch<'_> {
     }
 }
 
-fn scratch(ctx: &VulkanContext, bytes: usize) -> Result<Scratch<'_>> {
+/// Locks the scratch slot, flushes any pending GPU batch that may reference it, and frees it.
+/// Preserves the global lock order (`scratch` -> `exec`).
+pub(crate) fn release_scratch_synced(dev: &VulkanDevice) -> Result<()> {
+    let ctx = dev.ctx();
+    let mut guard = ctx
+        .gpu
+        .scratch
+        .lock()
+        .map_err(|_| Error::Msg("vulkan: scratch state poisoned".into()))?;
+    if guard.is_some() {
+        let _ = shaders::flush(dev);
+        if let Some(r) = guard.take() {
+            ctx.gpu.free_raw(&ctx.device, r);
+        }
+    }
+    Ok(())
+}
+
+fn scratch(dev: &VulkanDevice, bytes: usize) -> Result<Scratch<'_>> {
+    let ctx = dev.ctx();
     let mut guard = ctx
         .gpu
         .scratch
@@ -443,8 +462,12 @@ fn scratch(ctx: &VulkanContext, bytes: usize) -> Result<Scratch<'_>> {
     let need = bytes.max(1 << 20).next_power_of_two();
     let ok = guard.as_ref().map(|r| r.size >= bytes).unwrap_or(false);
     if !ok {
-        if let Some(r) = guard.take() {
-            ctx.gpu.free_raw(&ctx.device, r);
+        if guard.is_some() {
+            // Flush any pending dispatches referencing the previous scratch buffer before freeing.
+            shaders::flush(dev)?;
+            if let Some(r) = guard.take() {
+                ctx.gpu.free_raw(&ctx.device, r);
+            }
         }
         let (buffer, memory, _mapped, local, size) = alloc_raw(ctx, need, Use::Scratch)?;
         *guard = Some(RawBuf {
@@ -465,7 +488,7 @@ fn push(vals: &[usize]) -> Vec<u8> {
     v
 }
 
-fn storage_bind(s: &VulkanStorage) -> Bind {
+pub(crate) fn storage_bind(s: &VulkanStorage) -> Bind {
     Bind {
         buffer: s.buffer,
         offset: 0,
@@ -477,40 +500,47 @@ fn fits_u32(v: usize) -> bool {
     v <= u32::MAX as usize
 }
 
+/// Records `prefix` + `dispatches` into the active deferred command batch.
+///
+/// Even when the shared scratch buffer is used on discrete GPUs, intra-batch execution/memory
+/// barriers (`emit_gpu_barrier` + `Op::Barrier`) strictly order prior reads before subsequent
+/// overwrites, and `scratch()` / `release_scratch_synced()` flush before freeing or resizing.
+/// Therefore no per-call `run_ops_sync` is needed (fixes `P3b-F01` / `P3a-F05`).
 fn submit(
     dev: &VulkanDevice,
     prefix: Vec<Op<'_>>,
     dispatches: Vec<Op<'_>>,
-    uses_scratch: bool,
+    est_flops: u64,
 ) -> Result<()> {
     let mut pending: Vec<Op<'_>> = prefix;
     let mut count = 0u32;
     let total_dispatches = dispatches.len();
+    let per_dispatch_flops = if total_dispatches > 0 {
+        est_flops / total_dispatches as u64
+    } else {
+        0
+    };
+    let mut pending_flops = 0u64;
     for (idx, d) in dispatches.into_iter().enumerate() {
         let is_last = idx + 1 == total_dispatches;
         if count == shaders::MAX_SETS {
-            shaders::run_ops(dev, &pending)?;
+            shaders::run_ops_with_flops(dev, &pending, pending_flops)?;
             pending = Vec::new();
             count = 0;
+            pending_flops = 0;
         }
         pending.push(d);
         count += 1;
+        pending_flops = pending_flops.saturating_add(per_dispatch_flops);
         if is_last && !pending.is_empty() {
-            if uses_scratch {
-                shaders::run_ops_sync(dev, &pending)?;
-            } else {
-                shaders::run_ops(dev, &pending)?;
-            }
+            shaders::run_ops_with_flops(dev, &pending, pending_flops)?;
             pending = Vec::new();
             count = 0;
+            pending_flops = 0;
         }
     }
     if !pending.is_empty() {
-        if uses_scratch {
-            shaders::run_ops_sync(dev, &pending)?;
-        } else {
-            shaders::run_ops(dev, &pending)?;
-        }
+        shaders::run_ops_with_flops(dev, &pending, pending_flops)?;
     }
     Ok(())
 }
@@ -1314,7 +1344,7 @@ layout(set = 0, binding = 3) readonly buffer WA {{ uint wa[]; }};
 layout(set = 0, binding = 4) buffer Y {{ float y[]; }};
 layout(push_constant, std430) uniform PC {{
     uint bsz; uint topk; uint x_stride_t; uint n_exp;
-    uint n; uint k; uint nb; uint x_off; uint ids_off; uint c0;
+    uint n; uint k; uint nb; uint x_off; uint ids_off; uint c0; uint bt0;
 }} pc;
 {QUANT_BYTE_HELPERS}
 shared float red[256];
@@ -1322,7 +1352,7 @@ void main() {{
     uint t = gl_LocalInvocationID.x;
     uint lane = t & 31u;
     uint col = pc.c0 + gl_WorkGroupID.x * 8u + (t >> 5u);
-    uint bt = gl_WorkGroupID.y;
+    uint bt = pc.bt0 + gl_WorkGroupID.y;
     uint bi = bt / pc.topk;
     uint ti = bt - bi * pc.topk;
     float acc = 0.0;
@@ -1569,23 +1599,31 @@ impl GpuQuant {
         let max_groups = dev.limits().max_workgroup_count;
         let ctx = dev.ctx();
         let row_bytes = k * 4;
-        let band = if unified(ctx) || m * row_bytes <= scratch_cap() {
+        let mut band = if unified(ctx) || m * row_bytes <= scratch_cap() {
             m
         } else {
             ((scratch_cap() / row_bytes) / 64 * 64).max(64).min(m)
         };
+        if !gemv && unified(ctx) {
+            // Ensure even a 64-col tile dispatch stays within MAX_DISPATCH_FLOPS on iGPU (P3b-F05).
+            let max_rows_for_flops = (MAX_DISPATCH_FLOPS / (2 * 64 * k).max(1)) / 64 * 64;
+            if max_rows_for_flops >= 64 && band > max_rows_for_flops {
+                band = max_rows_for_flops.min(m);
+            }
+        }
         let cols_per = if gemv {
             (max_groups[0] as usize).min(65535) * 8
         } else {
             let by_flops = (MAX_DISPATCH_FLOPS / (2 * band.min(m) * k).max(1)) / 64 * 64;
             by_flops.max(64).min((max_groups[0] as usize).min(65535) * 64)
         };
+        // If VRAM scratch allocation fails under high weight pressure, fall back to binding
+        // host-visible X directly on GPU rather than downloading weights to CPU (P3b-F02).
         let scratch_guard = if unified(ctx) {
             None
         } else {
-            Some(scratch(ctx, band * row_bytes)?)
+            scratch(&dev, band * row_bytes).ok()
         };
-        let uses_scratch = scratch_guard.is_some();
         let mut r0 = 0;
         while r0 < m {
             let rows = band.min(m - r0);
@@ -1632,7 +1670,11 @@ impl GpuQuant {
                 });
                 c0 += cols;
             }
-            submit(&dev, prefix, dispatches, uses_scratch)?;
+            let band_flops = (rows as u64)
+                .saturating_mul(n as u64)
+                .saturating_mul(k as u64)
+                .saturating_mul(2);
+            submit(&dev, prefix, dispatches, band_flops)?;
             r0 += rows;
         }
         drop(scratch_guard);
@@ -1654,14 +1696,21 @@ impl GpuQuant {
         }
         let (bsz, topk) = ids_l.shape().dims2()?;
         let x_dims = x_l.dims();
-        let x_stride_t = if x_dims.len() == 3 { x_dims[1] } else { 1 };
+        let x_stride_t = match x_dims {
+            [b, k_in] if *b == bsz && *k_in == k => 1,
+            [b, tk, k_in] if *b == bsz && (*tk == 1 || *tk == topk) && *k_in == k => *tk,
+            _ => crate::bail!(
+                "vulkan {:?} moe: incompatible x shape {x_dims:?} for batch={bsz}, topk={topk}, k={k}",
+                self.fmt
+            ),
+        };
         let mut converted = None;
         let (xs, x_off) = Self::prep_f32_input(&dev, x, x_l, &mut converted)?;
         let ids_owned;
         let (ids_s, ids_off) = match (ids.dtype, ids_l.contiguous_offsets()) {
             (DType::U32, Some((a, _))) => (ids, a),
             _ => {
-                let v = ids.host_view().to_dtype(ids_l, DType::U32)?;
+                let v = ids.try_host_view()?.to_dtype(ids_l, DType::U32)?;
                 ids_owned = dev.storage_from_cpu_storage(&v)?;
                 (&ids_owned, 0)
             }
@@ -1671,35 +1720,57 @@ impl GpuQuant {
             return Ok(out);
         }
         let bt = bsz * topk;
-        if !fits_u32(bt * n) || !fits_u32(x_off + bsz * x_stride_t * k) || bt > 65535 {
-            crate::bail!("vulkan quant moe: dimensions exceed kernel limits")
+        if !fits_u32(bt * n) || !fits_u32(x_off + bsz * x_stride_t * k) || !fits_u32(ids_off + bt) {
+            crate::bail!("vulkan quant moe: dimensions exceed 32-bit kernel limits")
         }
         let nb = k / be;
         let tag = self.fmt.tag();
-        let kern = shaders::kernel(&dev, &format!("{tag}_moe"), 5, 40, || {
+        let kern = shaders::kernel(&dev, &format!("{tag}_moe"), 5, 44, || {
             quant_moe_src(self.fmt)
         })?;
         let cols_per = (dev.limits().max_workgroup_count[0] as usize).min(65535) * 8;
+        let max_bt_chunk = (dev.limits().max_workgroup_count[1] as usize).min(65535);
         let mut dispatches = Vec::new();
-        let mut c0 = 0;
-        while c0 < n {
-            let cols = cols_per.min(n - c0);
-            let p = push(&[bsz, topk, x_stride_t, n_exp, c0 + cols, k, nb, x_off, ids_off, c0]);
-            dispatches.push(Op::Dispatch {
-                kernel: kern.as_ref(),
-                binds: vec![
-                    storage_bind(xs),
-                    storage_bind(ids_s),
-                    self.qs_bind(),
-                    self.aux_bind(),
-                    storage_bind(&out),
-                ],
-                push: p,
-                groups: [cols.div_ceil(8) as u32, bt as u32, 1],
-            });
-            c0 += cols;
+        let mut bt0 = 0;
+        while bt0 < bt {
+            let bt_chunk = max_bt_chunk.min(bt - bt0);
+            let mut c0 = 0;
+            while c0 < n {
+                let cols = cols_per.min(n - c0);
+                let p = push(&[
+                    bsz,
+                    topk,
+                    x_stride_t,
+                    n_exp,
+                    c0 + cols,
+                    k,
+                    nb,
+                    x_off,
+                    ids_off,
+                    c0,
+                    bt0,
+                ]);
+                dispatches.push(Op::Dispatch {
+                    kernel: kern.as_ref(),
+                    binds: vec![
+                        storage_bind(xs),
+                        storage_bind(ids_s),
+                        self.qs_bind(),
+                        self.aux_bind(),
+                        storage_bind(&out),
+                    ],
+                    push: p,
+                    groups: [cols.div_ceil(8) as u32, bt_chunk as u32, 1],
+                });
+                c0 += cols;
+            }
+            bt0 += bt_chunk;
         }
-        submit(&dev, Vec::new(), dispatches, false)?;
+        let est_flops = (bt as u64)
+            .saturating_mul(n as u64)
+            .saturating_mul(k as u64)
+            .saturating_mul(2);
+        submit(&dev, Vec::new(), dispatches, est_flops)?;
         Ok(out)
     }
 
@@ -1810,10 +1881,23 @@ pub(crate) fn want_quant_on_gpu(dev: &VulkanDevice, dtype: GgmlDType, ggml_bytes
     let vram_need = (nb * fmt.qs_bytes_per_block()).div_ceil(256) * 256
         + nb * fmt.aux_bytes_per_block();
     let ctx = dev.ctx();
+    // Reserve headroom for the discrete scratch buffer so weights do not crowd out matmul scratch.
+    let scratch_headroom = if unified(ctx) {
+        0
+    } else {
+        let cur_scratch = ctx
+            .gpu
+            .scratch
+            .lock()
+            .ok()
+            .and_then(|g| g.as_ref().map(|r| r.size))
+            .unwrap_or(0);
+        scratch_cap().min(64 << 20).saturating_sub(cur_scratch)
+    };
     let budgets = heap_budgets(ctx);
     working_heaps(ctx)
         .into_iter()
-        .any(|h| heap_fits(ctx, h, vram_need as u64, &budgets))
+        .any(|h| heap_fits(ctx, h, (vram_need + scratch_headroom) as u64, &budgets))
 }
 
 fn rhs_variant(dtype: DType) -> Option<(&'static str, &'static str, &'static str)> {
@@ -2039,7 +2123,7 @@ fn mirror_after() -> u32 {
 
 /// VRAM copy of a weight. `force` mirrors on first use (fixed [`shaders::ExecMode::Gpu`]),
 /// otherwise only from the `CANDLE_VULKAN_MIRROR_AFTER`-th use.
-fn mirror_of(rhs: &VulkanStorage, force: bool) -> Option<Arc<GpuBuf>> {
+pub(crate) fn mirror_of(rhs: &VulkanStorage, force: bool) -> Option<Arc<GpuBuf>> {
     let mut slot = rhs.mirror.lock().ok()?;
     if let Some(m) = slot.as_ref() {
         return Some(m.clone());
@@ -2246,11 +2330,17 @@ pub(crate) fn dense_matmul(
         };
         let max_groups = dev.limits().max_workgroup_count;
         let row_bytes = k * 4;
-        let band = if unified(ctx) || big_m * row_bytes <= scratch_cap() {
+        let mut band = if unified(ctx) || big_m * row_bytes <= scratch_cap() {
             big_m
         } else {
             ((scratch_cap() / row_bytes) / 64 * 64).max(64).min(big_m)
         };
+        if !gemv && unified(ctx) {
+            let max_rows_for_flops = (MAX_DISPATCH_FLOPS / (2 * 64 * k).max(1)) / 64 * 64;
+            if max_rows_for_flops >= 64 && band > max_rows_for_flops {
+                band = max_rows_for_flops.min(big_m);
+            }
+        }
         let cols_per = if gemv {
             (max_groups[0] as usize).min(65535) * 8
         } else {
@@ -2260,9 +2350,8 @@ pub(crate) fn dense_matmul(
         let guard = if unified(ctx) {
             None
         } else {
-            Some(scratch(ctx, band * row_bytes)?)
+            scratch(dev, band * row_bytes).ok()
         };
-        let uses_scratch = guard.is_some();
         let mut r0 = 0;
         while r0 < big_m {
             let rows = band.min(big_m - r0);
@@ -2308,7 +2397,11 @@ pub(crate) fn dense_matmul(
                 });
                 c0 += cols;
             }
-            submit(dev, prefix, dispatches, uses_scratch)?;
+            let band_flops = (rows as u64)
+                .saturating_mul(n as u64)
+                .saturating_mul(k as u64)
+                .saturating_mul(2);
+            submit(dev, prefix, dispatches, band_flops)?;
             r0 += rows;
         }
         drop(guard);
@@ -2400,7 +2493,7 @@ pub(crate) fn act_matmul(
         if gx > limits.max_workgroup_count[0] as usize {
             crate::bail!("act matmul: n too large for one dispatch")
         }
-        let guard = scratch(ctx, total)?;
+        let guard = scratch(dev, total)?;
         let sb = guard.buffer();
         let prefix = vec![
             Op::Copy {
@@ -2455,7 +2548,12 @@ pub(crate) fn act_matmul(
             }
             z0 += zb;
         }
-        submit(dev, prefix, dispatches, true)?;
+        let est_flops = (batch as u64)
+            .saturating_mul(m as u64)
+            .saturating_mul(n as u64)
+            .saturating_mul(k as u64)
+            .saturating_mul(2);
+        submit(dev, prefix, dispatches, est_flops)?;
         drop(guard);
         Ok(out)
     })();

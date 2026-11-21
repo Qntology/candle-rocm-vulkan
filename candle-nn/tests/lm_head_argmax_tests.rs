@@ -435,12 +435,95 @@ fn lm_head_argmax_cpu_lossless() -> Result<()> {
 #[test]
 fn lm_head_argmax_gpu_lossless() -> Result<()> {
     let Some(dev) = gpu_device() else {
-        eprintln!("no CUDA/ROCm GPU feature or device available; skipping GPU lm_head test");
+        eprintln!("no CUDA/ROCm/Vulkan GPU feature or device available; skipping GPU lm_head test");
         return Ok(());
     };
     for dt in [DType::F32, DType::F16, DType::BF16] {
         verify_guarded_lm_head(&dev, dt)?;
     }
+
+    // GPU exact-tie (smallest index must win) and large non-32-aligned V=15003 tail check (`P5-F08`)
+    let (v_tie, k_tie) = (15003usize, 64usize);
+    let mut w_tie = vec![0.0f32; v_tie * k_tie];
+    // Make rows 17, 5000, and 15002 identical winning rows -> smallest index (17) must win!
+    for r in [17usize, 5000, 15002] {
+        for c in 0..k_tie {
+            w_tie[r * k_tie + c] = 1.0;
+        }
+    }
+    let w_t = Tensor::from_vec(w_tie, (v_tie, k_tie), &dev)?;
+    let h_t = Tensor::ones((2, k_tie), DType::F32, &dev)?;
+    let tie_out = fused_linear_argmax_cs(&h_t, &w_t, None, None, None)?;
+    assert_eq!(tie_out.ids.to_vec1::<u32>()?, vec![17u32, 17u32], "exact tie must pick smallest index");
+
+    // Tail winner at the very last column (V - 1 = 15002)
+    let mut w_tail = vec![0.0f32; v_tie * k_tie];
+    for c in 0..k_tie {
+        w_tail[(v_tie - 1) * k_tie + c] = 2.0;
+    }
+    let w_tail_t = Tensor::from_vec(w_tail, (v_tie, k_tie), &dev)?;
+    let tail_out = fused_linear_argmax_cs(&h_t, &w_tail_t, None, None, None)?;
+    assert_eq!(
+        tail_out.ids.to_vec1::<u32>()?,
+        vec![(v_tie - 1) as u32, (v_tie - 1) as u32],
+        "non-32-aligned tail column V-1 must be evaluated"
+    );
+
+    // Quantized GuardedQuantLmHead adversarial REST spike test (`Q5-F05`)
+    let (v_core, v_rest, qk) = (97usize, 67usize, 256usize);
+    let mut wc = det(v_core * qk, 901);
+    let mut wr = det(v_rest * qk, 902);
+    let mut hq_data = det(4 * qk, 903);
+    // Force row 0..2 to clearly win in CORE (col 96, tail!), and row 2..4 to spike in REST (col 66, tail!)
+    for r in 0..2 {
+        for c in 0..qk {
+            hq_data[r * qk + c] = 0.25;
+            wc[(v_core - 1) * qk + c] = 2.0;
+        }
+    }
+    for r in 2..4 {
+        for c in 0..qk {
+            hq_data[r * qk + c] = if c % 2 == 0 { 0.5 } else { -0.5 };
+            wr[(v_rest - 1) * qk + c] = if c % 2 == 0 { 3.0 } else { -3.0 };
+        }
+    }
+    let wc_t = Tensor::from_vec(wc, (v_core, qk), &Device::Cpu)?;
+    let wr_t = Tensor::from_vec(wr, (v_rest, qk), &Device::Cpu)?;
+    let hq_t = Tensor::from_vec(hq_data, (4, qk), &dev)?;
+    let core_ids = Tensor::arange(0u32, v_core as u32, &dev)?;
+    let rest_ids = Tensor::arange(v_core as u32, (v_core + v_rest) as u32, &dev)?;
+    for wt in [
+        candle::quantized::GgmlDType::Q8_0,
+        candle::quantized::GgmlDType::Q4_0,
+        candle::quantized::GgmlDType::Q4K,
+        candle::quantized::GgmlDType::Q5K,
+        candle::quantized::GgmlDType::Q6K,
+    ] {
+        let qc = std::sync::Arc::new(candle::quantized::QTensor::quantize_onto(&wc_t, wt, &dev)?);
+        let qr = std::sync::Arc::new(candle::quantized::QTensor::quantize_onto(&wr_t, wt, &dev)?);
+        let qhead = candle_nn::trimmed_head::GuardedQuantLmHead::from_split_weights(
+            candle_nn::trimmed_head::LmWeight::Quantized(qc.clone()),
+            None,
+            core_ids.clone(),
+            Some((
+                candle_nn::trimmed_head::LmWeight::Quantized(qr.clone()),
+                None,
+                rest_ids.clone(),
+            )),
+            1e-3,
+            &dev,
+        )?;
+        let (got_q, rescued_q) = qhead.forward_greedy(&hq_t)?;
+        let full_q = Tensor::cat(&[&qc.forward_exact(&hq_t)?, &qr.forward_exact(&hq_t)?], 1)?;
+        let want_q = full_q.argmax(1)?.to_vec1::<u32>()?;
+        assert_eq!(
+            got_q.to_vec1::<u32>()?,
+            want_q,
+            "GuardedQuantLmHead {wt:?} adversarial REST spike mismatch"
+        );
+        assert!(rescued_q >= 2, "GuardedQuantLmHead {wt:?} must rescue adversarial REST rows");
+    }
+
     dev.synchronize()?;
     Ok(())
 }

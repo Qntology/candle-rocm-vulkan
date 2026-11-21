@@ -15,6 +15,16 @@ pub fn moe_gemm(
     topk: usize,
     is_prefill: bool,
 ) -> Result<Tensor> {
+    if !input.device().is_cuda() {
+        return generic_moe_gemm_dense(
+            input,
+            weights,
+            topk_weights,
+            sorted_token_ids,
+            experts_ids,
+            topk,
+        );
+    }
     use candle::cuda_backend::cudarc::driver::DevicePtr;
     use candle::DType;
     use half::{bf16, f16};
@@ -227,7 +237,7 @@ fn generic_moe_gemm_gguf(
     experts_ids: &Tensor,
     topk: usize,
 ) -> Result<Tensor> {
-    use candle::{DType, Device};
+    use candle::DType;
     let (in_rows, k) = input.dims2()?;
     let (_num_experts, n, k_w) = weights.shape().dims3()?;
     if k != k_w {
@@ -239,23 +249,27 @@ fn generic_moe_gemm_gguf(
         in_rows / topk.max(1)
     };
     let size_m = batch * topk;
-    let s_ids = sorted_token_ids
-        .to_device(&Device::Cpu)?
-        .to_dtype(DType::U32)?
-        .flatten_all()?
-        .to_vec1::<u32>()?;
-    let e_ids = experts_ids
-        .to_device(&Device::Cpu)?
-        .to_dtype(DType::U32)?
-        .flatten_all()?
-        .to_vec1::<u32>()?;
-    let mut slot_expert = vec![0u32; size_m];
-    for (&slot, &exp) in s_ids.iter().zip(e_ids.iter()) {
-        if (slot as usize) < size_m {
-            slot_expert[slot as usize] = exp;
-        }
-    }
-    let ids = Tensor::from_vec(slot_expert, (batch, topk), input.device())?;
+    let dev = input.device();
+    // Build `slot_expert[slot] = exp` entirely on the target device via `minimum` + `scatter` so
+    // ROCm/Vulkan MoE layers avoid a per-layer D2H synchronization round-trip (`P2-F07`/`Q2-O06`).
+    let s_u32 = sorted_token_ids.flatten_all()?.to_dtype(DType::U32)?;
+    let e_u32 = experts_ids.flatten_all()?.to_dtype(DType::U32)?;
+    let n_pairs = s_u32.elem_count().min(e_u32.elem_count());
+    let ids = if n_pairs == 0 || size_m == 0 {
+        Tensor::zeros((batch, topk), DType::U32, dev)?
+    } else {
+        let s_flat = s_u32.narrow(0, 0, n_pairs)?;
+        let e_flat = e_u32.narrow(0, 0, n_pairs)?;
+        // Clamp out-of-range sentinel slots (>= size_m) to index `size_m` in a `size_m + 1`
+        // buffer, then drop the trash slot via narrow(0, 0, size_m).
+        let sentinel = Tensor::new(size_m as u32, dev)?.broadcast_as(n_pairs)?;
+        let clamped = s_flat.minimum(&sentinel)?;
+        let slot_buf = Tensor::zeros(size_m + 1, DType::U32, dev)?;
+        slot_buf
+            .scatter(&clamped, &e_flat, 0)?
+            .narrow(0, 0, size_m)?
+            .reshape((batch, topk))?
+    };
     let x_in = if topk_weights.is_none() {
         input.clone()
     } else {
@@ -294,6 +308,16 @@ pub fn moe_gemm_gguf(
     is_prefill: bool,
     dtype: candle::DType,
 ) -> Result<Tensor> {
+    if !input.device().is_cuda() {
+        return generic_moe_gemm_gguf(
+            input,
+            weights,
+            topk_weights,
+            sorted_token_ids,
+            experts_ids,
+            topk,
+        );
+    }
     use candle::cuda_backend::cudarc::driver::DevicePtr;
     use candle::quantized::GgmlDType;
     use candle::DType;

@@ -7,7 +7,8 @@
 //! All accumulations and tie-breaks (`v > bv || (v == bv && gi < bi)`) match the CUDA/ROCm/CPU
 //! reference bit-for-bit in semantics. Both stages record into the shared async command batch.
 
-use super::shaders::{kernel, run, GLSL_PACK16_HELPERS};
+use super::qgpu;
+use super::shaders::{kernel, run, run_ops, Bind, Op, GLSL_PACK16_HELPERS};
 use super::{VulkanDevice, VulkanStorage};
 use crate::{bail, DType, Result};
 
@@ -432,13 +433,45 @@ impl VulkanStorage {
         ])?;
         let gx = n_tiles.clamp(1, MAX_GROUPS) as u32;
         let gy = m.div_ceil(STAGE1_BM).clamp(1, MAX_GROUPS) as u32;
-        run(
-            dev,
-            &k1,
-            &[self, weight, b_s, &part_val, &part_idx, &prm1],
-            &[],
-            [gx, gy, 1],
-        )?;
+        // On discrete GPUs, mirror dense `[V, K]` weights into device-local VRAM so Stage 1 reads
+        // at full VRAM bandwidth rather than over PCIe (P3c-F01 / P3c-O03).
+        let w_mirror = if qgpu::unified(dev.ctx()) {
+            None
+        } else {
+            qgpu::mirror_of(weight, true)
+        };
+        if let Some(mb) = w_mirror {
+            let w_range = (weight.capacity_bytes.max(16).div_ceil(16) * 16) as u64;
+            let w_bind = Bind {
+                buffer: mb.buffer,
+                offset: 0,
+                range: w_range,
+            };
+            run_ops(
+                dev,
+                &[Op::Dispatch {
+                    kernel: k1.as_ref(),
+                    binds: vec![
+                        qgpu::storage_bind(self),
+                        w_bind,
+                        qgpu::storage_bind(b_s),
+                        qgpu::storage_bind(&part_val),
+                        qgpu::storage_bind(&part_idx),
+                        qgpu::storage_bind(&prm1),
+                    ],
+                    push: Vec::new(),
+                    groups: [gx, gy, 1],
+                }],
+            )?;
+        } else {
+            run(
+                dev,
+                &k1,
+                &[self, weight, b_s, &part_val, &part_idx, &prm1],
+                &[],
+                [gx, gy, 1],
+            )?;
+        }
 
         let (c_s, c_off, has_c) = match core_ids {
             Some((s, o)) => (s, o, 1u32),
@@ -558,7 +591,7 @@ impl VulkanStorage {
             &[],
             [g, 1, 1],
         )?;
-        let out_rescue = if check_cs {
+        let out_rescue = if check_cs && has_h != 0 {
             pack_u32_flags_to_u8(dev, &rescue_u32, m)?
         } else {
             alloc_zeroed_u8(dev, m)?

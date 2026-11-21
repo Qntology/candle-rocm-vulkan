@@ -13,37 +13,83 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::OnceLock;
 
+fn find_cxx() -> Option<String> {
+    if let Ok(v) = std::env::var("CXX") {
+        if !v.trim().is_empty() {
+            return Some(v);
+        }
+    }
+    let candidates: Vec<&str> = if cfg!(windows) {
+        vec![
+            r"C:\Program Files\AMD\ROCm\7.2\bin\clang++.exe",
+            r"C:\Program Files\LLVM\bin\clang++.exe",
+            "clang++",
+            "c++",
+            "g++",
+        ]
+    } else {
+        vec!["c++", "clang++", "g++"]
+    };
+    for cand in candidates {
+        if Path::new(cand).is_file() {
+            return Some(cand.to_string());
+        }
+        if Command::new(cand).arg("--version").output().is_ok() {
+            return Some(cand.to_string());
+        }
+    }
+    None
+}
+
+fn compile_harness(bin_name: &str, extra_args: &[&str]) -> Option<PathBuf> {
+    let cxx = match find_cxx() {
+        Some(c) => c,
+        None => {
+            eprintln!("skipping accel host kernel tests: no C++20 compiler found");
+            return None;
+        }
+    };
+    let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR"));
+    let bin = dir.join(if cfg!(windows) {
+        format!("{bin_name}.exe")
+    } else {
+        bin_name.to_string()
+    });
+    let src = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("kernels/tests/accel_host_test.cpp");
+    // No fused a * b + c: the bit-exact tests compare two differently shaped kernels, and a
+    // compiler that targets FMA by default (g++ on Ubuntu 26.04) fuses them differently.
+    let mut cmd = Command::new(&cxx);
+    cmd.args(["-std=c++20", "-O2", "-ffp-contract=off"]);
+    if !cfg!(windows) {
+        cmd.arg("-pthread");
+    }
+    cmd.args(extra_args).arg("-o").arg(&bin).arg(&src);
+    match cmd.output() {
+        Ok(o) if o.status.success() => Some(bin),
+        Ok(o) => {
+            eprintln!(
+                "skipping accel host kernel tests: {cxx} failed\n{}",
+                String::from_utf8_lossy(&o.stderr)
+            );
+            None
+        }
+        Err(e) => {
+            eprintln!("skipping accel host kernel tests: no C++ compiler ({cxx}: {e})");
+            None
+        }
+    }
+}
+
 fn harness() -> Option<&'static Path> {
     static BIN: OnceLock<Option<PathBuf>> = OnceLock::new();
-    BIN.get_or_init(|| {
-        let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR"));
-        let bin = dir.join("accel_host_test");
-        let src =
-            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("kernels/tests/accel_host_test.cpp");
-        let cxx = std::env::var("CXX").unwrap_or_else(|_| "c++".into());
-        // No fused a * b + c: the bit-exact tests compare two differently shaped kernels, and a
-        // compiler that targets FMA by default (g++ on Ubuntu 26.04) fuses them differently.
-        let out = Command::new(&cxx)
-            .args(["-std=c++20", "-O2", "-ffp-contract=off", "-pthread", "-o"])
-            .arg(&bin)
-            .arg(&src)
-            .output();
-        match out {
-            Ok(o) if o.status.success() => Some(bin),
-            Ok(o) => {
-                eprintln!(
-                    "skipping accel host kernel tests: {cxx} failed\n{}",
-                    String::from_utf8_lossy(&o.stderr)
-                );
-                None
-            }
-            Err(e) => {
-                eprintln!("skipping accel host kernel tests: no C++ compiler ({cxx}: {e})");
-                None
-            }
-        }
-    })
-    .as_deref()
+    BIN.get_or_init(|| compile_harness("accel_host_test", &[]))
+        .as_deref()
+}
+
+fn harness_shfl() -> Option<&'static Path> {
+    static BIN: OnceLock<Option<PathBuf>> = OnceLock::new();
+    BIN.get_or_init(|| compile_harness("accel_host_test_shfl", &["-DCANDLE_ACCEL_HOST_SHFL=1"]))
+        .as_deref()
 }
 
 #[derive(Default)]
@@ -85,7 +131,7 @@ impl Arrays {
     }
 }
 
-fn run(input: &Arrays) -> Arrays {
+fn run_with(bin: &Path, input: &Arrays) -> Arrays {
     static COUNTER: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
     let n = COUNTER.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR"));
@@ -101,11 +147,7 @@ fn run(input: &Arrays) -> Arrays {
         bytes.extend(data);
     }
     std::fs::write(&inp, bytes).unwrap();
-    let st = Command::new(harness().unwrap())
-        .arg(&inp)
-        .arg(&outp)
-        .status()
-        .unwrap();
+    let st = Command::new(bin).arg(&inp).arg(&outp).status().unwrap();
     assert!(st.success(), "harness failed");
     let data = std::fs::read(&outp).unwrap();
     let _ = std::fs::remove_file(&inp);
@@ -125,6 +167,10 @@ fn run(input: &Arrays) -> Arrays {
         p += nb;
     }
     out
+}
+
+fn run(input: &Arrays) -> Arrays {
+    run_with(harness().unwrap(), input)
 }
 
 fn randn(rng: &mut SplitMix64, n: usize, scale: f32) -> Vec<f32> {
@@ -1310,4 +1356,263 @@ fn tq_attention_matches_reference() {
             2e-4,
         );
     }
+}
+
+/// Verifies the GPU `AX_HAS_WARP32_SHFL=1` reduction branches (`ax_block_sum`, `ax_block_max`,
+/// `ax_block_reduce_g`) against the shared-memory binary-tree (`AX_HAS_WARP32_SHFL=0`) branches
+/// bit-for-bit on the host emulator (`P5-O05` / `P2-O03`).
+#[test]
+fn warp32_shfl_matches_shared_tree_bit_exact() {
+    let (Some(bin_tree), Some(bin_shfl)) = (harness(), harness_shfl()) else {
+        return;
+    };
+    let mut rng = SplitMix64::new(0x5A1F_0001);
+    let mut rvec = |n: usize| -> Vec<f32> { (0..n).map(|_| (rng.next_normal() * 0.4) as f32).collect() };
+
+    // 1) fa_row + fa_rowg4 (exercises ax_block_max, ax_block_sum, ax_block_reduce_g with splits)
+    let (b, lq, lk, hq, hkv, d) = (1usize, 1, 97, 8, 2, 64);
+    let q = rvec(b * lq * hq * d);
+    let k = rvec(b * lk * hkv * d);
+    let v = rvec(b * lk * hkv * d);
+    for g in [1u32, 4] {
+        let mut a = Arrays::default();
+        a.str("op", "fa")
+            .u32("dtypes", &[0, 0])
+            .u32("dims", &[b as u32, lq as u32, lk as u32, hq as u32, hkv as u32, d as u32, (b * lq) as u32])
+            .u64("strides", &[
+                (lq * hq * d) as u64, (hq * d) as u64, d as u64,
+                (lk * hkv * d) as u64, (hkv * d) as u64, d as u64,
+                (lk * hkv * d) as u64, (hkv * d) as u64, d as u64,
+            ])
+            .f32("fparams", &[1.0 / (d as f32).sqrt(), 0.0, 1.0, 1.0])
+            .i32("iparams", &[-1, 0])
+            .u32("cfg", &[0, 64, 2, 3, 0, if g == 1 { 8 } else { 2 }, 0, g])
+            .f32("q", &q)
+            .f32("k", &k)
+            .f32("v", &v);
+        let o_tree = run_with(bin_tree, &a).get_f32("o");
+        let o_shfl = run_with(bin_shfl, &a).get_f32("o");
+        assert_eq!(
+            o_tree.iter().map(|x| x.to_bits()).collect::<Vec<_>>(),
+            o_shfl.iter().map(|x| x.to_bits()).collect::<Vec<_>>(),
+            "fa_row (G={g}): warp32 shuffle must be bit-identical to shared-memory tree"
+        );
+    }
+
+    // 2) tq_quant (TurboMse + Fp8 + Nvfp4 — exercises ax_block_sum/max in turbo_quant_impl.h)
+    let (rows, td) = (6usize, 64usize);
+    let x = rvec(rows * td);
+    for (fmt, mode, cb) in [
+        (QuantFormat::TurboMse { bits: 4 }, 0u32, 4u32),
+        (QuantFormat::Fp8, 5u32, 8u32),
+        (QuantFormat::Nvfp4, 3u32, 4u32),
+    ] {
+        let lay = row_layout(fmt, td).unwrap();
+        let codec = RowCodec::new(fmt, td, 7).unwrap();
+        let tab = tq_tab(&codec);
+        let mut a = Arrays::default();
+        a.str("op", "tq_quant")
+            .u32("params", &[
+                rows as u32, td as u32, mode, cb, lay.code_words as u32,
+                lay.aux_words as u32, lay.row_words as u32, rows as u32, 0,
+            ])
+            .f32("x", &x)
+            .f32("tab", &tab);
+        let out_tree = run_with(bin_tree, &a).get_u32("out");
+        let out_shfl = run_with(bin_shfl, &a).get_u32("out");
+        assert_eq!(out_tree, out_shfl, "tq_quant {fmt:?}: warp32 shfl must be bit-exact");
+    }
+}
+
+/// Tests `fa_tilep_impl` (paged tile prefill) on non-BC-multiple page capacities (`cap = 48`),
+/// partial last page, zero-row empty page, and sliding window against dense `fa_tile_impl`
+/// bit-for-bit (`Q4-F03`).
+#[test]
+fn fa_paged_tile_kernel_matches_dense_bit_exact() {
+    let Some(bin) = harness() else {
+        return;
+    };
+    let mut rng = SplitMix64::new(0xFA12_BEEF);
+    let mut rvec = |n: usize| -> Vec<f32> { (0..n).map(|_| (rng.next_normal() * 0.35) as f32).collect() };
+    let (b, lq, hq, hkv, d) = (1usize, 19, 4, 2, 64);
+    let page_caps = [48usize, 48, 48, 48];
+    let page_rows = [48usize, 0, 40, 17]; // non-BC-multiple, empty page, partial last page
+    let lk: usize = page_rows.iter().sum();
+
+    let q = rvec(b * hq * lq * d);
+    // Pack pages into flat backing buffer (each page has shape [b, hkv, cap, d] -> BHSD layout)
+    let mut k_pages = Vec::new();
+    let mut v_pages = Vec::new();
+    let mut pg_off_k = Vec::new();
+    let mut pg_off_v = Vec::new();
+    let mut k_cat = vec![0f32; b * hkv * lk * d];
+    let mut v_cat = vec![0f32; b * hkv * lk * d];
+    let mut pos0 = 0usize;
+    for (&cap, &rows) in page_caps.iter().zip(page_rows.iter()) {
+        pg_off_k.push(k_pages.len() as u64);
+        pg_off_v.push(v_pages.len() as u64);
+        let pk = rvec(b * hkv * cap * d);
+        let pv = rvec(b * hkv * cap * d);
+        for h in 0..hkv {
+            for r in 0..rows {
+                let s = (h * cap + r) * d;
+                let dst = (h * lk + pos0 + r) * d;
+                k_cat[dst..dst + d].copy_from_slice(&pk[s..s + d]);
+                v_cat[dst..dst + d].copy_from_slice(&pv[s..s + d]);
+            }
+        }
+        k_pages.extend_from_slice(&pk);
+        v_pages.extend_from_slice(&pv);
+        pos0 += rows;
+    }
+
+    for &(version, br, wl) in &[(2u32, 32usize, -1i32), (2, 32, 41), (3, 64, 53)] {
+        let gx = lq.div_ceil(br) as u32;
+        let mut dense = Arrays::default();
+        dense
+            .str("op", "fa")
+            .u32("dtypes", &[0, 0])
+            .u32("dims", &[b as u32, lq as u32, lk as u32, hq as u32, hkv as u32, d as u32, (b * lq) as u32])
+            .u64("strides", &[
+                (hq * lq * d) as u64, d as u64, (lq * d) as u64,
+                (hkv * lk * d) as u64, d as u64, (lk * d) as u64,
+                (hkv * lk * d) as u64, d as u64, (lk * d) as u64,
+            ])
+            .f32("fparams", &[1.0 / (d as f32).sqrt(), 0.0, 1.0, 1.0])
+            .i32("iparams", &[wl, 0])
+            .u32("cfg", &[1, 64, version, 1, 0, gx, 0])
+            .f32("q", &q)
+            .f32("k", &k_cat)
+            .f32("v", &v_cat);
+
+        let mut paged = Arrays::default();
+        paged
+            .str("op", "fa")
+            .u32("dtypes", &[0, 0])
+            .u32("dims", &[b as u32, lq as u32, lk as u32, hq as u32, hkv as u32, d as u32, (b * lq) as u32])
+            .u64("strides", &[
+                (hq * lq * d) as u64, d as u64, (lq * d) as u64,
+                0, d as u64, 0,
+                0, d as u64, 0,
+            ])
+            .f32("fparams", &[1.0 / (d as f32).sqrt(), 0.0, 1.0, 1.0])
+            .i32("iparams", &[wl, 0])
+            .u32("cfg", &[1, 64, version, 1, 0, gx, 0])
+            .f32("q", &q)
+            .f32("k", &k_pages)
+            .f32("v", &v_pages)
+            .u32("pg_rows", &page_rows.iter().map(|&r| r as u32).collect::<Vec<_>>())
+            .u64("pg_off_k", &pg_off_k)
+            .u64("pg_off_v", &pg_off_v)
+            .u32("pg_cap_k", &page_caps.iter().map(|&c| c as u32).collect::<Vec<_>>())
+            .u32("pg_cap_v", &page_caps.iter().map(|&c| c as u32).collect::<Vec<_>>());
+
+        let o_dense = run_with(bin, &dense).get_f32("o");
+        let o_paged = run_with(bin, &paged).get_f32("o");
+        assert_eq!(
+            o_dense.iter().map(|x| x.to_bits()).collect::<Vec<_>>(),
+            o_paged.iter().map(|x| x.to_bits()).collect::<Vec<_>>(),
+            "fa_tilep v={version} wl={wl} must be bit-exact with dense fa_tile"
+        );
+    }
+}
+
+/// Host tests for `tq_fwht_impl` (matches `rotation_matrix`) and `tq_quant_prod_fused_impl`
+/// (codes, rsc0, rsc1 bit-exact with 4-step; coalesced `st` projection matches CPU j-order sum,
+/// `Q3-F02` / `Q3-F03` / `Q3-F04`).
+#[test]
+fn tq_fwht_and_prod_fused_host_contracts() {
+    use candle_core::accel::turbo::{hadamard_sign_bits, qjl_matrix, rotation_matrix};
+    use candle_core::accel::RotationKind;
+    let Some(bin) = harness() else {
+        return;
+    };
+    let mut rng = SplitMix64::new(0x7007_1234);
+    let (rows, d) = (5usize, 64usize);
+    let x: Vec<f32> = (0..rows * d).map(|_| (rng.next_normal() * 0.5) as f32).collect();
+
+    // 1) FWHT forward & inverse vs dense Hadamard rotation_matrix
+    let signs = hadamard_sign_bits(d, 42).unwrap();
+    let pi = rotation_matrix(d, RotationKind::Hadamard, 42).unwrap();
+    let mut fwd = Arrays::default();
+    fwd.str("op", "tq_fwht")
+        .u32("params", &[rows as u32, d as u32, 1, rows as u32])
+        .f32("x", &x)
+        .u32("signs", &signs);
+    let y_fwht = run_with(bin, &fwd).get_f32("y");
+    let mut y_dense = vec![0f32; rows * d];
+    for r in 0..rows {
+        for i in 0..d {
+            let mut s = 0f32;
+            for j in 0..d {
+                s += x[r * d + j] * pi[i * d + j];
+            }
+            y_dense[r * d + i] = s;
+        }
+    }
+    assert_close("tq_fwht forward vs rotation_matrix", &y_fwht, &y_dense, 1e-5, 1e-5);
+
+    let mut inv = Arrays::default();
+    inv.str("op", "tq_fwht")
+        .u32("params", &[rows as u32, d as u32, 0, rows as u32])
+        .f32("x", &y_fwht)
+        .u32("signs", &signs);
+    let x_rt = run_with(bin, &inv).get_f32("y");
+    assert_close("tq_fwht inverse roundtrip", &x_rt, &x, 1e-5, 1e-5);
+
+    // 2) tq_quant_prod_fused vs CPU serial j-order reference
+    let fmt = QuantFormat::TurboProd { bits: 4 };
+    let lay = row_layout(fmt, d).unwrap();
+    let codec = RowCodec::new(fmt, d, 77).unwrap();
+    let tab = tq_tab(&codec);
+    let s_mat = qjl_matrix(d, 77);
+    let mut st = vec![0f32; d * d];
+    for i in 0..d {
+        for j in 0..d {
+            st[j * d + i] = s_mat[i * d + j];
+        }
+    }
+    let mut a = Arrays::default();
+    a.str("op", "tq_quant_prod_fused")
+        .u32("params", &[
+            rows as u32, d as u32, 3, lay.code_words as u32, lay.aux_words as u32,
+            lay.row_words as u32, rows as u32,
+        ])
+        .f32("x", &x)
+        .f32("tab", &tab)
+        .f32("st", &st);
+    let fused = run_with(bin, &a).get_u32("out");
+
+    // Verify codes + rsc0 + rsc1 match standard 2-step tq_quant + tq_signs bit-exact
+    let mut step1 = Arrays::default();
+    step1
+        .str("op", "tq_quant")
+        .u32("params", &[
+            rows as u32, d as u32, 1, 3, lay.code_words as u32, lay.aux_words as u32,
+            lay.row_words as u32, rows as u32, 0,
+        ])
+        .f32("x", &x)
+        .f32("tab", &tab);
+    let q1 = run_with(bin, &step1);
+    let out1 = q1.get_u32("out");
+    let resid = q1.get_f32("resid");
+    let mut proj = vec![0f32; rows * d];
+    for r in 0..rows {
+        for i in 0..d {
+            let mut acc = 0f32;
+            for j in 0..d {
+                acc = resid[r * d + j].mul_add(st[j * d + i], acc);
+            }
+            proj[r * d + i] = acc;
+        }
+    }
+    let mut step2 = Arrays::default();
+    step2
+        .str("op", "tq_signs")
+        .u32("params", &[rows as u32, d as u32, lay.code_words as u32, lay.row_words as u32, rows as u32])
+        .u32("data", &out1)
+        .f32("proj", &proj)
+        .f32("resid", &resid);
+    let two_step = run_with(bin, &step2).get_u32("out");
+    assert_eq!(fused, two_step, "tq_quant_prod_fused must match same-order 2-step bit-for-bit");
 }

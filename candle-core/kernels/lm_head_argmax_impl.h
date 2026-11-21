@@ -8,8 +8,9 @@
 //   * CUDA: NVRTC at run time (accel/sources.rs -> cuda_backend/lm_head.rs, --std=c++17, no fast-math)
 //   * Host emulator: plain C++20 (CANDLE_ACCEL_HOST=1)
 //
-// Uses only accel_common.h primitives (dynamic shared memory + AX_SYNC, no warp shuffles,
-// no standard headers on CUDA NVRTC). Deterministic tie-break always prefers smaller index.
+// Uses only accel_common.h primitives (dynamic shared memory + AX_SYNC + portable 32-lane
+// warp shuffle reductions on GPU, no standard headers on CUDA NVRTC). Deterministic tie-break
+// always prefers smaller index.
 #pragma once
 #include "accel_common.h"
 

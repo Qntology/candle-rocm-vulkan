@@ -13,6 +13,10 @@ use super::config::FlashAttnVersion;
 pub const ACCEL_COMMON_H: &str = include_str!("../../kernels/accel_common.h");
 pub const FLASH_ATTN_IMPL_H: &str = include_str!("../../kernels/flash_attn_impl.h");
 pub const TURBO_QUANT_IMPL_H: &str = include_str!("../../kernels/turbo_quant_impl.h");
+pub const W8A16_IMPL_H: &str = include_str!("../../kernels/w8a16_impl.h");
+pub const LM_HEAD_ARGMAX_IMPL_H: &str = include_str!("../../kernels/lm_head_argmax_impl.h");
+pub const DECODER_OPS_IMPL_H: &str = include_str!("../../kernels/decoder_ops_impl.h");
+pub const DELTA_RULE_IMPL_H: &str = include_str!("../../kernels/delta_rule_impl.h");
 
 pub(crate) fn strip_includes(src: &str) -> String {
     strip(src)
@@ -134,8 +138,16 @@ mod tests {
             "FA_TILE_KERNEL(fa2_d128_bf16_fp8, ax_bf16, ax_fp8, 16, 32, 128)"
         );
         assert_eq!(
+            flash_attn_instantiation("fa2p_d128_bf16_fp8").unwrap(),
+            "FA_TILEP_KERNEL(fa2p_d128_bf16_fp8, ax_bf16, ax_fp8, 16, 32, 128)"
+        );
+        assert_eq!(
             flash_attn_instantiation("fa3_d64_f32_f32").unwrap(),
             "FA_TILE_KERNEL(fa3_d64_f32_f32, float, float, 64, 64, 64)"
+        );
+        assert_eq!(
+            flash_attn_instantiation("fa3p_d64_f32_f32").unwrap(),
+            "FA_TILEP_KERNEL(fa3p_d64_f32_f32, float, float, 64, 64, 64)"
         );
         assert_eq!(
             flash_attn_instantiation("fa_row_f16_fp8").unwrap(),
@@ -196,6 +208,7 @@ mod tests {
             for v in [2, 3] {
                 for d in [64, 128, 256] {
                     names.push(format!("fa{v}_d{d}_{q}_{kv}"));
+                    names.push(format!("fa{v}p_d{d}_{q}_{kv}"));
                 }
             }
         }

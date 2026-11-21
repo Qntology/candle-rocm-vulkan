@@ -503,7 +503,7 @@ fn decoder_ops_cpu_and_aliasing() -> Result<()> {
 #[test]
 fn decoder_ops_gpu_accuracy() -> Result<()> {
     let Some(dev) = gpu_device() else {
-        eprintln!("no CUDA/ROCm GPU feature or device available; skipping GPU decoder_ops test");
+        eprintln!("no CUDA/ROCm/Vulkan GPU feature or device available; skipping GPU decoder_ops test");
         return Ok(());
     };
     verify_device(&dev)?;

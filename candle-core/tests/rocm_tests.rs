@@ -746,3 +746,117 @@ fn runtime_info_reports_target() -> Result<()> {
     assert!(format!("{info}").contains(&arch));
     Ok(())
 }
+
+/// Tests wave-per-output Skinny-M/N GEMM (`min(m, n) <= 8 && k >= 256`) across all 4 transpose
+/// combinations and all 4 dtypes against CPU and rocBLAS (`P2-F01`/`P2-O04`/`P5-F03`).
+#[test]
+fn gemm_skinny_matches_rocblas_and_cpu() -> Result<()> {
+    use candle_core::rocm::GemmBackend;
+    let dev = rocm();
+    for dtype in [DType::F32, DType::F64, DType::F16, DType::BF16] {
+        for &(b, m, n, k) in &[(1, 1, 73, 256), (1, 4, 65, 512), (2, 8, 37, 300), (1, 65, 3, 256)] {
+            let a = randn(&[b, m, k], dtype)?;
+            let w = randn(&[b, k, n], dtype)?;
+            let wt = randn(&[b, n, k], dtype)?;
+            let at = randn(&[b, k, m], dtype)?;
+            let (ag, wg, wtg, atg) = (
+                a.to_device(&dev)?,
+                w.to_device(&dev)?,
+                wt.to_device(&dev)?,
+                at.to_device(&dev)?,
+            );
+            with_gemm_backend(&dev, GemmBackend::Hip, || {
+                assert_close(&ag.matmul(&wg)?, &mm_ref(&a, &w)?, "skinny NN")?;
+                assert_close(
+                    &ag.matmul(&wtg.transpose(1, 2)?)?,
+                    &mm_ref(&a, &wt.transpose(1, 2)?)?,
+                    "skinny NT",
+                )?;
+                assert_close(
+                    &atg.transpose(1, 2)?.matmul(&wg)?,
+                    &mm_ref(&at.transpose(1, 2)?, &w)?,
+                    "skinny TN",
+                )?;
+                assert_close(
+                    &atg.transpose(1, 2)?.matmul(&wtg.transpose(1, 2)?)?,
+                    &mm_ref(&at.transpose(1, 2)?, &wt.transpose(1, 2)?)?,
+                    "skinny TT",
+                )?;
+                Ok(())
+            })?;
+            if matches!(dtype, DType::F32 | DType::F16) {
+                let r_blas = with_gemm_backend(&dev, GemmBackend::RocBlas, || {
+                    ag.matmul(&wtg.transpose(1, 2)?)
+                })?;
+                let r_hip = with_gemm_backend(&dev, GemmBackend::Hip, || {
+                    ag.matmul(&wtg.transpose(1, 2)?)
+                })?;
+                assert_close(&r_blas, &r_hip, "skinny rocblas vs hip")?;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Tests LDS-fused multi-stage ROCm ArgSort (`ncols > 2048`), ties, ascending/descending, and
+/// multiple dtypes (`P2-F04`/`P2-O05`/`P5-F09`).
+#[test]
+fn arg_sort_multistage_and_ties() -> Result<()> {
+    let dev = rocm();
+    for &ncols in &[17usize, 2049, 4097] {
+        // Include exact duplicate values to test deterministic smaller-index tie-breaking.
+        let mut vals = Vec::with_capacity(2 * ncols);
+        for r in 0..2 {
+            for c in 0..ncols {
+                let bucket = ((c * 131 + r * 17) % 53) as f32 - 26.0;
+                vals.push(bucket);
+            }
+        }
+        let t_f32 = Tensor::from_vec(vals, (2, ncols), &Device::Cpu)?;
+        for asc in [true, false] {
+            for dt in [DType::F32, DType::F16, DType::BF16, DType::I32] {
+                let t = t_f32.to_dtype(dt)?;
+                let want = t.arg_sort_last_dim(asc)?.to_vec2::<u32>()?;
+                let got = t
+                    .to_device(&dev)?
+                    .arg_sort_last_dim(asc)?
+                    .to_device(&Device::Cpu)?
+                    .to_vec2::<u32>()?;
+                assert_eq!(got, want, "arg_sort ncols={ncols} asc={asc} dt={dt:?}");
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Gate 2-B: asserts zero implicit CPU fallbacks across native ROCm conv1d, conv_transpose1d,
+/// pool2d, upsample_nearest1d, arg_sort, and quantized MoE (`P2-O07`/`P5-F13`).
+#[test]
+fn gate_2b_zero_cpu_fallbacks() -> Result<()> {
+    let dev = rocm();
+    let c_in = randn(&[2, 4, 16], DType::F32)?.to_device(&dev)?;
+    let c_k = randn(&[6, 4, 3], DType::F32)?.to_device(&dev)?;
+    let ct_k = randn(&[4, 6, 3], DType::F32)?.to_device(&dev)?;
+    let p_in = randn(&[1, 4, 8, 8], DType::F32)?.to_device(&dev)?;
+    let s_in = randn(&[2, 2050], DType::F32)?.to_device(&dev)?;
+    let w_moe = QTensor::quantize_onto(&randn(&[4, 32, 256], DType::F32)?, GgmlDType::Q4K, &dev)?;
+    let x_moe = randn(&[2, 256], DType::F32)?.to_device(&dev)?;
+    let ids_moe = Tensor::from_vec(vec![0u32, 2, 1, 3], (2, 2), &dev)?;
+
+    let before = candle_core::rocm::cpu_fallback_count();
+    let _ = c_in.conv1d(&c_k, 1, 1, 1, 1)?;
+    let _ = c_in.conv_transpose1d(&ct_k, 1, 0, 2, 1, 1)?;
+    let _ = p_in.avg_pool2d(2)?;
+    let _ = p_in.max_pool2d(2)?;
+    let _ = c_in.upsample_nearest1d(32)?;
+    let _ = s_in.arg_sort_last_dim(false)?;
+    let _ = w_moe.indexed_moe_forward(&x_moe, &ids_moe)?;
+    let after = candle_core::rocm::cpu_fallback_count();
+    assert_eq!(
+        after - before,
+        0,
+        "Gate 2-B: expected 0 implicit ROCm CPU fallbacks, observed {}",
+        after - before
+    );
+    Ok(())
+}

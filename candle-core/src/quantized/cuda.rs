@@ -607,6 +607,58 @@ impl QCudaStorage {
         ids: &CudaStorage, //[batch, topk]
         ids_l: &crate::Layout,
     ) -> Result<(CudaStorage, crate::Shape)> {
+        // Exact weight-only W8A16 MoE path for F16/BF16 inputs or Q4_0 weights (previously
+        // unsupported on CUDA `indexed_moe_forward`, `P1-26` / `Q2-F05` / `Q2-O07`).
+        let use_w8a16 = super::w8a16::mv_supported(self.dtype())
+            && (matches!(input.dtype(), crate::DType::F16 | crate::DType::BF16)
+                || self.dtype() == GgmlDType::Q4_0);
+        if use_w8a16 {
+            let (num_experts, n, k) = self_shape.dims3()?;
+            let (batch, topk) = ids_l.dims2()?;
+            let x_dims = input_l.dims();
+            let x_has_topk = match x_dims {
+                [b, kk] if *b == batch && *kk == k => false,
+                [b, 1, kk] if *b == batch && *kk == k => false,
+                [b, tk, kk] if *b == batch && *tk == topk && *kk == k => true,
+                _ => crate::bail!(
+                    "indexed_moe_forward: incompatible input shape {x_dims:?} for batch={batch}, topk={topk}, k={k}"
+                ),
+            };
+            let esz = input.dtype().size_in_bytes();
+            let x_owned;
+            let (x_ref, x_off) = if input_l.is_contiguous() && (input_l.start_offset() * esz) % 16 == 0
+            {
+                (input, input_l.start_offset())
+            } else {
+                x_owned = input.contiguous_copy(input_l)?;
+                (&x_owned, 0)
+            };
+            let ids_owned;
+            let (ids_ref, ids_off) = if ids_l.is_contiguous() {
+                (ids, ids_l.start_offset())
+            } else {
+                ids_owned = ids.contiguous_copy(ids_l)?;
+                (&ids_owned, 0)
+            };
+            let ids_slice = ids_ref.as_cuda_slice::<u32>()?;
+            let out = super::w8a16::indexed_moe(
+                &self.device,
+                &self.data.inner,
+                self.dtype(),
+                num_experts,
+                n,
+                k,
+                x_ref,
+                x_off,
+                ids_slice,
+                ids_off,
+                batch,
+                topk,
+                x_has_topk,
+            )?;
+            return Ok((out, crate::Shape::from((batch, topk, n))));
+        }
+
         if matches!(
             self.dtype(),
             GgmlDType::Q8_0
@@ -657,6 +709,10 @@ impl QCudaStorage {
 
     pub fn device(&self) -> &CudaDevice {
         &self.device
+    }
+
+    pub(crate) fn data_slice(&self) -> &CudaSlice<u8> {
+        &self.data.inner
     }
 
     pub fn dequantize(&self, elem_count: usize) -> Result<CudaStorage> {

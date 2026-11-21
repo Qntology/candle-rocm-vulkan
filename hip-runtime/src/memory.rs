@@ -261,6 +261,70 @@ pub fn cached_bytes(device: i32) -> usize {
     cache_lock().bytes.get(&device).copied().unwrap_or(0)
 }
 
+/// Returns cached buffers of `device` beyond `keep_bytes` (largest size classes first) to the
+/// stream-ordered pool (`hipFreeAsync`), keeping hot small/medium buffers in the zero-cost reuse
+/// cache. Returns the number of bytes actually released. `device` must be current on this thread.
+pub fn release_cached_to(device: i32, keep_bytes: usize) -> Result<usize> {
+    if keep_bytes == 0 {
+        let before = cached_bytes(device);
+        release_cached(device)?;
+        return Ok(before);
+    }
+    let (ptrs, released) = {
+        let mut c = cache_lock();
+        let mut held = c.bytes.get(&device).copied().unwrap_or(0);
+        if held <= keep_bytes {
+            return Ok(0);
+        }
+        let keys: Vec<(i32, usize)> = c
+            .free
+            .range((device, 0)..=(device, usize::MAX))
+            .map(|(k, _)| *k)
+            .rev()
+            .collect();
+        let mut ptrs = Vec::new();
+        let mut released = 0usize;
+        for k in keys {
+            if held <= keep_bytes {
+                break;
+            }
+            let class = k.1;
+            let empty = if let Some(v) = c.free.get_mut(&k) {
+                while held > keep_bytes {
+                    let Some(p) = v.pop() else { break };
+                    ptrs.push(p);
+                    held = held.saturating_sub(class);
+                    released += class;
+                }
+                v.is_empty()
+            } else {
+                false
+            };
+            if empty {
+                c.free.remove(&k);
+            }
+        }
+        if held == 0 {
+            c.bytes.remove(&device);
+        } else {
+            c.bytes.insert(device, held);
+        }
+        (ptrs, released)
+    };
+    let mut first_err = hip_runtime::HIP_SUCCESS;
+    for p in ptrs {
+        let code = unsafe { hip_runtime::hipFreeAsync(p as *mut c_void, std::ptr::null_mut()) };
+        if code != hip_runtime::HIP_SUCCESS {
+            FREE_FAILURES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            if first_err == hip_runtime::HIP_SUCCESS {
+                first_err = code;
+            }
+        }
+    }
+    check_hip(first_err)?;
+    Ok(released)
+}
+
 /// Returns the cached buffers of `device` to the stream-ordered pool (`hipFreeAsync`).
 /// `device` must be the current device of the calling thread.
 pub fn release_cached(device: i32) -> Result<()> {

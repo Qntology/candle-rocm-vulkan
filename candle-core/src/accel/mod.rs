@@ -27,6 +27,11 @@ pub use config::{
 pub use formats::{row_layout, QuantFormat, RowLayout};
 pub use profile::{profile, AccelBackend, AccelProfile};
 
+/// Minimum payload size (4 MiB) for routing host-to-device uploads through a pinned
+/// staging buffer + non-blocking copy stream. Smaller transfers bypass pinned staging
+/// and copy directly on the compute stream to avoid small-transfer pinned overhead.
+pub const ASYNC_DMA_MIN_BYTES: usize = 4 * 1024 * 1024;
+
 /// What the fused paths will do on a device with the current configuration.
 #[derive(Debug, Clone, PartialEq)]
 pub struct AccelReport {

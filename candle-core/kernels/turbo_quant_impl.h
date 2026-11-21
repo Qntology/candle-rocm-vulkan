@@ -237,11 +237,12 @@ AX_DEV float tq_nvfp4_elem(const ax_u32 *row, ax_u32 j, ax_u32 cw) {
 #define TQ_FM_NVFP4   2
 
 // Single-pass TurboProd quantization: normalizes, quantizes to codebook, computes residual in
-// shared memory, projects with S (L2-cached D x D matrix), packs code words + QJL sign bits +
-// rsc0/rsc1 in one kernel launch (bit-exact with tq_quant + tq_resid + matmul + tq_signs).
+// shared memory, projects with S^T (coalesced across lanes), packs code words + QJL sign bits +
+// rsc0/rsc1 in one kernel launch. Codes, residual norm, and rsc0/rsc1 match the 4-stage pipeline;
+// QJL projection sums sequentially over j = 0..D matching the CPU reference `RowCodec::quantize_row`.
 // Shared memory: (2 * D + TQ_NT) * sizeof(float).
 template <typename T>
-AX_DEV void tq_quant_prod_fused_impl(const T *src, const float *tab, const float *s_mat,
+AX_DEV void tq_quant_prod_fused_impl(const T *src, const float *tab, const float *s_t,
                                      ax_u32 *out, ax_u64 rows, ax_u32 D, ax_u64 src_stride,
                                      ax_u32 cb, ax_u32 code_words, ax_u32 row_words) {
     float *y = ax_smem();
@@ -277,9 +278,8 @@ AX_DEV void tq_quant_prod_fused_impl(const T *src, const float *tab, const float
         for (ax_u32 w = t; w < code_words; w += TQ_NT) orow[w] = tq_pack_word(codes, w, cb, D);
         AX_SYNC(); // codes[] can now be reused for sign bits
         for (ax_u32 i = t; i < D; i += TQ_NT) {
-            const float *srow = s_mat + (ax_u64)i * (ax_u64)D;
             float dot = 0.0f;
-            for (ax_u32 j = 0; j < D; ++j) dot += y[j] * srow[j];
+            for (ax_u32 j = 0; j < D; ++j) dot += y[j] * s_t[(ax_u64)j * (ax_u64)D + i];
             codes[i] = dot >= 0.0f ? 1u : 0u;
         }
         AX_SYNC();

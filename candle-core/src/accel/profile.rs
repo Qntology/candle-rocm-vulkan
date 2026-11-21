@@ -68,10 +68,11 @@ impl AccelProfile {
         let cc = major * 10 + minor;
         let version = if cc < 80 {
             FlashAttnVersion::V1
-        } else if cc >= 90 {
-            // Hopper (sm_90), Blackwell DC/Thor (sm_100/110), and Blackwell RTX (sm_120, 99 KiB
-            // dynamic shared mem) all accommodate the 48.5-56.4 KiB V3 tiles (with automatic V2
-            // fallback in att::plan when max_shared_mem is smaller).
+        } else if cc >= 90 && max_shared_mem >= 128 * 1024 {
+            // Hopper (sm_90, 227 KiB) and Blackwell DC/Thor (sm_100/110, 227 KiB) fit multiple
+            // 48.5-56.4 KiB V3 tiles per SM. GPUs with ~99 KiB/SM (Ada sm_89, Blackwell RTX
+            // sm_120) stay on V2 (26.2 KiB d=128 tile, 3 blocks/SM) unless V3 is explicitly
+            // forced via config/benchmark.
             FlashAttnVersion::V3
         } else {
             FlashAttnVersion::V2
@@ -268,6 +269,10 @@ mod tests {
         assert_eq!(b200.auto_format(8, false, true), QuantFormat::Mxfp8);
         assert_eq!(
             AccelProfile::cuda(12, 0, 99 << 10, 84).flash_attn_version,
+            FlashAttnVersion::V2
+        );
+        assert_eq!(
+            AccelProfile::cuda(12, 0, 227 << 10, 84).flash_attn_version,
             FlashAttnVersion::V3
         );
 

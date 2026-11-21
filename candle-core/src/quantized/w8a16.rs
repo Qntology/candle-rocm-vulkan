@@ -1,6 +1,6 @@
 //! Exact weight-only quantized mat-vec products and direct dequantization on the CUDA backend.
 //!
-//! The kernels live in `w8a16.cu` and are compiled with NVRTC for the GPU's compute capability
+//! The kernels live in `kernels/w8a16_impl.h` and are compiled with NVRTC for the GPU's compute capability
 //! the first time a (weight type, activation dtype, rows) combination is used, one small module
 //! per kernel. They back [`super::QTensor::forward_exact`] and [`super::QTensor::dequantize_to`]:
 //!
@@ -154,7 +154,7 @@ fn arch(dev: &CudaDevice) -> &'static str {
         .or_insert_with(|| Box::leak(format!("compute_{major}{minor}").into_boxed_str()))
 }
 
-/// Kernel `name` of the module built from `w8a16.cu` + `inst` (compiled on first use).
+/// Kernel `name` of the module built from `kernels/w8a16_impl.h` + `inst` (compiled on first use).
 fn func(dev: &CudaDevice, name: &str, inst: String) -> Result<CudaFunction> {
     let module = format!("candle_{name}");
     let f = dev.get_or_compile_func(name, &module, || {
@@ -697,6 +697,220 @@ unsafe fn gemm_ex(
     .w()
 }
 
+/// Exact weight-only indexed MoE matvec on CUDA (`Q8_0`, `Q4_0`, `Q4K`, `Q5K`, `Q6K`,
+/// activations `F32` / `F16` / `BF16`, zero activation quantization).
+#[allow(clippy::too_many_arguments)]
+pub fn indexed_moe(
+    dev: &CudaDevice,
+    w: &CudaSlice<u8>,
+    wtype: GgmlDType,
+    num_experts: usize,
+    n: usize,
+    k: usize,
+    x: &CudaStorage,
+    x_off: usize,
+    ids: &CudaSlice<u32>,
+    ids_off: usize,
+    batch: usize,
+    topk: usize,
+    x_has_topk: bool,
+) -> Result<CudaStorage> {
+    use crate::backend::BackendStorage;
+    let Some(d) = decoder(wtype) else {
+        bail!("w8a16 indexed_moe: unsupported weight type {wtype:?}")
+    };
+    if k == 0 || !k.is_multiple_of(d.qk) || n == 0 || num_experts == 0 {
+        bail!("w8a16 indexed_moe: unsupported shape ({num_experts}, {n}, {k}) for {wtype:?}")
+    }
+    let (xs, xc) = elem_ctype(x.dtype())?;
+    if (x_off * x.dtype().size_in_bytes()) % 16 != 0 {
+        bail!("w8a16 indexed_moe: input offset {x_off} is not 16 byte aligned")
+    }
+    let row_bytes = (k / d.qk * wtype.type_size()) as i64;
+    let expert_bytes = row_bytes * (n as i64);
+    let name = format!("w8a16_moe_{}_{xs}", d.sfx);
+    let inst = format!("W8A16_MOE_KERNEL({name}, {}, {xc})", d.ty);
+    let f = func(dev, &name, inst)?;
+    let total_slots = batch * topk;
+    let lc = LaunchConfig {
+        grid_dim: (n.div_ceil(4) as u32, total_slots as u32, 1),
+        block_dim: (32, 4, 1),
+        shared_mem_bytes: 0,
+    };
+    let (k_i, n_i, topk_i, xht_i) = (k as i32, n as i32, topk as i32, i32::from(x_has_topk));
+    let id_v = ids.slice(ids_off..ids_off + total_slots);
+    let x_rows = if x_has_topk { total_slots } else { batch };
+    macro_rules! launch {
+        ($s:expr, $t:ty) => {{
+            let xv = $s.slice(x_off..x_off + x_rows * k);
+            let mut out = unsafe { dev.alloc::<$t>(total_slots * n)? };
+            let stream = dev.cuda_stream();
+            let mut b = stream.launch_builder(&f);
+            b.arg(w)
+                .arg(&xv)
+                .arg(&id_v)
+                .arg(&mut out)
+                .arg(&k_i)
+                .arg(&n_i)
+                .arg(&topk_i)
+                .arg(&xht_i)
+                .arg(&row_bytes)
+                .arg(&expert_bytes);
+            unsafe { b.launch(lc) }.w()?;
+            Ok(CudaStorage::wrap_cuda_slice(out, dev.clone()))
+        }};
+    }
+    match &x.slice {
+        CudaStorageSlice::F32(s) => launch!(s, f32),
+        CudaStorageSlice::F16(s) => launch!(s, half::f16),
+        CudaStorageSlice::BF16(s) => launch!(s, half::bf16),
+        _ => bail!("w8a16 indexed_moe: unsupported input dtype {:?}", x.dtype()),
+    }
+}
+
+/// Compiles and returns the Quantized Mode A `lm_head` Stage-1 kernel (`w8a16_lm{1,8}_*`)
+/// on CUDA from the shared `kernels/w8a16_impl.h` source.
+pub fn lm_stage1_quant_func(
+    dev: &CudaDevice,
+    wtype: GgmlDType,
+    dtype: DType,
+    m: usize,
+) -> Result<CudaFunction> {
+    let Some(d) = decoder(wtype) else {
+        bail!("w8a16 lm_stage1_quant: unsupported weight type {wtype:?}")
+    };
+    let (xs, xc) = elem_ctype(dtype)?;
+    let max_m = if m <= 1 { 1 } else { 8 };
+    let name = format!("w8a16_lm{max_m}_{}_{xs}", d.sfx);
+    let inst = format!("W8A16_LM_QUANT_KERNEL({name}, {}, {xc}, {max_m})", d.ty);
+    func(dev, &name, inst)
+}
+
+/// Planar NVFP4 / NVFP8 exact matvec (`M <= 8`) on CUDA via `kernels/w8a16_impl.h`.
+#[allow(clippy::too_many_arguments)]
+pub fn nvfp_mv(
+    dev: &CudaDevice,
+    data: &CudaSlice<u8>,
+    bscale_off: usize,
+    rscale_off: usize,
+    is_fp4: bool,
+    k: usize,
+    n: usize,
+    x: &CudaStorage,
+    x_off: usize,
+    rows: usize,
+) -> Result<CudaStorage> {
+    use crate::backend::BackendStorage;
+    use cudarc::driver::DevicePtr;
+    if rows == 0 || rows > MV_MAX_ROWS {
+        bail!("w8a16 nvfp_mv: {rows} rows (expected 1..={MV_MAX_ROWS})")
+    }
+    let (xs, xc) = elem_ctype(x.dtype())?;
+    let max_m = if rows == 1 { 1 } else { 8 };
+    let (name, inst) = if is_fp4 {
+        let name = format!("w8a16_nvfp4_mv{max_m}_{xs}");
+        let inst = format!("W8A16_NVFP4_MV_KERNEL({name}, {xc}, {max_m})");
+        (name, inst)
+    } else {
+        let name = format!("w8a16_nvfp8_mv{max_m}_{xs}");
+        let inst = format!("W8A16_NVFP8_MV_KERNEL({name}, {xc}, {max_m})");
+        (name, inst)
+    };
+    let f = func(dev, &name, inst)?;
+    let lc = LaunchConfig {
+        grid_dim: (n.div_ceil(4) as u32, 1, 1),
+        block_dim: (32, 4, 1),
+        shared_mem_bytes: 0,
+    };
+    let (k_i, n_i, rows_i) = (k as i32, n as i32, rows as i32);
+    let stream = dev.cuda_stream();
+    let (base_p, _g_w) = data.device_ptr(&stream);
+    let bs_p = base_p + bscale_off as u64;
+    let rs_p = base_p + rscale_off as u64;
+    macro_rules! launch {
+        ($s:expr, $t:ty) => {{
+            let xv = $s.slice(x_off..x_off + rows * k);
+            let mut out = unsafe { dev.alloc::<$t>(rows * n)? };
+            let mut b = stream.launch_builder(&f);
+            if is_fp4 {
+                b.arg(&base_p).arg(&bs_p).arg(&rs_p);
+            } else {
+                b.arg(&base_p).arg(&rs_p);
+            }
+            b.arg(&xv)
+                .arg(&mut out)
+                .arg(&k_i)
+                .arg(&n_i)
+                .arg(&rows_i);
+            unsafe { b.launch(lc) }.w()?;
+            Ok(CudaStorage::wrap_cuda_slice(out, dev.clone()))
+        }};
+    }
+    match &x.slice {
+        CudaStorageSlice::F32(s) => launch!(s, f32),
+        CudaStorageSlice::F16(s) => launch!(s, half::f16),
+        CudaStorageSlice::BF16(s) => launch!(s, half::bf16),
+        _ => bail!("w8a16 nvfp_mv: unsupported input dtype {:?}", x.dtype()),
+    }
+}
+
+/// Planar NVFP4 / NVFP8 exact dequantization on CUDA via `kernels/w8a16_impl.h`.
+pub fn nvfp_dq(
+    dev: &CudaDevice,
+    data: &CudaSlice<u8>,
+    bscale_off: usize,
+    rscale_off: usize,
+    is_fp4: bool,
+    k: usize,
+    n: usize,
+    out_dtype: DType,
+) -> Result<CudaStorage> {
+    use cudarc::driver::DevicePtr;
+    let (osfx, octype) = elem_ctype(out_dtype)?;
+    let (name, inst, total_work) = if is_fp4 {
+        let name = format!("w8a16_nvfp4_dq_{osfx}");
+        let inst = format!("W8A16_NVFP4_DQ_KERNEL({name}, {octype})");
+        (name, inst, n * (k / 16))
+    } else {
+        let name = format!("w8a16_nvfp8_dq_{osfx}");
+        let inst = format!("W8A16_NVFP8_DQ_KERNEL({name}, {octype})");
+        (name, inst, n * (k / 8))
+    };
+    let f = func(dev, &name, inst)?;
+    let lc = LaunchConfig {
+        grid_dim: (grid_1d(total_work, 256), 1, 1),
+        block_dim: (256, 1, 1),
+        shared_mem_bytes: 0,
+    };
+    let (k_i, n_i) = (k as i32, n as i32);
+    let stream = dev.cuda_stream();
+    let (base_p, _g_w) = data.device_ptr(&stream);
+    let bs_p = base_p + bscale_off as u64;
+    let rs_p = base_p + rscale_off as u64;
+    macro_rules! launch {
+        ($t:ty) => {{
+            let mut out = unsafe { dev.alloc::<$t>((n * k).max(1))? };
+            if n > 0 && k > 0 {
+                let mut b = stream.launch_builder(&f);
+                if is_fp4 {
+                    b.arg(&base_p).arg(&bs_p).arg(&rs_p);
+                } else {
+                    b.arg(&base_p).arg(&rs_p);
+                }
+                b.arg(&mut out).arg(&k_i).arg(&n_i);
+                unsafe { b.launch(lc) }.w()?;
+            }
+            Ok(CudaStorage::wrap_cuda_slice(out, dev.clone()))
+        }};
+    }
+    match out_dtype {
+        DType::F32 => launch!(f32),
+        DType::F16 => launch!(half::f16),
+        DType::BF16 => launch!(half::bf16),
+        d => bail!("w8a16 nvfp_dq: unsupported dtype {d:?}"),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -709,6 +923,12 @@ mod tests {
             "W8A16_DQ_KERNEL(",
             "W8A16_CVT_KERNEL(",
             "W8A16_CVT2D_KERNEL(",
+            "W8A16_MOE_KERNEL(",
+            "W8A16_LM_QUANT_KERNEL(",
+            "W8A16_NVFP4_MV_KERNEL(",
+            "W8A16_NVFP4_DQ_KERNEL(",
+            "W8A16_NVFP8_MV_KERNEL(",
+            "W8A16_NVFP8_DQ_KERNEL(",
         ] {
             assert!(SOURCE.contains(&format!("#define {m}")), "{m}");
         }
