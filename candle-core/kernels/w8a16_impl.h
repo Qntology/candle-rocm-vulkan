@@ -17,6 +17,10 @@
 
 #if defined(__HIP__) || defined(__HIPCC__)
 #include <hip/hip_runtime.h>
+// Prevent clang/hipcc from contracting `__fmul_rn` + `__fsub_rn` in DecQ4K/DecQ5K into FMA
+// (preserving bit-exact dequantization with CPU `Block*::to_float`; explicit `fmaf()` calls in
+// dot-product loops are unaffected by fp contract).
+#pragma clang fp contract(off)
 #define W_IS_HIP 1
 #define W_LDG(p) (*(p))
 #else
@@ -445,6 +449,7 @@ W_DEV void w8a16_mv_dyn(const w_u8 *__restrict__ wq, const XT *__restrict__ x, X
     if (row < n) {
         const w_u8 *wr = wq + (w_i64)row * row_bytes;
         const int ntasks = (k / D::QK) * D::TASKS;
+#pragma unroll 2
         for (int tk = wy * 32 + lane; tk < ntasks; tk += 32 * WPR) {
             const int b = tk / D::TASKS, t = tk % D::TASKS;
             float w[8 * D::RUNS];
@@ -625,36 +630,50 @@ W_DEV void w8a16_lm_stage1_quant(const XT *__restrict__ x, const w_u8 *__restric
         acc[m][3] = 0.0f;
     }
 
-    for (int tk = lane; tk < ntasks; tk += 32) {
-        const int b = tk / D::TASKS, t = tk % D::TASKS;
-        float w[8 * D::RUNS];
-        int xo[D::RUNS];
-        float xv[MAX_M][8 * D::RUNS];
-        // Compute xo using col0 if valid, or any valid column in this group; xo only depends on t.
-        const int first_col = col0 < V_valid ? col0 : 0;
-        D::decode(wq + (w_i64)first_col * row_bytes + (w_i64)b * D::BYTES, t, w, xo);
+    if (col0 < V_valid) {
+        for (int tk = lane; tk < ntasks; tk += 32) {
+            const int b = tk / D::TASKS, t = tk % D::TASKS;
+            float w[8 * D::RUNS];
+            int xo[D::RUNS];
+            if constexpr (MAX_M == 1) {
+                D::decode(wq + (w_i64)col0 * row_bytes + (w_i64)b * D::BYTES, t, w, xo);
+                float xv[8 * D::RUNS];
 #pragma unroll
-        for (int r = 0; r < D::RUNS; ++r) {
-            const XT *xr = x + b * D::QK + xo[r];
-            for (int m = 0; m < M; ++m) {
-                WIo<XT>::load8(xr + (w_i64)m * K, xv[m] + 8 * r);
-            }
-        }
-        if (col0 < V_valid) {
-            for (int m = 0; m < M; ++m) {
+                for (int r = 0; r < D::RUNS; ++r) {
+                    WIo<XT>::load8(x + b * D::QK + xo[r], xv + 8 * r);
+                }
 #pragma unroll
-                for (int i = 0; i < 8 * D::RUNS; ++i) acc[m][0] = fmaf(w[i], xv[m][i], acc[m][0]);
-            }
-        }
+                for (int i = 0; i < 8 * D::RUNS; ++i) acc[0][0] = fmaf(w[i], xv[i], acc[0][0]);
 #pragma unroll
-        for (int c = 1; c < 4; ++c) {
-            const int col = col0 + c;
-            if (col < V_valid) {
-                D::decode(wq + (w_i64)col * row_bytes + (w_i64)b * D::BYTES, t, w, xo);
-                for (int m = 0; m < M; ++m) {
+                for (int c = 1; c < 4; ++c) {
+                    const int col = col0 + c;
+                    if (col < V_valid) {
+                        D::decode(wq + (w_i64)col * row_bytes + (w_i64)b * D::BYTES, t, w, xo);
 #pragma unroll
-                    for (int i = 0; i < 8 * D::RUNS; ++i)
-                        acc[m][c] = fmaf(w[i], xv[m][i], acc[m][c]);
+                        for (int i = 0; i < 8 * D::RUNS; ++i)
+                            acc[0][c] = fmaf(w[i], xv[i], acc[0][c]);
+                    }
+                }
+            } else {
+                // For multi-row decode (M <= 8), stream x from L1 per (r, m) instead of keeping
+                // MAX_M * 8 * D::RUNS floats live in registers (avoids VGPR spilling on RDNA/CDNA).
+#pragma unroll
+                for (int c = 0; c < 4; ++c) {
+                    const int col = col0 + c;
+                    if (col < V_valid) {
+                        D::decode(wq + (w_i64)col * row_bytes + (w_i64)b * D::BYTES, t, w, xo);
+#pragma unroll
+                        for (int r = 0; r < D::RUNS; ++r) {
+                            const XT *xr = x + b * D::QK + xo[r];
+                            for (int m = 0; m < M; ++m) {
+                                float xv[8];
+                                WIo<XT>::load8(xr + (w_i64)m * K, xv);
+#pragma unroll
+                                for (int i = 0; i < 8; ++i)
+                                    acc[m][c] = fmaf(w[8 * r + i], xv[i], acc[m][c]);
+                            }
+                        }
+                    }
                 }
             }
         }

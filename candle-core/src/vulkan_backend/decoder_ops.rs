@@ -156,8 +156,12 @@ void main() {{
         for (uint p = t; p < dp; p += 256u) {{
             vec2 v = unpack2(x[xb + p]);
             if (has_delta) {{ v += unpack2(dl[db + p]); }}
-            if (write_res) {{ r_out[ob + p] = pack2(v.x, v.y); }}
-            sq += v.x * v.x + v.y * v.y;
+            if (write_res) {{
+                uint pk = pack2(v.x, v.y);
+                r_out[ob + p] = pk;
+                v = unpack2(pk);
+            }}
+            sq = fma(v.x, v.x, fma(v.y, v.y, sq));
         }}
         float inv = inversesqrt(wg_sum(sq) / float(D) + eps);
         for (uint p = t; p < dp; p += 256u) {{
@@ -349,7 +353,7 @@ void main() {{
 // 4. Fused QK Head RMSNorm + Partial/Full RoPE + KV Cache Direct Write
 // ---------------------------------------------------------------------------
 // Bindings: 0 q_in, 1 k_in, 2 v_in, 3 qnw, 4 knw, 5 cos, 6 sin, 7 q_out, 8 k_cache, 9 v_cache, 10 prm
-// prm layout (34 uints):
+// prm layout (37 uints):
 //   0 b, 1 t, 2 hq, 3 hkv, 4 d, 5 rotary_dim, 6 past_len, 7 eps_bits, 8 flags,
 //   9 has_qnw, 10 has_knw,
 //   11 q_off, 12 k_off, 13 v_off, 14 qnw_off, 15 knw_off, 16 cos_off, 17 sin_off, 18 kc_off, 19 vc_off,
@@ -519,7 +523,7 @@ void main() {{
 pub(crate) fn vk_fused_ready(dev: &VulkanDevice) -> bool {
     shaders::exec_mode() != shaders::ExecMode::Host
         && dev.ctx().native_ok.load(std::sync::atomic::Ordering::Relaxed)
-        && dev.ctx().device_type != ash::vk::PhysicalDeviceType::CPU
+        && (dev.ctx().device_type != ash::vk::PhysicalDeviceType::CPU || shaders::test_force_fused())
 }
 
 impl VulkanStorage {

@@ -14,6 +14,7 @@ use super::{VulkanDevice, VulkanStorage};
 use crate::accel::delta::{
     dk_cap, GdnScanArgs, GDN_FLAG_AB_F32, GDN_FLAG_L2NORM, GDN_FLAG_TILED, GDN_MAX_HEAD_K_DIM,
 };
+use crate::backend::BackendStorage;
 use crate::{bail, DType, Result};
 use std::collections::HashMap;
 use std::sync::{Mutex, OnceLock};
@@ -160,8 +161,12 @@ void main() {{
     uint bh = bi * Hv + h;
     bool has_s = prm[17] != 0u;
     float s_col[{dk_cap_val}];
-    for (uint i = 0u; i < Dk; i++) {{
-        s_col[i] = (active && has_s) ? s_in[prm[18] + (bh * Dk + i) * Dv + col] : 0.0;
+    for (uint i = 0u; i < {dk_cap_val}u; i++) {{
+        if (i < Dk) {{
+            s_col[i] = (active && has_s) ? s_in[prm[18] + (bh * Dk + i) * Dv + col] : 0.0;
+        }} else {{
+            s_col[i] = 0.0;
+        }}
     }}
     float na_h = neg_a[prm[15] + h];
     float dtb_h = dt_bias[prm[16] + h];
@@ -194,30 +199,38 @@ void main() {{
             float av = load_a(prm[9] + bi * prm[10] + tt * prm[11] + h);
             float bv = load_b(prm[12] + bi * prm[13] + tt * prm[14] + h);
             float x_sp = av + dtb_h;
-            float sp = (x_sp > 20.0) ? x_sp : log(1.0 + exp(x_sp));
+            float ex = exp(x_sp);
+            float u = 1.0 + ex;
+            float sp = (x_sp > 20.0) ? x_sp : ((u == 1.0) ? ex : (log(u) * (ex / (u - 1.0))));
             float eg = exp(na_h * sp);
             float beta = 1.0 / (1.0 + exp(-bv));
             float vv = qkv[qkv_t + 2u * key_dim + h * Dv + col];
             float kv_mem = 0.0;
-            for (uint i = 0u; i < Dk; i++) {{
-                float s_i = s_col[i] * eg;
-                s_col[i] = s_i;
-                kv_mem += s_i * sh_k[i];
+            for (uint i = 0u; i < {dk_cap_val}u; i++) {{
+                if (i < Dk) {{
+                    float s_i = s_col[i] * eg;
+                    s_col[i] = s_i;
+                    kv_mem = fma(s_i, sh_k[i], kv_mem);
+                }}
             }}
             float delta = (vv - kv_mem) * beta;
             float ov = 0.0;
-            for (uint i = 0u; i < Dk; i++) {{
-                float s_i = s_col[i] + sh_k[i] * delta;
-                s_col[i] = s_i;
-                ov += s_i * sh_q[i];
+            for (uint i = 0u; i < {dk_cap_val}u; i++) {{
+                if (i < Dk) {{
+                    float s_i = fma(sh_k[i], delta, s_col[i]);
+                    s_col[i] = s_i;
+                    ov = fma(s_i, sh_q[i], ov);
+                }}
             }}
             out_f32[((bi * T + tt) * Hv + h) * Dv + col] = ov;
         }}
         barrier();
     }}
     if (active) {{
-        for (uint i = 0u; i < Dk; i++) {{
-            s_out[(bh * Dk + i) * Dv + col] = s_col[i];
+        for (uint i = 0u; i < {dk_cap_val}u; i++) {{
+            if (i < Dk) {{
+                s_out[(bh * Dk + i) * Dv + col] = s_col[i];
+            }}
         }}
     }}
 }}
@@ -417,32 +430,45 @@ impl VulkanStorage {
 }
 
 /// Runs a one-time accuracy self-check of the Vulkan GPU GDN kernels against the CPU oracle,
-/// cached per Vulkan logical device.
+/// cached by `(ctx_id, dk_cap, x_dtype, ab_dtype)` so every distinct shader variant is verified
+/// before activation (`P3c-F04`, `P3c-F10`).
 pub(crate) fn self_check(dev: &VulkanDevice) -> bool {
+    self_check_for(dev, 64, DType::F32, DType::F32)
+}
+
+pub(crate) fn self_check_for(
+    dev: &VulkanDevice,
+    dk: usize,
+    x_dtype: DType,
+    ab_dtype: DType,
+) -> bool {
     if shaders::exec_mode() == shaders::ExecMode::Host
         || !dev.ctx().native_ok.load(std::sync::atomic::Ordering::Relaxed)
-        || dev.ctx().device_type == ash::vk::PhysicalDeviceType::CPU
+        || (dev.ctx().device_type == ash::vk::PhysicalDeviceType::CPU && !shaders::test_force_fused())
     {
         return false;
     }
-    static CACHE: OnceLock<Mutex<HashMap<usize, bool>>> = OnceLock::new();
-    let key = dev.ctx() as *const super::VulkanContext as usize;
+    let Some(cap) = dk_cap(dk) else {
+        return false;
+    };
+    static CACHE: OnceLock<Mutex<HashMap<(u64, usize, DType, DType), bool>>> = OnceLock::new();
+    let key = (dev.ctx().ctx_id, cap, x_dtype, ab_dtype);
     let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
     if let Some(ok) = cache.lock().ok().and_then(|g| g.get(&key).copied()) {
         return ok;
     }
-    let ok = run_self_check(dev).unwrap_or(false);
+    let ok = run_self_check(dev, cap, x_dtype, ab_dtype).unwrap_or(false);
     if let Ok(mut g) = cache.lock() {
         g.insert(key, ok);
     }
     ok
 }
 
-fn run_self_check(dev: &VulkanDevice) -> Result<bool> {
+fn run_self_check(dev: &VulkanDevice, dk: usize, x_dtype: DType, ab_dtype: DType) -> Result<bool> {
     use crate::delta_rule::{fused_gated_delta_rule, GdnConfig};
     use crate::{Device, Tensor};
 
-    let cfg = GdnConfig::new(2, 4, 64, 64);
+    let cfg = GdnConfig::new(2, 4, dk, 64);
     let (bsz, t, c, k) = (1, 4, cfg.conv_dim(), cfg.conv_kernel);
     let hv = cfg.num_v_heads;
     let mut rng = 0x517cc1b727220a95u64;
@@ -454,12 +480,13 @@ fn run_self_check(dev: &VulkanDevice) -> Result<bool> {
     };
     let mut mk = |n: usize| -> Vec<f32> { (0..n).map(|_| next()).collect() };
 
-    let x_cpu = Tensor::from_vec(mk(bsz * t * c), (bsz, t, c), &Device::Cpu)?;
+    let x_cpu = Tensor::from_vec(mk(bsz * t * c), (bsz, t, c), &Device::Cpu)?.to_dtype(x_dtype)?;
+    // `gdn_scan` always receives F32 `conv_weight` / `conv_bias` (matching `gpu_gated_delta_rule`).
     let cw_cpu = Tensor::from_vec(mk(c * k), (c, k), &Device::Cpu)?;
     let cb_cpu = Tensor::from_vec(mk(c), c, &Device::Cpu)?;
-    let cs_cpu = Tensor::from_vec(mk(bsz * c * (k - 1)), (bsz, c, k - 1), &Device::Cpu)?;
-    let a_cpu = Tensor::from_vec(mk(bsz * t * hv), (bsz, t, hv), &Device::Cpu)?;
-    let b_cpu = Tensor::from_vec(mk(bsz * t * hv), (bsz, t, hv), &Device::Cpu)?;
+    let cs_cpu = Tensor::from_vec(mk(bsz * c * (k - 1)), (bsz, c, k - 1), &Device::Cpu)?.to_dtype(x_dtype)?;
+    let a_cpu = Tensor::from_vec(mk(bsz * t * hv), (bsz, t, hv), &Device::Cpu)?.to_dtype(ab_dtype)?;
+    let b_cpu = Tensor::from_vec(mk(bsz * t * hv), (bsz, t, hv), &Device::Cpu)?.to_dtype(ab_dtype)?;
     let na_cpu = Tensor::from_vec(vec![-0.4f32; hv], hv, &Device::Cpu)?;
     let dtb_cpu = Tensor::from_vec(vec![0.1f32; hv], hv, &Device::Cpu)?;
     let st_cpu = Tensor::from_vec(
@@ -482,6 +509,10 @@ fn run_self_check(dev: &VulkanDevice) -> Result<bool> {
     )?;
 
     let vdev = Device::Vulkan(dev.clone());
+    let mut flags = GDN_FLAG_L2NORM;
+    if ab_dtype == DType::F32 && x_dtype != DType::F32 {
+        flags |= GDN_FLAG_AB_F32;
+    }
     let args = GdnScanArgs {
         b: bsz,
         t,
@@ -490,7 +521,7 @@ fn run_self_check(dev: &VulkanDevice) -> Result<bool> {
         dk: cfg.head_k_dim,
         dv: cfg.head_v_dim,
         kc: k,
-        flags: GDN_FLAG_L2NORM,
+        flags,
         eps: cfg.l2norm_eps,
         scale: (1.0 / (cfg.head_k_dim as f64).sqrt()) as f32,
         x: [0, t * c, c],
@@ -504,8 +535,12 @@ fn run_self_check(dev: &VulkanDevice) -> Result<bool> {
         s_off: 0,
     };
     let to_vk = |t: &Tensor| -> Result<VulkanStorage> {
-        let v = t.flatten_all()?.to_vec1::<f32>()?;
-        VulkanStorage::from_vec(v, dev)
+        let tv = t.to_device(&vdev)?;
+        let (st, _) = tv.storage_and_layout();
+        match &*st {
+            crate::Storage::Vulkan(vs) => vs.try_clone(tv.layout()),
+            _ => unreachable!(),
+        }
     };
     let (xv, cwv, cbv, csv, av, bv, nav, dtbv, stv) = (
         to_vk(&x_cpu)?,
@@ -529,10 +564,23 @@ fn run_self_check(dev: &VulkanDevice) -> Result<bool> {
         Some(&stv),
         &args,
     )?;
-    let _ = vdev;
+    let tol = match x_dtype {
+        DType::F32 => 1e-3,
+        DType::F16 => 1e-2,
+        DType::BF16 => 3e-2,
+        _ => 1e-2,
+    };
     let check_close = |gpu: &VulkanStorage, cpu: &Tensor| -> Result<bool> {
-        let gs = gpu.as_slice::<f32>()?;
-        let cs = cpu.flatten_all()?.to_vec1::<f32>()?;
+        let g_cpu = gpu.to_cpu_storage()?;
+        let g_t = crate::Tensor::from_storage(
+            crate::Storage::Cpu(g_cpu),
+            cpu.shape(),
+            crate::op::BackpropOp::none(),
+            false,
+        )
+        .to_dtype(DType::F32)?;
+        let gs = g_t.flatten_all()?.to_vec1::<f32>()?;
+        let cs = cpu.to_dtype(DType::F32)?.flatten_all()?.to_vec1::<f32>()?;
         if gs.len() != cs.len() {
             return Ok(false);
         }
@@ -541,7 +589,7 @@ fn run_self_check(dev: &VulkanDevice) -> Result<bool> {
             .zip(cs.iter())
             .map(|(a, b)| (a - b).abs())
             .fold(0.0f32, f32::max);
-        Ok(max_err.is_finite() && max_err < 1e-3)
+        Ok(max_err.is_finite() && max_err < tol)
     };
     Ok(check_close(&ov, &ref_out.out)?
         && check_close(&csv_o, &ref_out.conv_state)?

@@ -115,7 +115,7 @@ impl GuardedQuantLmHead {
             self.cs_guard.as_ref(),
         )?;
 
-        let (Some(w_rest), Some(rest_ids), Some(mask_t), Some(core_vals_t)) = (
+        let (Some(w_rest), Some(rest_ids), Some(_mask_t), Some(core_vals_t)) = (
             self.w_rest.as_ref(),
             self.rest_ids.as_ref(),
             core_out.rescue_mask.as_ref(),
@@ -124,7 +124,8 @@ impl GuardedQuantLmHead {
             return Ok((core_out.ids, 0));
         };
 
-        let masks = mask_t.to_vec1::<u8>()?;
+        let (mut ids, masks) = core_out.download_ids_and_mask()?;
+        let masks = masks.unwrap_or_default();
         let rescue_rows: Vec<u32> = masks
             .iter()
             .enumerate()
@@ -145,7 +146,6 @@ impl GuardedQuantLmHead {
             None,
         )?;
 
-        let mut ids = core_out.ids.to_vec1::<u32>()?;
         let core_vals = core_vals_t.to_vec1::<f32>()?;
         let rest_best_ids = rest_out.ids.to_vec1::<u32>()?;
         let rest_best_vals = rest_out
@@ -263,7 +263,7 @@ impl GuardedLmHead {
             self.cs_guard.as_ref(),
         )?;
 
-        let (Some(w_rest), Some(rest_ids), Some(mask_t), Some(core_vals_t)) = (
+        let (Some(w_rest), Some(rest_ids), Some(_mask_t), Some(core_vals_t)) = (
             self.w_rest.as_ref(),
             self.rest_ids.as_ref(),
             core_out.rescue_mask.as_ref(),
@@ -272,7 +272,8 @@ impl GuardedLmHead {
             return Ok((core_out.ids, 0));
         };
 
-        let masks = mask_t.to_vec1::<u8>()?;
+        let (mut ids, masks) = core_out.download_ids_and_mask()?;
+        let masks = masks.unwrap_or_default();
         let rescue_rows: Vec<u32> = masks
             .iter()
             .enumerate()
@@ -294,7 +295,6 @@ impl GuardedLmHead {
             None,
         )?;
 
-        let mut ids = core_out.ids.to_vec1::<u32>()?;
         let core_vals = core_vals_t.to_vec1::<f32>()?;
         let rest_best_ids = rest_out.ids.to_vec1::<u32>()?;
         let rest_best_vals = rest_out

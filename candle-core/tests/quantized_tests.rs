@@ -1754,7 +1754,7 @@ fn w8_check_forward_exact(
         .flatten_all()?
         .to_vec1::<f32>()?;
     let q_dev = std::sync::Arc::new(w8_qtensor(&bytes, wtype, n, k, dev)?);
-    let exact_mv = dev.is_cuda()
+    let exact_mv = (dev.is_cuda() || dev.is_rocm())
         && matches!(
             wtype,
             GgmlDType::Q8_0 | GgmlDType::Q4_0 | GgmlDType::Q4K | GgmlDType::Q5K | GgmlDType::Q6K
@@ -1795,8 +1795,9 @@ fn w8_check_forward_exact(
                 // same GEMM as a dense layer. Must equal `x.matmul(dequantize_to(dtype).t())`.
                 let tol = if dtype == DType::BF16 { 3e-2 } else { 5e-3 };
                 assert!(e.rel <= tol, "{line}");
-                if !dev.is_cuda() {
-                    // CPU: bf16 prefill runs in f32 (no bf16 matmul on the CPU backend).
+                if !dev.is_cuda() && !(dev.is_rocm() && exact_mv) {
+                    // CPU (and unquantized float QTensor on ROCm): runs in f32 (rounding <= 1.0
+                    // vs unrounded weights, strictly tighter than rounding weights to bf16/f16).
                     println!("{line}");
                     continue;
                 }
@@ -2297,28 +2298,117 @@ fn w8a16_dequantize_and_forward_exact_rocm() -> Result<()> {
         )?;
     }
 
-    // Native ROCm indexed_moe_forward
+    // Native ROCm indexed_moe_forward across all 5 W8A16 formats + F32/F16/BF16 + non-contiguous ids
     let (n_exp, out_n, in_k, batch, topk) = (4, 64, 256, 2, 2);
     let w_moe = Tensor::randn(0f32, 0.5, (n_exp, out_n, in_k), &Device::Cpu)?;
-    let q_moe = quantized::QTensor::quantize_onto(&w_moe, GgmlDType::Q4K, dev)?;
     let x_cpu = Tensor::randn(0f32, 0.5, (batch, in_k), &Device::Cpu)?;
     let ids_cpu = Tensor::from_vec(vec![2u32, 0, 1, 3], (batch, topk), &Device::Cpu)?;
-    let moe_gpu = q_moe
-        .indexed_moe_forward(&x_cpu.to_device(dev)?, &ids_cpu.to_device(dev)?)?
-        .to_device(&Device::Cpu)?;
-    let moe_ref = quantized::QTensor::quantize(&w_moe, GgmlDType::Q4K)?
-        .indexed_moe_forward(&x_cpu, &ids_cpu)?;
-    let moe_diff = (&moe_gpu - &moe_ref)?.abs()?.max_all()?.to_scalar::<f32>()?;
-    assert!(moe_diff <= 1e-3, "rocm indexed_moe diff {moe_diff}");
+    for wt in [
+        GgmlDType::Q8_0,
+        GgmlDType::Q4_0,
+        GgmlDType::Q4K,
+        GgmlDType::Q5K,
+        GgmlDType::Q6K,
+    ] {
+        let q_moe = quantized::QTensor::quantize_onto(&w_moe, wt, dev)?;
+        let moe_ref = quantized::QTensor::quantize(&w_moe, wt)?
+            .indexed_moe_forward(&x_cpu, &ids_cpu)?;
+        for dt in [DType::F32, DType::F16, DType::BF16] {
+            let x_dev = x_cpu.to_device(dev)?.to_dtype(dt)?;
+            let moe_gpu = q_moe
+                .indexed_moe_forward(&x_dev, &ids_cpu.to_device(dev)?)?
+                .to_device(&Device::Cpu)?
+                .to_dtype(DType::F32)?;
+            let tol = match dt {
+                DType::F32 => 1e-3,
+                DType::F16 => 2e-2,
+                DType::BF16 => 8e-2,
+                _ => 1e-3,
+            };
+            let moe_diff = (&moe_gpu - &moe_ref)?.abs()?.max_all()?.to_scalar::<f32>()?;
+            assert!(moe_diff <= tol, "rocm indexed_moe {wt:?} {dt:?} diff {moe_diff}");
+        }
+    }
+    // Non-contiguous ids on fallback format (Q2K) must not panic or mis-index (`Q2-F02`)
+    let q_moe_q2k = quantized::QTensor::quantize_onto(&w_moe, GgmlDType::Q2K, dev)?;
+    let ids_nc = Tensor::from_vec(vec![2u32, 1, 0, 3], (topk, batch), dev)?.t()?;
+    let moe_nc = q_moe_q2k.indexed_moe_forward(&x_cpu.to_device(dev)?, &ids_nc)?;
+    assert_eq!(moe_nc.dims(), [batch, topk, out_n]);
 
-    // Quantized Mode A lm_head on ROCm
-    let w_lm = Tensor::randn(0f32, 0.5, (96, 256), &Device::Cpu)?;
-    let q_lm = quantized::QTensor::quantize_onto(&w_lm, GgmlDType::Q8_0, dev)?;
-    let h_lm = Tensor::randn(0f32, 0.5, (3, 256), dev)?;
-    let out_q = candle_core::lm_head::fused_quant_argmax_cs(&h_lm, &q_lm, None, None, None)?;
-    let logits_ref = q_lm.forward_exact(&h_lm)?;
-    let out_b = candle_core::lm_head::logits_argmax_cs(&logits_ref, None, None, None)?;
-    assert_eq!(out_q.ids.to_vec1::<u32>()?, out_b.ids.to_vec1::<u32>()?);
+    // Quantized Mode A lm_head on ROCm: M=1 (lm1), M=3 (lm8), M=11 (chunked > 8),
+    // non-32-aligned V=97 tail, bias, all 5 W8A16 formats (`Q5-F05` / `Q5-O07`)
+    let w_lm = Tensor::randn(0f32, 0.5, (97, 256), &Device::Cpu)?;
+    let b_lm = Tensor::randn(0f32, 0.2, (97,), dev)?;
+    for wt in [
+        GgmlDType::Q8_0,
+        GgmlDType::Q4_0,
+        GgmlDType::Q4K,
+        GgmlDType::Q5K,
+        GgmlDType::Q6K,
+    ] {
+        let q_lm = quantized::QTensor::quantize_onto(&w_lm, wt, dev)?;
+        for m in [1usize, 3, 11] {
+            for dt in [DType::F32, DType::F16, DType::BF16] {
+                let h_lm = Tensor::randn(0f32, 0.5, (m, 256), dev)?.to_dtype(dt)?;
+                let out_q = candle_core::lm_head::fused_quant_argmax_cs(
+                    &h_lm,
+                    &q_lm,
+                    Some(&b_lm),
+                    None,
+                    None,
+                )?;
+                // Compare against exact F32 logits of the widened `h_lm` (fused Mode A never
+                // truncates intermediate logits to F16/BF16 before argmax).
+                let h_f32 = h_lm.to_dtype(DType::F32)?;
+                let logits_ref = q_lm
+                    .forward_exact(&h_f32)?
+                    .broadcast_add(&b_lm.unsqueeze(0)?)?;
+                let out_b =
+                    candle_core::lm_head::logits_argmax_cs(&logits_ref, None, None, None)?;
+                assert_eq!(
+                    out_q.ids.to_vec1::<u32>()?,
+                    out_b.ids.to_vec1::<u32>()?,
+                    "rocm quant Mode A {wt:?} m={m} dt={dt:?} V=97"
+                );
+            }
+        }
+    }
+
+    // Native ROCm NVFP4 & NVFP8: bit-exact GPU vs CPU dequant, decode (M=1,4), tiled prefill (M=17) (`Q1-O04`)
+    let w_nv = Tensor::randn(0f32, 0.4, (64, 256), &Device::Cpu)?;
+    for fmt in [quantized::NvfpFormat::Nvfp4, quantized::NvfpFormat::Nvfp8] {
+        let nw_cpu = quantized::NvfpWeight::quantize_onto(&w_nv, fmt, &Device::Cpu)?;
+        let nw_gpu = quantized::NvfpWeight::quantize_onto(&w_nv, fmt, dev)?;
+        let dq_cpu = nw_cpu.dequantize_to(DType::F32)?.flatten_all()?.to_vec1::<f32>()?;
+        let dq_gpu = nw_gpu
+            .dequantize_to(DType::F32)?
+            .to_device(&Device::Cpu)?
+            .flatten_all()?
+            .to_vec1::<f32>()?;
+        assert_eq!(
+            dq_cpu.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+            dq_gpu.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+            "rocm {fmt:?} dequantize_to must be bit-exact with CPU"
+        );
+        for m in [1usize, 4, 17] {
+            for dt in [DType::F32, DType::F16, DType::BF16] {
+                let x = Tensor::randn(0f32, 0.5, (m, 256), &Device::Cpu)?.to_dtype(dt)?;
+                let y_ref = nw_cpu.forward(&x)?.to_dtype(DType::F32)?;
+                let y_gpu = nw_gpu
+                    .forward(&x.to_device(dev)?)?
+                    .to_device(&Device::Cpu)?
+                    .to_dtype(DType::F32)?;
+                let tol = match dt {
+                    DType::F32 => 1e-4,
+                    DType::F16 => 2e-2,
+                    DType::BF16 => 1e-1,
+                    _ => 1e-4,
+                };
+                let diff = (&y_gpu - &y_ref)?.abs()?.max_all()?.to_scalar::<f32>()?;
+                assert!(diff <= tol, "rocm {fmt:?} forward m={m} dt={dt:?} diff {diff}");
+            }
+        }
+    }
 
     // Skinny GEMM, conv1d, conv_transpose1d, avg_pool2d, max_pool2d, upsample_nearest1d, arg_sort
     let a = Tensor::randn(0f32, 0.5, (3, 128), &Device::Cpu)?;

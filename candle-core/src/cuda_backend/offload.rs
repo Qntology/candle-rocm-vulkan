@@ -440,9 +440,10 @@ impl CudaDevice {
     }
 }
 
-/// Minimum payload size for routing uploads through the pinned staging buffer + non-blocking
-/// CopyStream. Smaller transfers bypass pinned staging and copy directly on the compute stream.
-pub const ASYNC_DMA_MIN_BYTES: usize = 2 * 1024 * 1024;
+/// Minimum payload size (4 MiB) for routing uploads through the pinned staging buffer +
+/// non-blocking CopyStream. Smaller transfers bypass pinned staging and copy directly on the
+/// compute stream.
+pub use crate::accel::ASYNC_DMA_MIN_BYTES;
 
 /// Reusable page-locked staging slot for overlapping host-to-device DMA uploads (such as
 /// layer weight streaming or next-crop vision inputs) with compute kernels on `CudaDevice`.
@@ -466,7 +467,8 @@ impl AsyncPrefetchSlot {
     }
 
     /// Waits for any prior DMA from this slot to finish, copies `src` into the pinned buffer,
-    /// and queues an asynchronous H2D upload into `dst` at `dst_off`.
+    /// and queues an asynchronous H2D upload into `dst` at `dst_off` when `src.len() >= ASYNC_DMA_MIN_BYTES`,
+    /// or copies directly on the compute stream for smaller payloads to avoid pinned overhead.
     pub fn prefetch_bytes(&mut self, src: &[u8], dst: &CudaStorage, dst_off: usize) -> Result<()> {
         if let Some(ev) = self.inflight.take() {
             ev.synchronize()?;
@@ -477,6 +479,34 @@ impl AsyncPrefetchSlot {
                 src.len(),
                 self.buf.len()
             );
+        }
+        if src.is_empty() {
+            return Ok(());
+        }
+        if src.len() < ASYNC_DMA_MIN_BYTES {
+            self.stream.check(dst, "destination")?;
+            let (dst_ptr, dst_len) = storage_ptr(dst);
+            if dst_off
+                .checked_add(src.len())
+                .map_or(true, |end| end > dst_len)
+            {
+                bail!(
+                    "AsyncPrefetchSlot: destination range {dst_off}+{} exceeds {dst_len} bytes",
+                    src.len()
+                );
+            }
+            bind_context_raw(&self.stream.stream.ctx).w()?;
+            unsafe {
+                sys::cuMemcpyHtoDAsync_v2(
+                    dst_ptr + dst_off as u64,
+                    src.as_ptr() as *const std::ffi::c_void,
+                    src.len(),
+                    dst.device.cuda_stream().cu_stream(),
+                )
+                .result()
+            }
+            .w()?;
+            return Ok(());
         }
         self.buf.as_mut_slice()[..src.len()].copy_from_slice(src);
         let ev = self.stream.upload(&self.buf, 0, dst, dst_off, src.len())?;

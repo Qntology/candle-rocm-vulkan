@@ -60,11 +60,13 @@ impl QuantizedTensor {
 pub struct TurboQuantizer {
     format: QuantFormat,
     rotation: RotationKind,
+    seed: u64,
     dim: usize,
     layout: RowLayout,
     codec: Arc<RowCodec>,
-    /// `Π` and `Πᵀ` (`dim x dim`), `None` without rotation.
-    rot: Option<(Tensor, Tensor)>,
+    /// `Π` and `Πᵀ` (`dim x dim`), lazily populated when Hadamard uses O(d log d) FWHT so
+    /// CPU/CUDA/ROCm never allocate unused `d x d` rotation matrices (`Q3-F06`).
+    rot: Arc<Mutex<Option<(Tensor, Tensor)>>>,
     /// Packed sign bits (`ceil(dim / 32)` u32 words) for O(d log d) FWHT when
     /// `rotation == Hadamard && dim.is_power_of_two() && dim <= 256`.
     hadamard_signs: Option<(Tensor, Arc<Vec<u32>>)>,
@@ -107,20 +109,25 @@ impl TurboQuantizer {
         let layout = row_layout(format, dim)?;
         let codec = Arc::new(RowCodec::new(format, dim, seed)?);
         let rotation = rotation.resolve(dim);
-        let rot = if rotation == RotationKind::None {
-            None
-        } else {
-            let m = Tensor::from_vec(rotation_matrix(dim, rotation, seed)?, (dim, dim), device)?;
-            let mt = m.t()?.contiguous()?;
-            Some((m, mt))
-        };
         let hadamard_signs = if rotation == RotationKind::Hadamard
             && dim.is_power_of_two()
-            && dim <= 256
+            && (dim <= 256 || device.is_cpu())
         {
             let bits = hadamard_sign_bits(dim, seed)?;
             let t = Tensor::from_vec(bits.clone(), bits.len(), device)?;
             Some((t, Arc::new(bits)))
+        } else {
+            None
+        };
+        // Skip eager d x d Π/Πᵀ allocation when FWHT handles rotation directly on this device
+        // (CPU, CUDA, ROCm); materialize lazily only if dense rotation is actually needed.
+        let eager_rot = rotation != RotationKind::None
+            && !(hadamard_signs.is_some()
+                && matches!(device, Device::Cpu | Device::Cuda(_) | Device::Rocm(_)));
+        let rot_init = if eager_rot {
+            let m = Tensor::from_vec(rotation_matrix(dim, rotation, seed)?, (dim, dim), device)?;
+            let mt = m.t()?.contiguous()?;
+            Some((m, mt))
         } else {
             None
         };
@@ -141,10 +148,11 @@ impl TurboQuantizer {
         Ok(Self {
             format,
             rotation,
+            seed,
             dim,
             layout,
             codec,
-            rot,
+            rot: Arc::new(Mutex::new(rot_init)),
             hadamard_signs,
             qjl,
             tab,
@@ -217,20 +225,44 @@ impl TurboQuantizer {
             return Ok(Some(Tensor::from_vec(v, shape, x.device())?));
         }
         #[cfg(any(feature = "cuda", feature = "rocm"))]
-        if self.kernels() && matches!(x.device(), Device::Cuda(_) | Device::Rocm(_)) {
+        if self.kernels() && matches!(x.device(), Device::Cuda(_) | Device::Rocm(_)) && d <= 256 {
             let x2 = x.contiguous()?.reshape((rows, d))?;
-            let out = x2.apply_op2_no_bwd(
+            match x2.apply_op2_no_bwd(
                 signs_t,
                 &TqFwht {
                     rows,
                     dim: d,
                     forward,
                 },
-            )?;
-            return Ok(Some(out.reshape(shape)?));
+            ) {
+                Ok(out) => return Ok(Some(out.reshape(shape)?)),
+                Err(err) => {
+                    // Fall back cleanly to dense rotation instead of aborting append/attention (`Q3-F10`).
+                    warn_cpu_fallback("tq_fwht", &err);
+                }
+            }
         }
         let _ = signs_t;
         Ok(None)
+    }
+
+    fn dense_rot(&self) -> Result<Option<(Tensor, Tensor)>> {
+        if self.rotation == RotationKind::None {
+            return Ok(None);
+        }
+        let mut g = self.rot.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some(pair) = g.as_ref() {
+            return Ok(Some(pair.clone()));
+        }
+        let m = Tensor::from_vec(
+            rotation_matrix(self.dim, self.rotation, self.seed)?,
+            (self.dim, self.dim),
+            &self.device,
+        )?;
+        let mt = m.t()?.contiguous()?;
+        let pair = (m, mt);
+        *g = Some(pair.clone());
+        Ok(Some(pair))
     }
 
     /// `x Πᵀ` in f32 (rows of the rotated domain). Uses O(d log d) FWHT when `Hadamard`.
@@ -239,8 +271,8 @@ impl TurboQuantizer {
             return Ok(y);
         }
         let x = x.to_dtype(DType::F32)?;
-        match &self.rot {
-            Some((_, mt)) => x.broadcast_matmul(mt),
+        match self.dense_rot()? {
+            Some((_, mt)) => x.broadcast_matmul(&mt),
             None => x.contiguous(),
         }
     }
@@ -250,8 +282,8 @@ impl TurboQuantizer {
         if let Some(z) = self.fwht_transform(y, false)? {
             return Ok(z);
         }
-        match &self.rot {
-            Some((m, _)) => y.broadcast_matmul(m),
+        match self.dense_rot()? {
+            Some((m, _)) => y.broadcast_matmul(&m),
             None => Ok(y.clone()),
         }
     }
@@ -275,11 +307,11 @@ impl TurboQuantizer {
     fn quantize_gpu(&self, y: &Tensor, rows: usize) -> Result<Tensor> {
         let args = TqRowArgs::new(self.format, rows, self.dim)?;
         #[cfg(any(feature = "cuda", feature = "rocm"))]
-        if let Some((s_mat, _)) = &self.qjl {
+        if let Some((_, st)) = &self.qjl {
             if matches!(y.device(), Device::Cuda(_) | Device::Rocm(_)) && self.dim <= 256 {
                 return y.apply_op3_no_bwd(
                     &self.tab,
-                    s_mat,
+                    st,
                     &TqQuantProdFused { args },
                 );
             }
@@ -1600,13 +1632,22 @@ fn cpu_attention_packed_fused(
             }
             mode::FP8 => {
                 let mut dot = 0.0f32;
-                for wi in 0..(d / 4) {
+                let full = d / 4;
+                for wi in 0..full {
                     let w = kr[wi];
                     let d0 = wi * 4;
                     dot = e4m3_lut[(w & 0xff) as usize].mul_add(qrow[d0], dot);
                     dot = e4m3_lut[((w >> 8) & 0xff) as usize].mul_add(qrow[d0 + 1], dot);
                     dot = e4m3_lut[((w >> 16) & 0xff) as usize].mul_add(qrow[d0 + 2], dot);
                     dot = e4m3_lut[((w >> 24) & 0xff) as usize].mul_add(qrow[d0 + 3], dot);
+                }
+                let rem = d & 3;
+                if rem > 0 {
+                    let w = kr[full];
+                    let d0 = full * 4;
+                    for r in 0..rem {
+                        dot = e4m3_lut[((w >> (r * 8)) & 0xff) as usize].mul_add(qrow[d0 + r], dot);
+                    }
                 }
                 dot
             }
@@ -1681,13 +1722,23 @@ fn cpu_attention_packed_fused(
                 }
             }
             mode::FP8 => {
-                for wi in 0..(d / 4) {
+                let full = d / 4;
+                for wi in 0..full {
                     let w = vr[wi];
                     let d0 = wi * 4;
                     acc[d0] = e4m3_lut[(w & 0xff) as usize].mul_add(p, acc[d0]);
                     acc[d0 + 1] = e4m3_lut[((w >> 8) & 0xff) as usize].mul_add(p, acc[d0 + 1]);
                     acc[d0 + 2] = e4m3_lut[((w >> 16) & 0xff) as usize].mul_add(p, acc[d0 + 2]);
                     acc[d0 + 3] = e4m3_lut[((w >> 24) & 0xff) as usize].mul_add(p, acc[d0 + 3]);
+                }
+                let rem = d & 3;
+                if rem > 0 {
+                    let w = vr[full];
+                    let d0 = full * 4;
+                    for r in 0..rem {
+                        acc[d0 + r] =
+                            e4m3_lut[((w >> (r * 8)) & 0xff) as usize].mul_add(p, acc[d0 + r]);
+                    }
                 }
             }
             _ => {
@@ -1700,84 +1751,250 @@ fn cpu_attention_packed_fused(
 
     let total_rows = b * hq * lq;
     let mut out = vec![0.0f32; total_rows * d];
-    out.par_chunks_mut(d).enumerate().for_each(|(row_idx, out_row)| {
-        let bh = row_idx / lq;
-        let qi = row_idx % lq;
-        let bi = bh / hq;
-        let h = bh % hq;
-        let hk = h / group;
-        let qrow = &qr_v[row_idx * d..(row_idx + 1) * d];
-        let qsk = q_sk.as_ref().map(|v| &v[row_idx * d..(row_idx + 1) * d]);
-        let slope = alibi_v
-            .as_ref()
-            .map(|(a, bs)| a[bi * bs + h])
-            .unwrap_or(0.0);
 
-        let pos = qi as i32 + lk as i32 - lq as i32;
-        let mut lo = if wl >= 0 { (pos - wl).max(0) } else { 0 };
-        let mut hi = if wr >= 0 { (pos + wr + 1).min(lk as i32) } else { lk as i32 };
-        if lo > lk as i32 {
-            lo = lk as i32;
-        }
-        if hi < lo {
-            hi = lo;
-        }
-        let k_head = (bi * hkv + hk) * cap * kw;
-        let v_head = (bi * hkv + hk) * cap * vw;
-        let mut m = f32::NEG_INFINITY;
-        let mut lsum = 0.0f32;
-        out_row.fill(0.0);
-
-        for j in (lo as usize)..(hi as usize) {
-            let kr = &k_words[k_head + j * kw..k_head + (j + 1) * kw];
-            let r0 = f32::from_bits(kr[k_side.rsc_offset]);
-            let mut sc = r0 * decode_key_dot(kr, qrow);
-            if let Some(sk) = qsk {
-                let mut sdot = 0.0f32;
-                for dd in 0..d {
-                    let bit = (kr[k_side.code_words + (dd >> 5)] >> (dd & 31)) & 1;
-                    sdot += if bit != 0 { sk[dd] } else { -sk[dd] };
+    // Helper to decode a compressed K/V row once into a dense f32 buffer for GQA-shared reuse.
+    let decode_row_to_f32 = |words: &[u32], side_mode: u32, code_words: usize, codec: &RowCodec, dst: &mut [f32]| {
+        match side_mode {
+            mode::NVFP4 => {
+                let aux = &words[code_words..];
+                for bk in 0..(d / 16) {
+                    let sbyte = ((aux[bk >> 2] >> ((bk & 3) * 8)) & 0xff) as usize;
+                    let bs = e4m3_lut[sbyte];
+                    let w0 = words[bk * 2];
+                    let w1 = words[bk * 2 + 1];
+                    let d0 = bk * 16;
+                    for e in 0..8 {
+                        dst[d0 + e] = FP4_LUT[((w0 >> (e * 4)) & 0xf) as usize] * bs;
+                    }
+                    for e in 0..8 {
+                        dst[d0 + 8 + e] = FP4_LUT[((w1 >> (e * 4)) & 0xf) as usize] * bs;
+                    }
                 }
-                let r1 = f32::from_bits(kr[k_side.rsc_offset + 1]);
-                sc += r0 * r1 * QJL_FACTOR / (d as f32) * sdot;
             }
-            let mut s = sc * scale;
-            if softcap > 0.0 {
-                s = softcap * (s / softcap).tanh();
+            mode::MXFP4 => {
+                let aux = &words[code_words..];
+                for bk in 0..(d / 32) {
+                    let sbyte = ((aux[bk >> 2] >> ((bk & 3) * 8)) & 0xff) as u8;
+                    let bs = e8m0_to_f32(sbyte);
+                    let d0 = bk * 32;
+                    for wi in 0..4 {
+                        let w = words[bk * 4 + wi];
+                        for e in 0..8 {
+                            dst[d0 + wi * 8 + e] = FP4_LUT[((w >> (e * 4)) & 0xf) as usize] * bs;
+                        }
+                    }
+                }
             }
-            if slope != 0.0 {
-                s -= slope * (pos - j as i32).abs() as f32;
+            mode::FP8 => {
+                let full = d / 4;
+                for wi in 0..full {
+                    let w = words[wi];
+                    let d0 = wi * 4;
+                    dst[d0] = e4m3_lut[(w & 0xff) as usize];
+                    dst[d0 + 1] = e4m3_lut[((w >> 8) & 0xff) as usize];
+                    dst[d0 + 2] = e4m3_lut[((w >> 16) & 0xff) as usize];
+                    dst[d0 + 3] = e4m3_lut[((w >> 24) & 0xff) as usize];
+                }
+                let rem = d & 3;
+                if rem > 0 {
+                    let w = words[full];
+                    let d0 = full * 4;
+                    for r in 0..rem {
+                        dst[d0 + r] = e4m3_lut[((w >> (r * 8)) & 0xff) as usize];
+                    }
+                }
             }
-            let vr = &v_words[v_head + j * vw..v_head + (j + 1) * vw];
-            let vscale = f32::from_bits(vr[v_side.rsc_offset]);
-            if s > m {
-                let alpha = if m.is_finite() { (m - s).exp() } else { 0.0 };
+            _ => {
+                for j in 0..d {
+                    dst[j] = codec.elem(words, j);
+                }
+            }
+        }
+    };
+
+    // When GQA shares a KV head across `group >= 2` query heads (and `d <= 256`), decode each
+    // K/V row once per `(b, hk, qi)` group and reuse it across all `group` query heads via
+    // runtime-dispatched SIMD `VecOps` (`Q6-F05` / `Q6-O05`).
+    if group >= 2 && d <= 256 {
+        use candle::cpu::kernels::VecOps;
+        out.par_chunks_mut(group * lq * d)
+            .enumerate()
+            .for_each(|(bg_idx, out_group)| {
+                let bi = bg_idx / hkv;
+                let hk = bg_idx % hkv;
+                let h0 = hk * group;
+                let k_head = (bi * hkv + hk) * cap * kw;
+                let v_head = (bi * hkv + hk) * cap * vw;
+                let mut k_buf = [0.0f32; 256];
+                let mut v_buf = [0.0f32; 256];
+                let mut m = vec![f32::NEG_INFINITY; group];
+                let mut lsum = vec![0.0f32; group];
+                for qi in 0..lq {
+                    let pos = qi as i32 + lk as i32 - lq as i32;
+                    let mut lo = if wl >= 0 { Ord::max(pos - wl, 0) } else { 0 };
+                    let mut hi = if wr >= 0 {
+                        Ord::min(pos + wr + 1, lk as i32)
+                    } else {
+                        lk as i32
+                    };
+                    if lo > lk as i32 {
+                        lo = lk as i32;
+                    }
+                    if hi < lo {
+                        hi = lo;
+                    }
+                    m.fill(f32::NEG_INFINITY);
+                    lsum.fill(0.0);
+                    for g in 0..group {
+                        let o_off = (g * lq + qi) * d;
+                        out_group[o_off..o_off + d].fill(0.0);
+                    }
+                    for j in (lo as usize)..(hi as usize) {
+                        let kr = &k_words[k_head + j * kw..k_head + (j + 1) * kw];
+                        let vr = &v_words[v_head + j * vw..v_head + (j + 1) * vw];
+                        let r0 = f32::from_bits(kr[k_side.rsc_offset]);
+                        let vscale = f32::from_bits(vr[v_side.rsc_offset]);
+                        decode_row_to_f32(kr, k_side.mode, k_side.code_words, &k_codec, &mut k_buf[..d]);
+                        decode_row_to_f32(vr, v_side.mode, v_side.code_words, &v_codec, &mut v_buf[..d]);
+                        for g in 0..group {
+                            let h = h0 + g;
+                            let row_idx = (bi * hq + h) * lq + qi;
+                            let qrow = &qr_v[row_idx * d..(row_idx + 1) * d];
+                            let mut sc = r0 * unsafe { f32::vec_dot_f32(k_buf.as_ptr(), qrow.as_ptr(), d) };
+                            if let Some(sk_all) = &q_sk {
+                                let sk = &sk_all[row_idx * d..(row_idx + 1) * d];
+                                let mut sdot = 0.0f32;
+                                for dd in 0..d {
+                                    let bit = (kr[k_side.code_words + (dd >> 5)] >> (dd & 31)) & 1;
+                                    sdot += if bit != 0 { sk[dd] } else { -sk[dd] };
+                                }
+                                let r1 = f32::from_bits(kr[k_side.rsc_offset + 1]);
+                                sc += r0 * r1 * QJL_FACTOR / (d as f32) * sdot;
+                            }
+                            let mut s = sc * scale;
+                            if softcap > 0.0 {
+                                s = softcap * (s / softcap).tanh();
+                            }
+                            if let Some((a, bs)) = &alibi_v {
+                                let slope = a[bi * *bs + h];
+                                if slope != 0.0 {
+                                    s -= slope * (pos - j as i32).abs() as f32;
+                                }
+                            }
+                            if s == f32::NEG_INFINITY && m[g] == f32::NEG_INFINITY {
+                                continue;
+                            }
+                            let o_off = (g * lq + qi) * d;
+                            let out_row = &mut out_group[o_off..o_off + d];
+                            if s > m[g] {
+                                let alpha = if m[g].is_finite() { (m[g] - s).exp() } else { 0.0 };
+                                for v in out_row.iter_mut() {
+                                    *v *= alpha;
+                                }
+                                lsum[g] = lsum[g] * alpha + 1.0;
+                                m[g] = s;
+                                f32::vec_fmadd_to_f32(out_row, &v_buf[..d], vscale);
+                            } else {
+                                let p = (s - m[g]).exp();
+                                lsum[g] += p;
+                                f32::vec_fmadd_to_f32(out_row, &v_buf[..d], p * vscale);
+                            }
+                        }
+                    }
+                    for g in 0..group {
+                        if lsum[g] > 0.0 {
+                            let inv = 1.0 / lsum[g];
+                            let o_off = (g * lq + qi) * d;
+                            for v in &mut out_group[o_off..o_off + d] {
+                                *v *= inv;
+                            }
+                        }
+                    }
+                }
+            });
+    } else {
+        out.par_chunks_mut(d).enumerate().for_each(|(row_idx, out_row)| {
+            let bh = row_idx / lq;
+            let qi = row_idx % lq;
+            let bi = bh / hq;
+            let h = bh % hq;
+            let hk = h / group;
+            let qrow = &qr_v[row_idx * d..(row_idx + 1) * d];
+            let qsk = q_sk.as_ref().map(|v| &v[row_idx * d..(row_idx + 1) * d]);
+            let slope = alibi_v
+                .as_ref()
+                .map(|(a, bs)| a[bi * bs + h])
+                .unwrap_or(0.0);
+
+            let pos = qi as i32 + lk as i32 - lq as i32;
+            let mut lo = if wl >= 0 { (pos - wl).max(0) } else { 0 };
+            let mut hi = if wr >= 0 { (pos + wr + 1).min(lk as i32) } else { lk as i32 };
+            if lo > lk as i32 {
+                lo = lk as i32;
+            }
+            if hi < lo {
+                hi = lo;
+            }
+            let k_head = (bi * hkv + hk) * cap * kw;
+            let v_head = (bi * hkv + hk) * cap * vw;
+            let mut m = f32::NEG_INFINITY;
+            let mut lsum = 0.0f32;
+            out_row.fill(0.0);
+
+            for j in (lo as usize)..(hi as usize) {
+                let kr = &k_words[k_head + j * kw..k_head + (j + 1) * kw];
+                let r0 = f32::from_bits(kr[k_side.rsc_offset]);
+                let mut sc = r0 * decode_key_dot(kr, qrow);
+                if let Some(sk) = qsk {
+                    let mut sdot = 0.0f32;
+                    for dd in 0..d {
+                        let bit = (kr[k_side.code_words + (dd >> 5)] >> (dd & 31)) & 1;
+                        sdot += if bit != 0 { sk[dd] } else { -sk[dd] };
+                    }
+                    let r1 = f32::from_bits(kr[k_side.rsc_offset + 1]);
+                    sc += r0 * r1 * QJL_FACTOR / (d as f32) * sdot;
+                }
+                let mut s = sc * scale;
+                if softcap > 0.0 {
+                    s = softcap * (s / softcap).tanh();
+                }
+                if slope != 0.0 {
+                    s -= slope * (pos - j as i32).abs() as f32;
+                }
+                if s == f32::NEG_INFINITY && m == f32::NEG_INFINITY {
+                    continue;
+                }
+                let vr = &v_words[v_head + j * vw..v_head + (j + 1) * vw];
+                let vscale = f32::from_bits(vr[v_side.rsc_offset]);
+                if s > m {
+                    let alpha = if m.is_finite() { (m - s).exp() } else { 0.0 };
+                    for v in out_row.iter_mut() {
+                        *v *= alpha;
+                    }
+                    lsum = lsum * alpha + 1.0;
+                    m = s;
+                    accum_val(vr, vscale, out_row);
+                } else {
+                    let p = (s - m).exp();
+                    lsum += p;
+                    accum_val(vr, p * vscale, out_row);
+                }
+            }
+            if lsum > 0.0 {
+                let inv = 1.0 / lsum;
                 for v in out_row.iter_mut() {
-                    *v *= alpha;
+                    *v *= inv;
                 }
-                lsum = lsum * alpha + 1.0;
-                m = s;
-                accum_val(vr, vscale, out_row);
-            } else {
-                let p = (s - m).exp();
-                lsum += p;
-                accum_val(vr, p * vscale, out_row);
             }
-        }
-        if lsum > 0.0 {
-            let inv = 1.0 / lsum;
-            for v in out_row.iter_mut() {
-                *v *= inv;
-            }
-        }
-    });
+        });
+    }
 
     let o = Tensor::from_vec(out, (b, hq, lq, d), q.device())?;
     Ok(Some(vq.unrotate(&o)?.to_dtype(q.dtype())?))
 }
 
 /// The fused kernel over `kd` / `vd` (`(b, hkv, capacity, words)`, contiguous, same capacity),
-/// `Ok(None)` when it does not apply (CPU, kernels off, shape out of range).
+/// `Ok(None)` when it does not apply (kernels off, prefill on CPU, shape out of range).
 fn fused_attention_rows(
     q: &Tensor,
     kd: &Tensor,
@@ -1788,6 +2005,13 @@ fn fused_attention_rows(
     cfg: &FlashAttnConfig,
 ) -> Result<Option<Tensor>> {
     if q.device().is_cpu() {
+        let allow_fused = cfg
+            .fused
+            .unwrap_or_else(|| accel::config().flash_attn_allowed(q.device()));
+        let lq = q.dim(2)?;
+        if !allow_fused || lq > 8 {
+            return Ok(None);
+        }
         return cpu_attention_packed_fused(q, kd, vd, lk, kq, vq, cfg);
     }
     let (b, _, _, _) = q.dims4()?;
@@ -2274,6 +2498,65 @@ mod accuracy {
                 "{kf} / {vf}: {bits} bits per key value, relative error {:.3}",
                 total / 6.0
             );
+        }
+    }
+
+    /// Odd head dimension (`d = 6`, not divisible by 4) FP8 fused CPU TurboQuant must not drop
+    /// tail elements (`Q3-F01`), and `fused=true` must match `fused=false` (dequant + reference)
+    /// across all formats including NVFP4/MXFP4 (`Q6-F04`).
+    #[test]
+    fn cpu_fused_tq_odd_fp8_and_all_formats_match_unfused() {
+        let rand = |shape: &[usize], seed: u64| -> Tensor {
+            let mut rng = SplitMix64::new(seed);
+            let n: usize = shape.iter().product();
+            let v: Vec<f32> = (0..n).map(|_| rng.next_normal() as f32).collect();
+            Tensor::from_vec(v, shape, &Device::Cpu).unwrap()
+        };
+        let rel_err = |a: &Tensor, b: &Tensor| -> f32 {
+            let e = (a - b).unwrap().sqr().unwrap().sum_all().unwrap().to_scalar::<f32>().unwrap();
+            let n = b.sqr().unwrap().sum_all().unwrap().to_scalar::<f32>().unwrap();
+            (e / n).sqrt()
+        };
+        // 1) Odd dim d = 6 FP8 tail check (Q3-F01)
+        let (b, hq, hkv, lk, d_odd) = (1usize, 4, 2, 17, 6);
+        let kq_odd = TurboQuantizer::new(QuantFormat::Fp8, d_odd, RotationKind::None, 11, &Device::Cpu).unwrap();
+        let vq_odd = TurboQuantizer::new(QuantFormat::Fp8, d_odd, RotationKind::None, 12, &Device::Cpu).unwrap();
+        let k_odd = rand(&[b, hkv, lk, d_odd], 101);
+        let v_odd = rand(&[b, hkv, lk, d_odd], 102);
+        let q_odd = rand(&[b, hq, 3, d_odd], 103);
+        let kr_odd = kq_odd.quantize_rows(&k_odd.reshape((b * hkv * lk, d_odd)).unwrap()).unwrap().reshape((b, hkv, lk, kq_odd.row_words())).unwrap();
+        let vr_odd = vq_odd.quantize_rows(&v_odd.reshape((b * hkv * lk, d_odd)).unwrap()).unwrap().reshape((b, hkv, lk, vq_odd.row_words())).unwrap();
+        let cfg_fused = FlashAttnConfig::new(1.0 / (d_odd as f32).sqrt()).causal().fused(true);
+        let cfg_ref = FlashAttnConfig::new(1.0 / (d_odd as f32).sqrt()).causal().fused(false);
+        let out_f = attention_packed(&q_odd, &kr_odd, &vr_odd, lk, &kq_odd, &vq_odd, &cfg_fused).unwrap();
+        let out_r = attention_packed(&q_odd, &kr_odd, &vr_odd, lk, &kq_odd, &vq_odd, &cfg_ref).unwrap();
+        let err = rel_err(&out_f, &out_r);
+        assert!(err <= 1e-5, "odd-dim d=6 FP8 fused vs unfused rel_err={err}");
+
+        // 2) Full format matrix: Fp8 / Nvfp4 / Mxfp4 / Mxfp8 / TurboMse / TurboProd x lq {1, 5}
+        let d = 64usize;
+        let k = rand(&[1, 2, 33, d], 201);
+        let v = rand(&[1, 2, 33, d], 202);
+        for (kf, vf) in [
+            (QuantFormat::Fp8, QuantFormat::Fp8),
+            (QuantFormat::Nvfp4, QuantFormat::Nvfp4),
+            (QuantFormat::Nvfp4, QuantFormat::Fp8),
+            (QuantFormat::Mxfp4, QuantFormat::Mxfp8),
+            (QuantFormat::TurboMse { bits: 4 }, QuantFormat::TurboMse { bits: 4 }),
+            (QuantFormat::TurboProd { bits: 4 }, QuantFormat::TurboMse { bits: 4 }),
+        ] {
+            let kq = TurboQuantizer::new(kf, d, RotationKind::Hadamard, 31, &Device::Cpu).unwrap();
+            let vq = TurboQuantizer::new(vf, d, RotationKind::Hadamard, 37, &Device::Cpu).unwrap();
+            let kr = kq.quantize_rows(&k.reshape((2 * 33, d)).unwrap()).unwrap().reshape((1, 2, 33, kq.row_words())).unwrap();
+            let vr = vq.quantize_rows(&v.reshape((2 * 33, d)).unwrap()).unwrap().reshape((1, 2, 33, vq.row_words())).unwrap();
+            for lq in [1usize, 5] {
+                let q = rand(&[1, 6, lq, d], 300 + lq as u64);
+                let base = FlashAttnConfig::new(1.0 / (d as f32).sqrt()).causal().window(Some(17), Some(0)).softcap(30.0);
+                let out_f = attention_packed(&q, &kr, &vr, 33, &kq, &vq, &base.clone().fused(true)).unwrap();
+                let out_r = attention_packed(&q, &kr, &vr, 33, &kq, &vq, &base.fused(false)).unwrap();
+                let e = rel_err(&out_f, &out_r);
+                assert!(e <= 1e-5, "CPU TQ fused vs unfused {kf}/{vf} lq={lq}: rel_err={e}");
+            }
         }
     }
 }

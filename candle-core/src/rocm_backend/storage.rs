@@ -309,6 +309,7 @@ impl RocmStorage {
     }
 
     fn fallback1(&self, f: impl FnOnce(&CpuStorage) -> Result<CpuStorage>) -> Result<Self> {
+        record_cpu_fallback();
         let cpu = self.to_cpu()?;
         let out = f(&cpu)?;
         self.upload_cpu(&out)
@@ -319,6 +320,7 @@ impl RocmStorage {
         rhs: &Self,
         f: impl FnOnce(&CpuStorage, &CpuStorage) -> Result<CpuStorage>,
     ) -> Result<Self> {
+        record_cpu_fallback();
         let a = self.to_cpu()?;
         let b = rhs.to_cpu()?;
         let out = f(&a, &b)?;
@@ -334,6 +336,7 @@ impl RocmStorage {
         rhs_l: &Layout,
         f: impl FnOnce(&CpuStorage, &Layout, &CpuStorage, &Layout) -> Result<CpuStorage>,
     ) -> Result<Self> {
+        record_cpu_fallback();
         let a = self.to_cpu()?;
         let b = rhs.to_cpu()?;
         if !matches!(self.dtype, DType::F16 | DType::BF16) {
@@ -356,6 +359,7 @@ impl RocmStorage {
         s3: &Self,
         f: impl FnOnce(&CpuStorage, &CpuStorage, &CpuStorage) -> Result<CpuStorage>,
     ) -> Result<Self> {
+        record_cpu_fallback();
         let a = self.to_cpu()?;
         let b = s2.to_cpu()?;
         let c = s3.to_cpu()?;
@@ -1792,6 +1796,7 @@ impl BackendStorage for RocmStorage {
             }
             return Ok(());
         }
+        record_cpu_fallback();
         let mut cpu = self.to_cpu()?;
         let ids_c = ids.to_cpu()?;
         let src_c = src.to_cpu()?;
@@ -1838,6 +1843,7 @@ impl BackendStorage for RocmStorage {
             }
             return Ok(());
         }
+        record_cpu_fallback();
         let mut cpu = self.to_cpu()?;
         let ids_c = ids.to_cpu()?;
         let src_c = src.to_cpu()?;
@@ -2136,15 +2142,32 @@ impl BackendStorage for RocmStorage {
                 .device
                 .launch(func, (grid_1d(n, block), 1, 1), (block, 1, 1), 0, &mut args);
         }
+        record_cpu_fallback();
         let mut cpu = self.to_cpu()?;
         cpu.const_set(s, l)?;
         self.overwrite_from_cpu(&cpu)
     }
 }
 
+static ROCM_CPU_FALLBACK_COUNT: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+#[inline]
+pub(crate) fn record_cpu_fallback() {
+    ROCM_CPU_FALLBACK_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Cumulative count of implicit CPU fallbacks executed by `RocmStorage` / ROCm custom ops.
+/// Tests can snapshot this counter before and after a GPU workload to assert zero CPU fallbacks
+/// (Gate 2-B, `P2-O07` / `P5-F13`).
+pub fn cpu_fallback_count() -> u64 {
+    ROCM_CPU_FALLBACK_COUNT.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 impl RocmStorage {
     /// Runs a cpu implementation of a custom op and moves the result back to this device.
     pub fn cpu_fallback_op(&self, out: CpuStorage) -> Result<Self> {
+        record_cpu_fallback();
         self.upload_cpu(&out)
     }
 
@@ -2154,6 +2177,7 @@ impl RocmStorage {
         layout: &Layout,
         f: impl FnOnce(&CpuStorage, &Layout) -> Result<(CpuStorage, Shape)>,
     ) -> Result<(Self, Shape)> {
+        record_cpu_fallback();
         let cpu = self.to_cpu()?;
         let (out, shape) = f(&cpu, layout)?;
         Ok((self.upload_cpu(&out)?, shape))

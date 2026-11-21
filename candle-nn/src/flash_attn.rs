@@ -701,11 +701,12 @@ pub(crate) fn cat_blocks(blocks: &[KvBlockRef<'_>], device: &Device) -> Result<(
 
 /// Attention of `q: (batch, q_heads, seq_q, head_dim)` over the dense K/V of paged cache
 /// blocks (any dtype the kernels read: the query dtype, FP8, or F16 / BF16 with F32 queries),
-/// without concatenating them: decoding (`seq_q <= 4`) on CUDA / ROCm runs a row kernel over a
-/// block table of up to 128 blocks. Longer queries, other devices, other layouts and more
-/// blocks concatenate the valid rows and run [`flash_attn_bhsd`] (same results up to the
-/// summation order). Masks, soft-capping and ALiBi of `cfg` are bottom-right aligned over the
-/// concatenated keys. Output `(batch, q_heads, seq_q, head_dim)` in the query dtype.
+/// without concatenating them: decoding (`seq_q <= 4`) on CUDA / ROCm runs the paged row kernel
+/// (`fa_rowp`) and longer queries (`seq_q > 4`) run the paged tile kernel (`fa2p` / `fa3p`) over a
+/// block table of up to 128 blocks. Other devices, unsupported layouts, and more than 128 blocks
+/// concatenate the valid rows and run [`flash_attn_bhsd`] (same results up to the summation
+/// order). Masks, soft-capping and ALiBi of `cfg` are bottom-right aligned over the concatenated
+/// keys. Output `(batch, q_heads, seq_q, head_dim)` in the query dtype.
 pub fn flash_attn_blocks(
     q: &Tensor,
     blocks: &[KvBlockRef<'_>],
@@ -731,7 +732,7 @@ pub fn flash_attn_blocks(
     flash_attn_bhsd(q, &k, &v, cfg)
 }
 
-/// The paged row kernel, `Ok(None)` when it does not apply.
+/// The paged row (`seq_q <= 4`) or paged tile (`seq_q > 4`) kernel, `Ok(None)` when it does not apply.
 #[cfg(any(feature = "cuda", feature = "rocm"))]
 fn paged_flash_attn(
     q: &Tensor,
@@ -867,8 +868,25 @@ pub fn flash_attn_fp8(q: &Tensor, k: &Tensor, v: &Tensor, cfg: &FlashAttnConfig)
     let d = q.dim(D::Minus1)?;
     let conf = accel::config();
     let (q, k) = if conf.flash_attn.hadamard && d.is_power_of_two() && d > 1 {
-        let pi = accel::turbo::rotation_matrix(d, accel::RotationKind::Hadamard, 0x4641_3346)?;
-        let pi_t = Tensor::from_vec(pi, (d, d), q.device())?.t()?;
+        use std::collections::HashMap;
+        use std::sync::{Mutex, OnceLock};
+        static PI_T_CACHE: OnceLock<Mutex<HashMap<(usize, candle::DeviceLocation), Tensor>>> =
+            OnceLock::new();
+        let cache = PI_T_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+        let key = (d, q.device().location());
+        let pi_t = {
+            let guard = cache.lock().unwrap_or_else(|p| p.into_inner());
+            guard.get(&key).cloned()
+        };
+        let pi_t = match pi_t {
+            Some(t) => t,
+            None => {
+                let pi = accel::turbo::rotation_matrix(d, accel::RotationKind::Hadamard, 0x4641_3346)?;
+                let t = Tensor::from_vec(pi, (d, d), q.device())?.t()?.contiguous()?;
+                cache.lock().unwrap_or_else(|p| p.into_inner()).insert(key, t.clone());
+                t
+            }
+        };
         let rot = |x: &Tensor| -> Result<Tensor> {
             x.to_dtype(DType::F32)?
                 .broadcast_matmul(&pi_t)?
@@ -878,14 +896,19 @@ pub fn flash_attn_fp8(q: &Tensor, k: &Tensor, v: &Tensor, cfg: &FlashAttnConfig)
     } else {
         (q.clone(), k.clone())
     };
-    let quant = |x: &Tensor| -> Result<(Tensor, f32)> {
-        let x32 = x.to_dtype(DType::F32)?;
-        let amax = x32.abs()?.max_all()?.to_scalar::<f32>()?;
-        let scale = if amax > 0.0 { amax / 448.0 } else { 1.0 };
-        Ok(((x32 / scale as f64)?.to_dtype(DType::F8E4M3)?, scale))
-    };
-    let (k8, ks) = quant(&k)?;
-    let (v8, vs) = quant(v)?;
+    // Compute K and V amax in native dtype and transfer both in a single D2H sync (`Q1-F05` / `Q1-O05`).
+    let amax_kv = Tensor::stack(
+        &[
+            k.abs()?.max_all()?.to_dtype(DType::F32)?,
+            v.abs()?.max_all()?.to_dtype(DType::F32)?,
+        ],
+        0,
+    )?
+    .to_vec1::<f32>()?;
+    let ks = if amax_kv[0] > 0.0 { amax_kv[0] / 448.0 } else { 1.0 };
+    let vs = if amax_kv[1] > 0.0 { amax_kv[1] / 448.0 } else { 1.0 };
+    let k8 = (k.to_dtype(DType::F32)? / ks as f64)?.to_dtype(DType::F8E4M3)?;
+    let v8 = (v.to_dtype(DType::F32)? / vs as f64)?.to_dtype(DType::F8E4M3)?;
     let cfg = cfg.clone().descale(cfg.k_descale * ks, cfg.v_descale * vs);
     flash_attn_with_config(&q, &k8, &v8, &cfg)
 }

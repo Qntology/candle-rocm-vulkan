@@ -262,8 +262,8 @@ fn causal_decode_f32(
                     prefetch_read(k_data[k_base + k_seq_stride..].as_ptr());
                 }
 
-                let mut score = 0.0f32;
-                f32::vec_dot(q_row.as_ptr(), k_row.as_ptr(), &mut score, q_row.len());
+                let mut score =
+                    <f32 as VecOps>::vec_dot_f32(q_row.as_ptr(), k_row.as_ptr(), q_row.len());
                 score *= scale_pre;
 
                 if do_softcap {
@@ -279,9 +279,7 @@ fn causal_decode_f32(
                 }
 
                 online_softmax_step(score, &mut m, &mut ssum, acc, |acc, w| {
-                    for t in 0..d {
-                        acc[t] += v_row[t] * w;
-                    }
+                    <f32 as VecOps>::vec_fmadd_to_f32(acc, v_row, w);
                 });
             }
 
@@ -353,9 +351,9 @@ fn causal_decode_f32_lean(
                     prefetch_read(k_data[k_base + k_seq_stride..].as_ptr());
                 }
 
-                let mut score = 0.0f32;
-                f32::vec_dot(q_row.as_ptr(), k_row.as_ptr(), &mut score, q_row.len());
-                score *= scale;
+                let score =
+                    <f32 as VecOps>::vec_dot_f32(q_row.as_ptr(), k_row.as_ptr(), q_row.len())
+                        * scale;
 
                 let v_base = kv_pos * v_seq_stride + v_head_off;
                 let v_row = &v_data[v_base..v_base + d];
@@ -365,9 +363,7 @@ fn causal_decode_f32_lean(
                 }
 
                 online_softmax_step(score, &mut m, &mut ssum, acc, |acc, w| {
-                    for t in 0..d {
-                        acc[t] += v_row[t] * w;
-                    }
+                    <f32 as VecOps>::vec_fmadd_to_f32(acc, v_row, w);
                 });
             }
 
@@ -440,14 +436,12 @@ pub fn causal_decode_f32_interleaved(
                     prefetch_read(kv_data[kv_base + kv_seq_stride..].as_ptr());
                 }
 
-                let mut score = 0.0f32;
-                f32::vec_dot(q_row.as_ptr(), k_row.as_ptr(), &mut score, q_row.len());
-                score *= scale;
+                let score =
+                    <f32 as VecOps>::vec_dot_f32(q_row.as_ptr(), k_row.as_ptr(), q_row.len())
+                        * scale;
 
                 online_softmax_step(score, &mut m, &mut ssum, acc, |acc, w| {
-                    for t in 0..d {
-                        acc[t] += v_row[t] * w;
-                    }
+                    <f32 as VecOps>::vec_fmadd_to_f32(acc, v_row, w);
                 });
             }
 
@@ -521,12 +515,10 @@ fn causal_decode_f32_interleaved_gqa2(
                     prefetch_read(kv_data[kv_base + kv_seq_stride..].as_ptr());
                 }
 
-                let mut sc0 = 0.0f32;
-                let mut sc1 = 0.0f32;
-                f32::vec_dot(q0.as_ptr(), k_row.as_ptr(), &mut sc0, q0.len());
-                f32::vec_dot(q1.as_ptr(), k_row.as_ptr(), &mut sc1, q1.len());
-                sc0 *= scale;
-                sc1 *= scale;
+                let sc0 =
+                    <f32 as VecOps>::vec_dot_f32(q0.as_ptr(), k_row.as_ptr(), q0.len()) * scale;
+                let sc1 =
+                    <f32 as VecOps>::vec_dot_f32(q1.as_ptr(), k_row.as_ptr(), q1.len()) * scale;
 
                 if sc0 > m0 {
                     let so = f32::exp(m0 - sc0);
@@ -667,8 +659,8 @@ fn causal_prefill_f32(
                     prefetch_read(k_data[k_base + k_seq_stride..].as_ptr());
                 }
 
-                let mut score = 0.0f32;
-                f32::vec_dot(q_row.as_ptr(), k_row.as_ptr(), &mut score, q_row.len());
+                let mut score =
+                    <f32 as VecOps>::vec_dot_f32(q_row.as_ptr(), k_row.as_ptr(), q_row.len());
                 score *= scale_pre;
 
                 if do_softcap {
@@ -684,9 +676,7 @@ fn causal_prefill_f32(
                 }
 
                 online_softmax_step(score, &mut m, &mut ssum, acc, |acc, w| {
-                    for t in 0..d {
-                        acc[t] += v_row[t] * w;
-                    }
+                    <f32 as VecOps>::vec_fmadd_to_f32(acc, v_row, w);
                 });
             }
 
@@ -769,9 +759,9 @@ fn causal_prefill_f32_lean(
                     prefetch_read(k_data[k_base + k_seq_stride..].as_ptr());
                 }
 
-                let mut score = 0.0f32;
-                f32::vec_dot(q_row.as_ptr(), k_row.as_ptr(), &mut score, q_row.len());
-                score *= scale;
+                let score =
+                    <f32 as VecOps>::vec_dot_f32(q_row.as_ptr(), k_row.as_ptr(), q_row.len())
+                        * scale;
 
                 let v_base = kv_pos * v_seq_stride + v_head_off;
                 let v_row = &v_data[v_base..v_base + d];
@@ -781,9 +771,7 @@ fn causal_prefill_f32_lean(
                 }
 
                 online_softmax_step(score, &mut m, &mut ssum, acc, |acc, w| {
-                    for t in 0..d {
-                        acc[t] += v_row[t] * w;
-                    }
+                    <f32 as VecOps>::vec_fmadd_to_f32(acc, v_row, w);
                 });
             }
 
@@ -827,8 +815,9 @@ fn causal_decode_generic<T: WithDType + num_traits::Float>(
     let mut out = vec![0f32; h_q * d];
 
     // GQA-grouped path: load each K/V row once per KV head and reuse across all `rk` query heads
-    // (cuts KV memory bandwidth by `rk` = 2x..8x for F16/BF16 decode).
-    if h_kv == h_v && rk > 1 && max_bias == 0.0 {
+    // (cuts KV memory bandwidth by `rk` = 2x..8x for F16/BF16 decode) when `h_kv` is large enough
+    // to saturate the rayon thread pool (`Q6-F03` / `Q6-O04`).
+    if h_kv == h_v && rk > 1 && max_bias == 0.0 && h_kv >= rayon::current_num_threads() {
         out.par_chunks_mut(rk * d).enumerate().for_each(|(hk, grp_out)| {
             let mut accs = vec![0f32; rk * d];
             let mut ms = vec![f32::NEG_INFINITY; rk];
@@ -993,4 +982,50 @@ fn causal_prefill_generic<T: WithDType>(
         );
 
     Tensor::from_vec(out, (h_q, s_q, d), &Device::Cpu)
+}
+
+#[cfg(test)]
+mod f8_regression_tests {
+    use super::*;
+    use candle::DType;
+
+    /// Regression test for `P0-4` / `Q6-F01`: `F8E4M3` causal CPU flash attention (B=1) must
+    /// produce finite non-zero outputs matching an F32-cast reference (never silent zeros).
+    #[test]
+    fn f8e4m3_causal_flash_attn_matches_f32_reference() -> Result<()> {
+        let dev = Device::Cpu;
+        let (b, s_q, s_k, h_q, h_kv, d) = (1usize, 1, 8, 4, 2, 16);
+        let q_vals: Vec<f32> = (0..b * s_q * h_q * d)
+            .map(|i| (((i * 7 + 3) % 19) as f32 - 9.0) * 0.125)
+            .collect();
+        let k_vals: Vec<f32> = (0..b * s_k * h_kv * d)
+            .map(|i| (((i * 11 + 5) % 23) as f32 - 11.0) * 0.125)
+            .collect();
+        let v_vals: Vec<f32> = (0..b * s_k * h_kv * d)
+            .map(|i| (((i * 13 + 1) % 17) as f32 - 8.0) * 0.25)
+            .collect();
+        let q_f8 = Tensor::from_vec(q_vals, (b, s_q, h_q, d), &dev)?.to_dtype(DType::F8E4M3)?;
+        let k_f8 = Tensor::from_vec(k_vals, (b, s_k, h_kv, d), &dev)?.to_dtype(DType::F8E4M3)?;
+        let v_f8 = Tensor::from_vec(v_vals, (b, s_k, h_kv, d), &dev)?.to_dtype(DType::F8E4M3)?;
+
+        let scale = 1.0 / (d as f32).sqrt();
+        let mask = crate::attention::cpu_flash::AttnMask::Causal { kv_offset: s_k - s_q };
+        let out_f8 = crate::attention::cpu_flash::flash_attn::<candle::F8E4M3>(
+            &q_f8, &k_f8, &v_f8, scale, mask.clone(), None, None,
+        )?;
+        let out_f32 = crate::attention::cpu_flash::flash_attn::<f32>(
+            &q_f8.to_dtype(DType::F32)?,
+            &k_f8.to_dtype(DType::F32)?,
+            &v_f8.to_dtype(DType::F32)?,
+            scale,
+            mask,
+            None,
+            None,
+        )?;
+        let norm = out_f8.sqr()?.sum_all()?.to_scalar::<f32>()?;
+        assert!(norm > 1e-3, "F8E4M3 causal attention output unexpectedly zero: {norm}");
+        let diff = (&out_f8 - &out_f32)?.abs()?.max_all()?.to_scalar::<f32>()?;
+        assert!(diff < 1e-4, "F8E4M3 causal attention diff vs F32 reference: {diff}");
+        Ok(())
+    }
 }

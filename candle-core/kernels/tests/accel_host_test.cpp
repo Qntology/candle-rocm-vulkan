@@ -3,6 +3,7 @@
 // Driven by candle-core/tests/accel_kernels_host.rs: `accel_host_test <in> <out>` reads named
 // arrays from <in>, runs the operation named by the `op` array and writes the result arrays
 // to <out>. File format: repeated [u32 name_len][name][u8 kind][u64 bytes][bytes].
+#define _CRT_SECURE_NO_WARNINGS
 #define CANDLE_ACCEL_HOST 1
 #include "../flash_attn_impl.h"
 #include "../turbo_quant_impl.h"
@@ -134,13 +135,24 @@ static void run_tile(const Arrays &in, const TQ *q, const TKV *k, const TKV *v, 
                      const float *fp, const int *ip, ax_u32 varlen, ax_u32 alibi_bs, unsigned gx) {
     const ax_u32 B = dims[0], Lq = dims[1], Lk = dims[2], Hq = dims[3], Hkv = dims[4], D = dims[5];
     const size_t smem = ((BR + BC) * (D + 1) + BR * BC) * 4;
-    candle_emu::launch(gx, Hq, B, FA_NT, smem, [&] {
-        fa_tile_impl<TQ, TKV, BR, BC, DMAX>(q, k, v, o, nullptr, nullptr, alibi, cu_q, cu_k, Lq, Lk, Hq,
-                                            Hkv, D, st[0], st[1], st[2], st[3], st[4], st[5], st[6],
-                                            st[7], st[8], fp[0], fp[1], ip[0], ip[1], fp[2], fp[3], 1,
-                                            alibi_bs, varlen, 0);
-    });
-    (void)in;
+    if (opt(in, "pg_rows")) {
+        const ax_pages pg =
+            make_pages(in, reinterpret_cast<ax_u64>(k), reinterpret_cast<ax_u64>(v), sizeof(TKV));
+        candle_emu::launch(gx, Hq, B, FA_NT, smem, [&] {
+            fa_tilep_impl<TQ, TKV, BR, BC, DMAX>(q, nullptr, nullptr, o, nullptr, nullptr, alibi,
+                                                 nullptr, nullptr, Lq, Lk, Hq, Hkv, D, st[0], st[1],
+                                                 st[2], st[3], st[4], st[5], st[6], st[7], st[8],
+                                                 fp[0], fp[1], ip[0], ip[1], fp[2], fp[3], 1,
+                                                 alibi_bs, 0, 0, pg);
+        });
+    } else {
+        candle_emu::launch(gx, Hq, B, FA_NT, smem, [&] {
+            fa_tile_impl<TQ, TKV, BR, BC, DMAX>(q, k, v, o, nullptr, nullptr, alibi, cu_q, cu_k, Lq,
+                                                Lk, Hq, Hkv, D, st[0], st[1], st[2], st[3], st[4],
+                                                st[5], st[6], st[7], st[8], fp[0], fp[1], ip[0],
+                                                ip[1], fp[2], fp[3], 1, alibi_bs, varlen, 0);
+        });
+    }
 }
 
 template <typename TQ, typename TKV> static Arrays op_fa(const Arrays &in) {
@@ -458,6 +470,41 @@ static Arrays op_decoders(const Arrays &) {
     return res;
 }
 
+// p: rows D forward gx
+static Arrays op_tq_fwht(const Arrays &in) {
+    const ax_u32 *p = need(in, "params").as<ax_u32>();
+    const ax_u64 rows = p[0];
+    const ax_u32 D = p[1], forward = p[2], gx = p[3];
+    const float *x = need(in, "x").as<float>();
+    const ax_u32 *signs = need(in, "signs").as<ax_u32>();
+    std::vector<float> y(rows * D);
+    const float inv_sqrt_d = 1.0f / sqrtf((float)D);
+    candle_emu::launch(gx, 1, 1, TQ_NT, D * 4, [&] {
+        tq_fwht_impl<float>(x, y.data(), signs, rows, D, D, inv_sqrt_d, forward);
+    });
+    Arrays res;
+    res["y"] = make_arr(y, 0);
+    return res;
+}
+
+// p: rows D cb code_words aux_words row_words gx
+static Arrays op_tq_quant_prod_fused(const Arrays &in) {
+    const ax_u32 *p = need(in, "params").as<ax_u32>();
+    const ax_u64 rows = p[0];
+    const ax_u32 D = p[1], cb = p[2], cw = p[3], rw = p[5], gx = p[6];
+    const float *x = need(in, "x").as<float>();
+    const float *tab = need(in, "tab").as<float>();
+    const float *st = need(in, "st").as<float>();
+    std::vector<ax_u32> out(rows * rw, 0xdeadbeefu);
+    const size_t smem = (2 * D + TQ_NT) * 4;
+    candle_emu::launch(gx, 1, 1, TQ_NT, smem, [&] {
+        tq_quant_prod_fused_impl<float>(x, tab, st, out.data(), rows, D, D, cb, cw, rw);
+    });
+    Arrays res;
+    res["out"] = make_arr(out, 1);
+    return res;
+}
+
 int main(int argc, char **argv) {
     if (argc != 3) {
         fprintf(stderr, "usage: %s <in> <out>\n", argv[0]);
@@ -473,6 +520,8 @@ int main(int argc, char **argv) {
         else if (op == "tq_signs") out = op_tq_signs(in);
         else if (op == "tq_dequant") out = op_tq_dequant(in);
         else if (op == "tq_attn") out = op_tq_attn(in);
+        else if (op == "tq_fwht") out = op_tq_fwht(in);
+        else if (op == "tq_quant_prod_fused") out = op_tq_quant_prod_fused(in);
         else if (op == "combine") out = op_combine(in);
         else if (op == "decoders") out = op_decoders(in);
         else throw std::runtime_error("unknown op " + op);

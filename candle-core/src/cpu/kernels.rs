@@ -21,18 +21,10 @@ pub trait VecOps: num_traits::NumAssign + Copy {
     ///
     /// # Safety
     /// The length of `lhs` and `rhs` must be at least `len`.
-    #[inline(always)]
-    unsafe fn vec_dot_f32(lhs: *const Self, rhs: *const Self, len: usize) -> f32 {
-        let mut res = Self::zero();
-        Self::vec_dot(lhs, rhs, &mut res, len);
-        // Scalar fallback for integer/non-float types; overridden for f32/f16/bf16/f64.
-        let _ = res;
-        0.0
-    }
+    unsafe fn vec_dot_f32(lhs: *const Self, rhs: *const Self, len: usize) -> f32;
 
     /// Fused multiply-add of a `Self` vector into an `f32` accumulator: `acc[i] += v[i] * w`.
-    #[inline(always)]
-    fn vec_fmadd_to_f32(_acc: &mut [f32], _v: &[Self], _w: f32) {}
+    fn vec_fmadd_to_f32(acc: &mut [f32], v: &[Self], w: f32);
 
     /// Dot-product of two vectors.
     ///
@@ -251,60 +243,53 @@ impl VecOps for half::bf16 {
         super::vec_fmadd_bf16_to_f32_simd(acc, v, w)
     }
 }
-impl VecOps for u8 {
-    #[inline(always)]
-    fn min(self, other: Self) -> Self {
-        <Self as Ord>::min(self, other)
-    }
+macro_rules! impl_int_vec_ops {
+    ($ty:ty) => {
+        impl VecOps for $ty {
+            #[inline(always)]
+            fn min(self, other: Self) -> Self {
+                <Self as Ord>::min(self, other)
+            }
 
-    #[inline(always)]
-    fn max(self, other: Self) -> Self {
-        <Self as Ord>::max(self, other)
-    }
+            #[inline(always)]
+            fn max(self, other: Self) -> Self {
+                <Self as Ord>::max(self, other)
+            }
+
+            #[inline(always)]
+            unsafe fn vec_dot_f32(lhs: *const Self, rhs: *const Self, len: usize) -> f32 {
+                let mut sum = 0.0f64;
+                for i in 0..len {
+                    sum += (*lhs.add(i) as f64) * (*rhs.add(i) as f64);
+                }
+                sum as f32
+            }
+
+            #[inline(always)]
+            fn vec_fmadd_to_f32(acc: &mut [f32], v: &[Self], w: f32) {
+                for (a, &x) in acc.iter_mut().zip(v.iter()) {
+                    *a += (x as f32) * w;
+                }
+            }
+        }
+    };
 }
-impl VecOps for u32 {
-    #[inline(always)]
-    fn min(self, other: Self) -> Self {
-        <Self as Ord>::min(self, other)
-    }
 
-    #[inline(always)]
-    fn max(self, other: Self) -> Self {
-        <Self as Ord>::max(self, other)
-    }
-}
-impl VecOps for i16 {
-    #[inline(always)]
-    fn min(self, other: Self) -> Self {
-        <Self as Ord>::min(self, other)
-    }
+impl_int_vec_ops!(u8);
+impl_int_vec_ops!(u32);
+impl_int_vec_ops!(i16);
+impl_int_vec_ops!(i32);
+impl_int_vec_ops!(i64);
 
-    #[inline(always)]
-    fn max(self, other: Self) -> Self {
-        <Self as Ord>::max(self, other)
-    }
-}
-impl VecOps for i32 {
-    #[inline(always)]
-    fn min(self, other: Self) -> Self {
-        <Self as Ord>::min(self, other)
-    }
-
-    #[inline(always)]
-    fn max(self, other: Self) -> Self {
-        <Self as Ord>::max(self, other)
-    }
-}
-impl VecOps for i64 {
-    #[inline(always)]
-    fn min(self, other: Self) -> Self {
-        <Self as Ord>::min(self, other)
-    }
-
-    #[inline(always)]
-    fn max(self, other: Self) -> Self {
-        <Self as Ord>::max(self, other)
-    }
+fn f8e4m3_to_f32_lut() -> &'static [f32; 256] {
+    static LUT: std::sync::OnceLock<[f32; 256]> = std::sync::OnceLock::new();
+    LUT.get_or_init(|| {
+        let mut t = [0.0f32; 256];
+        for i in 0..256 {
+            t[i] = float8::F8E4M3::from_bits(i as u8).to_f32();
+        }
+        t
+    })
 }
 
 impl VecOps for float8::F8E4M3 {
@@ -316,6 +301,26 @@ impl VecOps for float8::F8E4M3 {
     #[inline(always)]
     fn max(self, other: Self) -> Self {
         Self::max(self, other)
+    }
+
+    #[inline(always)]
+    unsafe fn vec_dot_f32(lhs: *const Self, rhs: *const Self, len: usize) -> f32 {
+        let lut = f8e4m3_to_f32_lut();
+        let mut sum = 0.0f32;
+        for i in 0..len {
+            let a = lut[(*lhs.add(i)).to_bits() as usize];
+            let b = lut[(*rhs.add(i)).to_bits() as usize];
+            sum += a * b;
+        }
+        sum
+    }
+
+    #[inline(always)]
+    fn vec_fmadd_to_f32(acc: &mut [f32], v: &[Self], w: f32) {
+        let lut = f8e4m3_to_f32_lut();
+        for (a, &x) in acc.iter_mut().zip(v.iter()) {
+            *a += lut[x.to_bits() as usize] * w;
+        }
     }
 }
 

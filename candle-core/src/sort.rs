@@ -267,6 +267,7 @@ impl crate::CustomOp1 for ArgSort {
             DType::I32 => "i32",
             DType::I64 => "i64",
             _ => {
+                crate::rocm_backend::record_cpu_fallback();
                 let cpu = storage.to_cpu_storage()?;
                 let (out_cpu, shape) = self.cpu_fwd(&cpu, layout)?;
                 let out_rocm = storage.device().storage_from_cpu_storage(&out_cpu)?;
@@ -306,18 +307,29 @@ impl crate::CustomOp1 for ArgSort {
         } else {
             let pad_total = nrows * ncols_pad;
             let buf = dev.alloc(pad_total * 4)?;
-            let init_fn = dev.get_func(Module::Sort, "asort_init_pad")?;
-            let mut ia = LaunchArgs::new();
-            ia.ptr(buf.as_ptr()).usize(nrows).u32(ncols_pad as u32);
-            dev.launch(init_fn, (grid_1d(pad_total, 256), 1, 1), (256, 1, 1), 0, &mut ia)?;
+            let total_tiles = (nrows * (ncols_pad / 2048)).min(65535) as u32;
 
+            // Phase 1: Fused LDS initialization + k = 2..2048 (replaces init + 66 global launches).
+            let tile_init_fn = dev.get_func(Module::Sort, &format!("asort_tile_init_{dir}_{sfx}"))?;
+            let mut tia = LaunchArgs::new();
+            tia.ptr(src_ptr)
+                .ptr(buf.as_ptr())
+                .usize(nrows)
+                .u32(ncols as u32)
+                .u32(ncols_pad as u32);
+            dev.launch(tile_init_fn, (total_tiles, 1, 1), (256, 1, 1), 0, &mut tia)?;
+
+            // Phase 2: For each k >= 4096, run global steps for j >= 2048, then fuse j = 1024..1
+            // into a single LDS tile merge (writing directly to `dst` on the final k == ncols_pad).
             let step_fn = dev.get_func(Module::Sort, &format!("asort_step_{dir}_{sfx}"))?;
+            let tile_merge_fn =
+                dev.get_func(Module::Sort, &format!("asort_tile_merge_{dir}_{sfx}"))?;
             let pairs = nrows * (ncols_pad / 2);
             let grid_step = grid_1d(pairs, 256);
-            let mut k = 2usize;
+            let mut k = 4096usize;
             while k <= ncols_pad {
                 let mut j = k >> 1;
-                while j > 0 {
+                while j >= 2048 {
                     let mut sa = LaunchArgs::new();
                     sa.ptr(src_ptr)
                         .ptr(buf.as_ptr())
@@ -329,16 +341,22 @@ impl crate::CustomOp1 for ArgSort {
                     dev.launch(step_fn, (grid_step, 1, 1), (256, 1, 1), 0, &mut sa)?;
                     j >>= 1;
                 }
+                let final_dst: *const u8 = if k == ncols_pad {
+                    dst.as_ptr()
+                } else {
+                    std::ptr::null()
+                };
+                let mut tma = LaunchArgs::new();
+                tma.ptr(src_ptr)
+                    .ptr(buf.as_ptr())
+                    .ptr(final_dst)
+                    .usize(nrows)
+                    .u32(ncols as u32)
+                    .u32(ncols_pad as u32)
+                    .u32(k as u32);
+                dev.launch(tile_merge_fn, (total_tiles, 1, 1), (256, 1, 1), 0, &mut tma)?;
                 k <<= 1;
             }
-            let copy_fn = dev.get_func(Module::Sort, "asort_copy_out")?;
-            let mut ca = LaunchArgs::new();
-            ca.ptr(buf.as_ptr())
-                .ptr(dst.as_ptr())
-                .usize(nrows)
-                .u32(ncols as u32)
-                .u32(ncols_pad as u32);
-            dev.launch(copy_fn, (grid_1d(el, 256), 1, 1), (256, 1, 1), 0, &mut ca)?;
         }
         Ok((
             crate::RocmStorage::new(dst, DType::U32, dev.clone()),

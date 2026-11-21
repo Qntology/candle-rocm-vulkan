@@ -648,20 +648,14 @@ impl ScatteredCacheBuilder {
     }
 }
 
-/// KV-Cache using concatenation for append operations
+/// KV-Cache backed by a geometrically growing reserved buffer updated in-place via `slice_set`.
 ///
-/// This implementation uses `Tensor::cat` instead of `slice_set` for updates,
-/// providing significant GPU performance improvements for autoregressive generation.
+/// Appends copy only the new tokens (`O(seq_new)`) and return zero-copy `narrow` views over the
+/// valid prefix `[0, current_seq_len)`. For `[B, S, H, D]` (`dim = 1`, `B = 1`), the returned
+/// views are contiguous; for `[B, H, S, D]` (`dim = 2`, `B*H > 1`), views are strided.
 ///
-/// # When to Use
-///
-/// **Recommended for:**
-/// - GPU inference (CUDA, Metal)
-/// - Autoregressive generation (token-by-token decoding)
-///
-/// **Use `KvCache` instead for:**
-/// - CPU-only inference
-/// - When you need fixed memory allocation upfront
+/// Cloning deep-copies the valid prefix `[0, current_seq_len)` into an independent backing buffer
+/// so forked caches (prefix sharing, beam search, speculative decoding) never overwrite each other.
 ///
 /// # Example
 ///
@@ -680,7 +674,7 @@ impl ScatteredCacheBuilder {
 /// let v_new = Tensor::randn(0f32, 1., (1, 8, 1, 64), &device)?;
 /// let (k, v) = cache.append(&k_new, &v_new)?;
 /// ```
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct ConcatKvCache {
     k_buf: Option<Tensor>,
     v_buf: Option<Tensor>,
@@ -690,6 +684,49 @@ pub struct ConcatKvCache {
     current_seq_len: usize,
     capacity: usize,
     grow_by: usize,
+}
+
+impl Clone for ConcatKvCache {
+    fn clone(&self) -> Self {
+        let clone_buf = |buf: &Option<Tensor>, view: &Option<Tensor>| -> (Option<Tensor>, Option<Tensor>) {
+            let Some(b) = buf.as_ref() else {
+                return (None, None);
+            };
+            let new_buf = Tensor::zeros(b.dims(), b.dtype(), b.device())
+                .and_then(|nb| {
+                    let nb = nb.detach();
+                    if self.current_seq_len > 0 {
+                        if let Some(v) = view.as_ref() {
+                            nb.slice_set(&v.contiguous()?, self.dim, 0)?;
+                        }
+                    }
+                    Ok(nb)
+                })
+                .expect("ConcatKvCache::clone failed to deep-copy backing buffer");
+            let new_view = if self.current_seq_len > 0 {
+                Some(
+                    new_buf
+                        .narrow(self.dim, 0, self.current_seq_len)
+                        .expect("ConcatKvCache::clone narrow failed"),
+                )
+            } else {
+                None
+            };
+            (Some(new_buf), new_view)
+        };
+        let (k_buf, k) = clone_buf(&self.k_buf, &self.k);
+        let (v_buf, v) = clone_buf(&self.v_buf, &self.v);
+        Self {
+            k_buf,
+            v_buf,
+            k,
+            v,
+            dim: self.dim,
+            current_seq_len: self.current_seq_len,
+            capacity: self.capacity,
+            grow_by: self.grow_by,
+        }
+    }
 }
 
 impl ConcatKvCache {
@@ -1075,7 +1112,7 @@ mod tests {
 ///
 /// Input K and V have shape `(B, H_kv, S, D)` (standard attention format)
 /// and are transposed+interleaved on append.
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct InterleavedKvCache {
     kv_buf: Option<Tensor>,
     kv: Option<Tensor>,
@@ -1083,6 +1120,45 @@ pub struct InterleavedKvCache {
     current_seq_len: usize,
     capacity: usize,
     grow_by: usize,
+}
+
+impl Clone for InterleavedKvCache {
+    fn clone(&self) -> Self {
+        let (kv_buf, kv) = match self.kv_buf.as_ref() {
+            None => (None, None),
+            Some(b) => {
+                let new_buf = Tensor::zeros(b.dims(), b.dtype(), b.device())
+                    .and_then(|nb| {
+                        let nb = nb.detach();
+                        if self.current_seq_len > 0 {
+                            if let Some(v) = self.kv.as_ref() {
+                                nb.slice_set(&v.contiguous()?, 0, 0)?;
+                            }
+                        }
+                        Ok(nb)
+                    })
+                    .expect("InterleavedKvCache::clone failed to deep-copy backing buffer");
+                let new_view = if self.current_seq_len > 0 {
+                    Some(
+                        new_buf
+                            .narrow(0, 0, self.current_seq_len)
+                            .expect("InterleavedKvCache::clone narrow failed"),
+                    )
+                } else {
+                    None
+                };
+                (Some(new_buf), new_view)
+            }
+        };
+        Self {
+            kv_buf,
+            kv,
+            head_dim: self.head_dim,
+            current_seq_len: self.current_seq_len,
+            capacity: self.capacity,
+            grow_by: self.grow_by,
+        }
+    }
 }
 
 impl InterleavedKvCache {
@@ -1277,5 +1353,71 @@ pub fn rope_i_inplace(data: &mut [f32], cos: &[f32], sin: &[f32], num_heads: usi
             data[base + 2 * i] = a * cos[i] - b * sin[i];
             data[base + 2 * i + 1] = b * cos[i] + a * sin[i];
         }
+    }
+}
+
+#[cfg(test)]
+mod clone_tests {
+    use super::*;
+    use candle::{DType, Device};
+
+    /// Verifies `ConcatKvCache::clone` deep-copies the reserved backing buffer so forked
+    /// continuations (beam search / speculative decoding / prefix sharing) never overwrite each
+    /// other (`P0-3` / `Q5-F01`).
+    #[test]
+    fn concat_kv_cache_clone_is_independent() -> Result<()> {
+        let mut base = ConcatKvCache::with_capacity(2, 16);
+        let k0 = Tensor::ones((1, 2, 3, 4), DType::F32, &Device::Cpu)?;
+        let v0 = Tensor::ones((1, 2, 3, 4), DType::F32, &Device::Cpu)?;
+        let _ = base.append(&k0, &v0)?;
+
+        let mut branch_a = base.clone();
+        let mut branch_b = base.clone();
+
+        let ka = Tensor::full(2.0f32, (1, 2, 1, 4), &Device::Cpu)?;
+        let va = Tensor::full(3.0f32, (1, 2, 1, 4), &Device::Cpu)?;
+        let (out_ka, out_va) = branch_a.append(&ka, &va)?;
+        let snap_ka = out_ka.flatten_all()?.to_vec1::<f32>()?;
+        let snap_va = out_va.flatten_all()?.to_vec1::<f32>()?;
+
+        let kb = Tensor::full(7.0f32, (1, 2, 1, 4), &Device::Cpu)?;
+        let vb = Tensor::full(9.0f32, (1, 2, 1, 4), &Device::Cpu)?;
+        let (out_kb, out_vb) = branch_b.append(&kb, &vb)?;
+
+        // Branch A's previously returned views and cache contents must be unchanged!
+        assert_eq!(out_ka.flatten_all()?.to_vec1::<f32>()?, snap_ka);
+        assert_eq!(out_va.flatten_all()?.to_vec1::<f32>()?, snap_va);
+        assert_eq!(branch_a.k().unwrap().flatten_all()?.to_vec1::<f32>()?, snap_ka);
+        assert_eq!(branch_a.v().unwrap().flatten_all()?.to_vec1::<f32>()?, snap_va);
+        assert_ne!(out_kb.flatten_all()?.to_vec1::<f32>()?, snap_ka);
+        assert_ne!(out_vb.flatten_all()?.to_vec1::<f32>()?, snap_va);
+        assert_eq!(base.current_seq_len(), 3);
+        Ok(())
+    }
+
+    #[test]
+    fn interleaved_kv_cache_clone_is_independent() -> Result<()> {
+        let mut base = InterleavedKvCache::with_capacity(4, 16);
+        let k0 = Tensor::ones((1, 2, 2, 4), DType::F32, &Device::Cpu)?;
+        let v0 = Tensor::ones((1, 2, 2, 4), DType::F32, &Device::Cpu)?;
+        let _ = base.append(&k0, &v0)?;
+
+        let mut branch_a = base.clone();
+        let mut branch_b = base.clone();
+
+        let ka = Tensor::full(4.0f32, (1, 2, 1, 4), &Device::Cpu)?;
+        let va = Tensor::full(5.0f32, (1, 2, 1, 4), &Device::Cpu)?;
+        let view_a = branch_a.append(&ka, &va)?;
+        let snap_a = view_a.flatten_all()?.to_vec1::<f32>()?;
+
+        let kb = Tensor::full(8.0f32, (1, 2, 1, 4), &Device::Cpu)?;
+        let vb = Tensor::full(9.0f32, (1, 2, 1, 4), &Device::Cpu)?;
+        let view_b = branch_b.append(&kb, &vb)?;
+
+        assert_eq!(view_a.flatten_all()?.to_vec1::<f32>()?, snap_a);
+        assert_eq!(branch_a.kv().unwrap().flatten_all()?.to_vec1::<f32>()?, snap_a);
+        assert_ne!(view_b.flatten_all()?.to_vec1::<f32>()?, snap_a);
+        assert_eq!(base.current_seq_len(), 2);
+        Ok(())
     }
 }

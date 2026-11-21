@@ -74,32 +74,54 @@ impl CsGuardParams {
             bail!("CsGuardParams::from_quant_rest_weight: q_rest must have at least 1 row");
         }
         const CHUNK: usize = 4096;
+        // Backends without native row-range dequantization (Vulkan/Metal) would otherwise
+        // dequantize the full matrix on every chunk (2 * ceil(V/4096) times); dequantize once
+        // and slice chunks from it (`Q5-F02` / `Q5-O03`).
+        let supports_row_range = matches!(
+            q_rest.storage(),
+            crate::quantized::QStorage::Cuda(_)
+                | crate::quantized::QStorage::Rocm(_)
+                | crate::quantized::QStorage::Cpu(_)
+        );
+        let full_w = if supports_row_range {
+            None
+        } else {
+            Some(q_rest.dequantize_to(DType::F32, device)?)
+        };
+        let get_chunk = |r0: usize, rn: usize| -> Result<Tensor> {
+            match &full_w {
+                Some(w) => w.narrow(0, r0, rn),
+                None => q_rest.dequantize_rows_to(r0, rn, DType::F32, device),
+            }
+        };
         let mut sum = Tensor::zeros((k,), DType::F32, device)?;
         let mut r0 = 0usize;
         while r0 < v_rest {
             let rn = (v_rest - r0).min(CHUNK);
-            let w_chunk = q_rest.dequantize_rows_to(r0, rn, DType::F32, device)?;
+            let w_chunk = get_chunk(r0, rn)?;
             sum = (sum + w_chunk.sum(0)?)?;
             r0 += rn;
         }
         let mu_rest = (sum / (v_rest as f64))?.contiguous()?;
-        let mut max_norm = 0.0f32;
+        let mut max_chunks: Vec<Tensor> = Vec::with_capacity(v_rest.div_ceil(CHUNK));
         let mut r0 = 0usize;
         while r0 < v_rest {
             let rn = (v_rest - r0).min(CHUNK);
-            let w_chunk = q_rest.dequantize_rows_to(r0, rn, DType::F32, device)?;
+            let w_chunk = get_chunk(r0, rn)?;
             let c_max = w_chunk
                 .broadcast_sub(&mu_rest)?
                 .sqr()?
                 .sum(1)?
                 .sqrt()?
-                .max(0)?
-                .to_scalar::<f32>()?;
-            if c_max > max_norm {
-                max_norm = c_max;
-            }
+                .max(0)?;
+            max_chunks.push(c_max);
             r0 += rn;
         }
+        let max_norm = if max_chunks.len() == 1 {
+            max_chunks[0].to_scalar::<f32>()?
+        } else {
+            Tensor::stack(&max_chunks, 0)?.max(0)?.to_scalar::<f32>()?
+        };
         let b_rest_max = match b_rest {
             Some(b) => b.to_dtype(DType::F32)?.max(0)?.to_scalar::<f32>()?,
             None => 0.0,
@@ -121,6 +143,35 @@ pub struct ArgmaxCsOutput {
     pub max_vals: Option<Tensor>,
     /// Per-row REST rescue flag (`0` = guaranteed exact, `1` = must evaluate REST): `[M]`, `DType::U8`.
     pub rescue_mask: Option<Tensor>,
+}
+
+impl ArgmaxCsOutput {
+    /// Downloads `ids` and (when present) `rescue_mask` in a single D2H transfer by concatenating
+    /// `[ids, mask.to_dtype(U32)]` on-device before calling `to_vec1::<u32>()` (`P1-5` / `Q5-O02`).
+    /// Eliminates one host-device synchronization round-trip per decode token on the common
+    /// no-rescue fast path.
+    pub fn download_ids_and_mask(&self) -> Result<(Vec<u32>, Option<Vec<u8>>)> {
+        match self.rescue_mask.as_ref() {
+            None => Ok((self.ids.to_vec1::<u32>()?, None)),
+            Some(mask_t) => {
+                let m = self.ids.elem_count();
+                if m == 0 {
+                    return Ok((Vec::new(), Some(Vec::new())));
+                }
+                let packed = Tensor::cat(
+                    &[
+                        &self.ids.flatten_all()?,
+                        &mask_t.flatten_all()?.to_dtype(DType::U32)?,
+                    ],
+                    0,
+                )?
+                .to_vec1::<u32>()?;
+                let ids = packed[..m].to_vec();
+                let mask: Vec<u8> = packed[m..].iter().map(|&v| u8::from(v != 0)).collect();
+                Ok((ids, Some(mask)))
+            }
+        }
+    }
 }
 
 fn check_float_dtype(dt: DType, op: &str) -> Result<()> {
@@ -507,10 +558,10 @@ pub fn fused_quant_argmax_cs(
         };
         let bs = qr.dtype().block_size();
         if let Some(q_sfx) = q_sfx {
-            if m <= 8 && k.is_multiple_of(bs) && qweight.device().same_device(&dev) {
+            if k.is_multiple_of(bs) && qweight.device().same_device(&dev) {
                 let esz = dtype.size_in_bytes();
                 let x_c = if hidden.is_contiguous()
-                    && (hidden.layout().start_offset() * esz).is_multiple_of(32)
+                    && (hidden.layout().start_offset() * esz).is_multiple_of(16)
                 {
                     hidden.clone()
                 } else {
@@ -604,6 +655,111 @@ pub fn fused_quant_argmax_cs(
                     },
                 });
             }
+        }
+    }
+
+    #[cfg(feature = "cuda")]
+    if let (Device::Cuda(_), crate::quantized::QStorage::Cuda(qc)) = (&dev, qweight.storage()) {
+        if crate::quantized::w8a16::mv_supported(qc.dtype())
+            && k.is_multiple_of(qc.dtype().block_size())
+            && qweight.device().same_device(&dev)
+        {
+            let esz = dtype.size_in_bytes();
+            let x_c = if hidden.is_contiguous()
+                && (hidden.layout().start_offset() * esz).is_multiple_of(16)
+            {
+                hidden.clone()
+            } else {
+                hidden.force_contiguous()?
+            };
+            let bias_f32 = match bias {
+                Some(b) => {
+                    if b.dims() != [v_valid] {
+                        bail!("fused_quant_argmax_cs: bias shape {:?} != [{v_valid}]", b.dims());
+                    }
+                    Some(b.to_device(&dev)?.to_dtype(DType::F32)?.contiguous()?)
+                }
+                None => None,
+            };
+            let cids_u32 = match core_ids {
+                Some(c) => {
+                    if c.dims() != [v_valid] {
+                        bail!("fused_quant_argmax_cs: core_ids shape {:?} != [{v_valid}]", c.dims());
+                    }
+                    Some(c.to_device(&dev)?.to_dtype(DType::U32)?.contiguous()?)
+                }
+                None => None,
+            };
+            let (mu_f32, w_bound, b_max, check_cs) = match cs_guard {
+                Some(g) => {
+                    if g.mu_rest.dims() != [k] {
+                        bail!("fused_quant_argmax_cs: mu_rest shape {:?} != [{k}]", g.mu_rest.dims());
+                    }
+                    (
+                        Some(g.mu_rest.to_device(&dev)?.to_dtype(DType::F32)?.contiguous()?),
+                        g.w_rest_bound,
+                        g.b_rest_max,
+                        true,
+                    )
+                }
+                None => (None, 0.0f32, 0.0f32, false),
+            };
+
+            let (xs, xl) = x_c.storage_and_layout();
+            let Storage::Cuda(xc) = &*xs else {
+                unreachable!()
+            };
+            let bg = bias_f32.as_ref().map(|t| t.storage_and_layout());
+            let cg = cids_u32.as_ref().map(|t| t.storage_and_layout());
+            let mg = mu_f32.as_ref().map(|t| t.storage_and_layout());
+            let b_arg = bg.as_ref().map(|(s, l)| match &**s {
+                Storage::Cuda(c) => (c, l.start_offset()),
+                _ => unreachable!(),
+            });
+            let c_arg = cg.as_ref().map(|(s, l)| match &**s {
+                Storage::Cuda(c) => (c, l.start_offset()),
+                _ => unreachable!(),
+            });
+            let m_arg = mg.as_ref().map(|(s, l)| match &**s {
+                Storage::Cuda(c) => (c, l.start_offset()),
+                _ => unreachable!(),
+            });
+            let bs = qc.dtype().block_size();
+            let row_bytes = (k / bs) * qc.dtype().type_size();
+            let (id_s, val_s, res_s) = xc.fused_quant_argmax_cs(
+                xl.start_offset(),
+                qc.data_slice(),
+                qc.dtype(),
+                row_bytes,
+                b_arg,
+                c_arg,
+                m_arg,
+                w_bound,
+                b_max,
+                check_cs,
+                m,
+                v_valid,
+                k,
+            )?;
+            return Ok(ArgmaxCsOutput {
+                ids: from_storage(Storage::Cuda(id_s), (m,), BackpropOp::none(), false),
+                max_vals: Some(from_storage(
+                    Storage::Cuda(val_s),
+                    (m,),
+                    BackpropOp::none(),
+                    false,
+                )),
+                rescue_mask: if check_cs {
+                    Some(from_storage(
+                        Storage::Cuda(res_s),
+                        (m,),
+                        BackpropOp::none(),
+                        false,
+                    ))
+                } else {
+                    None
+                },
+            });
         }
     }
 

@@ -16,7 +16,8 @@ pub(crate) use device::{GemmCall, GemmOutcome};
 pub use device::{GemmBackend, RocmDevice, RocmRuntimeInfo};
 pub use hip_runtime;
 pub use hip_sys;
-pub use storage::{RocmStorage, RopeKind};
+pub(crate) use storage::record_cpu_fallback;
+pub use storage::{cpu_fallback_count, RocmStorage, RopeKind};
 
 #[derive(Debug, Clone)]
 pub enum RocmError {

@@ -505,11 +505,18 @@ fn e4m3_is_ocp_fn_software_decode() {
         );
     }
     assert!(cpu[0x7f].is_nan() && cpu[0xff].is_nan());
-    use accel::sources::{ACCEL_COMMON_H, FLASH_ATTN_IMPL_H, TURBO_QUANT_IMPL_H};
+    use accel::sources::{
+        ACCEL_COMMON_H, DECODER_OPS_IMPL_H, DELTA_RULE_IMPL_H, FLASH_ATTN_IMPL_H,
+        LM_HEAD_ARGMAX_IMPL_H, TURBO_QUANT_IMPL_H, W8A16_IMPL_H,
+    };
     for (name, src) in [
         ("accel_common.h", ACCEL_COMMON_H),
         ("flash_attn_impl.h", FLASH_ATTN_IMPL_H),
         ("turbo_quant_impl.h", TURBO_QUANT_IMPL_H),
+        ("w8a16_impl.h", W8A16_IMPL_H),
+        ("lm_head_argmax_impl.h", LM_HEAD_ARGMAX_IMPL_H),
+        ("decoder_ops_impl.h", DECODER_OPS_IMPL_H),
+        ("delta_rule_impl.h", DELTA_RULE_IMPL_H),
     ] {
         for bad in HW_FP8 {
             assert!(!src.contains(bad), "{name} uses the hardware FP8 conversion {bad}");
@@ -1459,24 +1466,35 @@ mod turbo {
     }
 
     /// Paged tile prefill (`lq = 16 > FA_DECODE_MAX_Q`, `fa2p`/`fa3p`) matches concatenated
-    /// attention without calling `cat_blocks`.
+    /// attention bit-for-bit across non-BC-multiple capacities (`cap = 48`), partial last page,
+    /// and sliding windows (`Q4-F03`).
     #[test]
     fn paged_tile_prefill_matches_concatenated() {
         let _s = serial();
         let dev = gpu();
         for d in [64usize, 128] {
-            let (hq, hkv, lq, lk) = (8usize, 2usize, 16usize, 192usize);
+            let (hq, hkv, lq) = (8usize, 2usize, 19usize);
             let scale = 1.0 / (d as f32).sqrt();
-            let host_blocks = make_blocks(3, 64, 64, hkv, d, 9100 + d as u64, DType::F16);
+            // Non-BC-multiple cap=48 with partial last page (total lk = 48 + 48 + 17 = 113)
+            let mut host_blocks = make_blocks(3, 48, 48, hkv, d, 9100 + d as u64, DType::F16);
+            host_blocks[2].2 = 17;
+            let lk: usize = host_blocks.iter().map(|b| b.2).sum();
             let (k_cat, v_cat) = cat_valid(&host_blocks, &dev);
             let blocks = upload_blocks(&host_blocks, &dev);
             let q = up(&randn(&[1, hq, lq, d], 9200 + d as u64).to_dtype(DType::F16).unwrap(), &dev);
-            let cfg = strict(scale);
-            let paged = flash_attn_blocks(&q, &refs(&blocks), &cfg).unwrap();
-            let dense = flash_attn_bhsd(&q, &k_cat, &v_cat, &cfg).unwrap();
-            let e = rel(&paged, &dense);
-            println!("paged tile prefill d={d} lq={lq} lk={lk}: max rel err {e:.3e}");
-            assert!(e <= 2e-3, "paged tile prefill d={d}: {e}");
+            for window in [None, Some(41usize)] {
+                let mut cfg = strict(scale);
+                if let Some(w) = window {
+                    cfg = cfg.window(Some(w), Some(0));
+                }
+                let paged = flash_attn_blocks(&q, &refs(&blocks), &cfg).unwrap();
+                let dense = flash_attn_bhsd(&q, &k_cat, &v_cat, &cfg).unwrap();
+                assert_bits_eq(
+                    &paged,
+                    &dense,
+                    &format!("paged tile prefill d={d} lq={lq} lk={lk} window={window:?}"),
+                );
+            }
         }
     }
 
@@ -1500,6 +1518,15 @@ mod turbo {
         set_fp8_fast(true);
         let fast = attention_packed(&q, &kr, &vr, lk, &kq, &vq, &cfg).unwrap();
         assert_bits_eq(&fast, &slow, "tq_attn NVFP4/FP8 fast path vs generic");
+
+        // Also test NVFP4 K + NVFP4 V fast path bit-exact vs generic (`Q3-F04`)
+        let vq_nv4 = TurboQuantizer::new(QuantFormat::Nvfp4, d, RotationKind::Hadamard, 23, &dev).unwrap();
+        let vr_nv4 = pack(&vq_nv4, &v);
+        set_fp8_fast(false);
+        let slow_nv4 = attention_packed(&q, &kr, &vr_nv4, lk, &kq, &vq_nv4, &cfg).unwrap();
+        set_fp8_fast(true);
+        let fast_nv4 = attention_packed(&q, &kr, &vr_nv4, lk, &kq, &vq_nv4, &cfg).unwrap();
+        assert_bits_eq(&fast_nv4, &slow_nv4, "tq_attn NVFP4/NVFP4 fast path vs generic");
 
         // Single-pass TurboProd QJL quantize matches CPU codec.
         let pq = TurboQuantizer::new(
@@ -1526,21 +1553,45 @@ mod turbo {
         println!("tq_quant_prod_fused GPU vs CPU dequant rel err: {prod_err:.3e}");
         assert!(prod_err <= 2e-2, "tq_quant_prod_fused err {prod_err}");
 
-        // OffloadedTurboKvEngine ping-pong staging on ROCm (exercising both direct & async DMA).
-        let slab = candle_nn::kv_offload::PinnedKvSlab::from_packed_tensors(&kr, &vr, &dev).unwrap();
+        // OffloadedTurboKvEngine ping-pong staging on ROCm: force pinned host buffers so the real
+        // asynchronous CopyStream DMA + compact_async (kv_len < max_kv_len) paths execute (`Q6-F06`).
+        let slab_async = candle_nn::kv_offload::PinnedKvSlab::from_packed_tensors_with_pinned(
+            &kr,
+            &vr,
+            &dev,
+            Some(true),
+        )
+        .unwrap();
+        assert!(slab_async.is_pinned(), "ROCm PinnedKvSlab should be page-locked");
+        let slab_sync = candle_nn::kv_offload::PinnedKvSlab::from_packed_tensors_with_pinned(
+            &kr,
+            &vr,
+            &dev,
+            Some(false),
+        )
+        .unwrap();
+        // Allocate staging capacity > lk to exercise both compact_async and direct cap > kv_len.
         let mut eng = candle_nn::kv_offload::OffloadedTurboKvEngine::new(
             &dev,
             1,
             hkv,
-            lk,
+            lk + 32,
             kq.row_words(),
             vq.row_words(),
         )
         .unwrap()
         .with_async_min_bytes(0);
-        eng.prefetch_slab(0, &slab).unwrap();
-        let off_out = eng.attend_slot(0, &q, &kq, &vq, &cfg).unwrap();
-        assert_bits_eq(&off_out, &fast, "OffloadedTurboKvEngine ROCm vs direct");
+        eng.prefetch_slab(0, &slab_async).unwrap();
+        assert!(
+            eng.slot_used_async_dma(0),
+            "OffloadedTurboKvEngine must execute async CopyStream DMA path on ROCm"
+        );
+        eng.prefetch_slab(1, &slab_sync).unwrap();
+        assert!(!eng.slot_used_async_dma(1));
+        let off_async = eng.attend_slot(0, &q, &kq, &vq, &cfg).unwrap();
+        let off_sync = eng.attend_slot(1, &q, &kq, &vq, &cfg).unwrap();
+        assert_bits_eq(&off_async, &fast, "OffloadedTurboKvEngine ROCm async DMA vs direct");
+        assert_bits_eq(&off_sync, &fast, "OffloadedTurboKvEngine ROCm sync staging vs direct");
 
         // GuardedQuantLmHead lossless 2-tier rescue on ROCm.
         let (v_core, v_rest, kdim) = (64usize, 64usize, 256usize);

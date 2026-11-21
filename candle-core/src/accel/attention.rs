@@ -495,21 +495,28 @@ pub fn split_count_grouped(
         SplitKv::Fixed(n) => n.clamp(1, FA_MAX_SPLITS),
         SplitKv::Auto => {
             let group = group.max(1);
+            let cu = compute_units.max(1);
             let workgroups = (rows / group).max(1);
-            let by_occupancy =
-                (SPLIT_WORKGROUPS_PER_CU * compute_units.max(1)).div_ceil(workgroups);
-            // High-SM GPUs (>= 64 CUs, e.g., Ada/Hopper/Blackwell/CDNA) would otherwise saturate
-            // FA_MAX_SPLITS on short contexts where launch_combine dominates; keep a 256-key
-            // floor per split there.
-            let keys = if compute_units >= 64 {
-                256
-            } else if group > 1 {
+            let by_occupancy = (SPLIT_WORKGROUPS_PER_CU * cu).div_ceil(workgroups);
+            let base_keys = if group > 1 {
                 FA_THREADS / 2
             } else {
                 FA_THREADS
             };
-            let by_keys = lk.div_ceil(keys).max(1);
-            by_occupancy.min(by_keys).clamp(1, FA_MAX_SPLITS)
+            let by_keys_base = lk.div_ceil(base_keys).max(1);
+            let raw = by_occupancy.min(by_keys_base);
+            // On high-SM GPUs (>= 64 CUs), apply a 256-key/group combine-amortization floor only
+            // when the base plan already exceeds 4 workgroups per CU, so small-batch decode never
+            // under-populates SMs.
+            let splits = if cu >= 64 && raw.saturating_mul(workgroups) > 4 * cu {
+                let min_splits_for_cu = cu.div_ceil(workgroups);
+                let floor_keys = (256usize / group).max(base_keys);
+                let by_keys_floor = lk.div_ceil(floor_keys).max(min_splits_for_cu);
+                raw.min(by_keys_floor)
+            } else {
+                raw
+            };
+            splits.clamp(1, FA_MAX_SPLITS)
         }
     }
 }
@@ -826,6 +833,11 @@ mod tests {
         assert_eq!(split_count_grouped(16, 4, 1024, SplitKv::Auto, 16), 16);
         assert_eq!(split_count_grouped(16, 4, 8192, SplitKv::Auto, 16), 64);
         assert_eq!(split_count_grouped(4096, 4, 2048, SplitKv::Auto, 16), 1);
+        // High-CU (>= 64) GPUs preserve occupancy for small-batch decode and only trim excessive
+        // splits when total workgroups already exceed 4 per CU.
+        assert_eq!(split_count_grouped(32, 4, 1024, SplitKv::Auto, 170), 16);
+        assert_eq!(split_count_grouped(32, 4, 4096, SplitKv::Auto, 128), 64);
+        assert_eq!(split_count_for(256, 1024, SplitKv::Auto, 128), 4);
         p.split_kv = SplitKv::Off;
         assert_eq!(plan(&dec, &p, 64 * 1024, 60), FaPlan::Row { splits: 1 });
     }

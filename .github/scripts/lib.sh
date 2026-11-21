@@ -21,6 +21,16 @@ run() {
   set -e
   echo "::endgroup::"
   local counts; counts="$(test_counts "$log")"
+  if [ "$rc" -eq 0 ] && grep -qE '^running 0 tests$' "$log" 2>/dev/null; then
+    # Guard against stale/mismatched test filters silently passing with 0 executed tests (P5-O01).
+    local passed_total; passed_total="$(awk '/^test result:/ { for (i = 2; i <= NF; i++) if ($i ~ /^passed/) p += $(i - 1) } END { print p + 0 }' "$log")"
+    if [ "$passed_total" -eq 0 ]; then
+      echo "| $label | FAIL (0 tests ran) | $label.log |" >> "$SUMMARY"
+      echo "::error title=$label::cargo test ran 0 tests (check test filter)"
+      FAILS=$((FAILS + 1))
+      return 0
+    fi
+  fi
   if [ "$rc" -eq 0 ]; then
     echo "| $label | PASS${counts:+ ($counts)} | $label.log |" >> "$SUMMARY"
   else

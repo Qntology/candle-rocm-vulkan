@@ -105,38 +105,63 @@ DEVFN void gemm_impl(const T *A, const T *B, T *C, const uint32_t transa, const 
     }
 }
 
-// Skinny-M / Skinny-N GEMM (min(m, n) <= 8 && k >= 256): one 256-thread workgroup per output
-// element C[i, j, b] reduces across K with coalesced reads instead of wasting 98% of a 64x64 tile.
+DEVFN float gemm_warp32_sum(float v) {
+#pragma unroll
+    for (int off = 16; off > 0; off >>= 1) v += __shfl_xor(v, off, 32);
+    return v;
+}
+
+DEVFN double gemm_warp32_sum(double v) {
+#pragma unroll
+    for (int off = 16; off > 0; off >>= 1) {
+        int lo = __double2loint(v);
+        int hi = __double2hiint(v);
+        lo = __shfl_xor(lo, off, 32);
+        hi = __shfl_xor(hi, off, 32);
+        v += __hiloint2double(hi, lo);
+    }
+    return v;
+}
+
+// Skinny-M / Skinny-N GEMM (min(m, n) <= 8 && k >= 256):
+// Wave-per-output design: 256 threads = 8 sub-warps of 32 lanes, zero LDS, zero barriers.
+// - When n <= 8 (standard decode X[M,K] @ W[N,K]^T in col-major -> C[N,M] has n=M<=8):
+//   each block covers 8 rows of m for one column j (grid = (ceil(m/8), n, batch)), so all 8
+//   sub-warps share b[:, j] in L1 and reduce across K via 32-lane __shfl_xor (portable across
+//   wave32 RDNA and wave64 CDNA).
+// - When n > 8 (m <= 8): each block covers 8 cols of n for one row i (grid = (m, ceil(n/8), batch)).
 template <typename T>
 DEVFN void gemm_skinny_impl(const T *A, const T *B, T *C, const uint32_t transa, const uint32_t transb,
                             const size_t m, const size_t n, const size_t k, const size_t lda, const size_t ldb,
                             const size_t ldc, const int64_t stride_a, const int64_t stride_b,
                             const int64_t stride_c, const size_t batch) {
     typedef typename Ty<T>::acc Acc;
-    __shared__ Acc red[256];
     const size_t tid = threadIdx.x;
+    const size_t lane = tid & 31u;
+    const size_t wid = tid >> 5; // 0..7 (8 outputs per 256-thread block)
+    const bool tile_m = (n <= 8);
+    const size_t m_tiles = tile_m ? ((m + 7) / 8) : m;
+    const size_t n_tiles = tile_m ? n : ((n + 7) / 8);
+
     for (size_t bz = blockIdx.z; bz < batch; bz += gridDim.z) {
         const T *a = A + (int64_t)bz * stride_a;
         const T *b = B + (int64_t)bz * stride_b;
         T *c = C + (int64_t)bz * stride_c;
-        for (size_t j = blockIdx.y; j < n; j += gridDim.y) {
-            for (size_t i = blockIdx.x; i < m; i += gridDim.x) {
+        for (size_t tj = blockIdx.y; tj < n_tiles; tj += gridDim.y) {
+            const size_t j = tile_m ? tj : (tj * 8 + wid);
+            for (size_t ti = blockIdx.x; ti < m_tiles; ti += gridDim.x) {
+                const size_t i = tile_m ? (ti * 8 + wid) : ti;
+                if (i >= m || j >= n) continue;
                 Acc acc = (Acc)0;
-                for (size_t p = tid; p < k; p += 256) {
+                for (size_t p = lane; p < k; p += 32) {
                     const Acc av = (Acc)Ty<T>::to(transa ? a[p + i * lda] : a[i + p * lda]);
                     const Acc bv = (Acc)Ty<T>::to(transb ? b[j + p * ldb] : b[p + j * ldb]);
                     acc += av * bv;
                 }
-                red[tid] = acc;
-                __syncthreads();
-                for (size_t s = 128; s > 0; s >>= 1) {
-                    if (tid < s) red[tid] += red[tid + s];
-                    __syncthreads();
+                acc = gemm_warp32_sum(acc);
+                if (lane == 0) {
+                    c[i + j * ldc] = Ty<T>::from(acc);
                 }
-                if (tid == 0) {
-                    c[i + j * ldc] = Ty<T>::from(red[0]);
-                }
-                __syncthreads();
             }
         }
     }

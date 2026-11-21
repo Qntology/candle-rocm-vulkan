@@ -419,7 +419,7 @@ impl RocmDevice {
 /// Minimum byte size for routing uploads through the pinned host buffer + non-blocking
 /// CopyStream. Below 4 MiB, Windows/Linux HIP pinned transfers regress vs default-stream copies
 /// (measured ~2.4 GB/s pinned vs ~3.1 GB/s pageable at 1 MiB on RX 6600).
-pub const ASYNC_DMA_MIN_BYTES: usize = 4 * 1024 * 1024;
+pub use crate::accel::ASYNC_DMA_MIN_BYTES;
 
 /// Reusable page-locked staging slot for overlapping host-to-device DMA uploads (such as
 /// layer weight streaming or next-crop vision inputs) with compute kernels on `RocmDevice`.

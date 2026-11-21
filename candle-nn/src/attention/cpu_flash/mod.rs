@@ -31,13 +31,9 @@ use super::AttnMask;
 #[inline]
 pub(crate) fn dot_f32<T: WithDType>(a: &[T], b: &[T]) -> f32 {
     debug_assert_eq!(a.len(), b.len());
-    if matches!(T::DTYPE, DType::F32 | DType::F16 | DType::BF16 | DType::F64) {
-        // SAFETY: `a` and `b` have equal length `a.len()`.
-        return unsafe { T::vec_dot_f32(a.as_ptr(), b.as_ptr(), a.len()) };
-    }
-    let mut res = T::zero();
-    unsafe { T::vec_dot(a.as_ptr(), b.as_ptr(), &mut res, a.len()) };
-    res.to_f64() as f32
+    // SAFETY: `a` and `b` have equal length `a.len()`. Every `WithDType` explicitly implements
+    // `VecOps::vec_dot_f32` with f32 accumulation (never narrowing scores to F16/BF16/F8E4M3).
+    unsafe { T::vec_dot_f32(a.as_ptr(), b.as_ptr(), a.len()) }
 }
 
 /// Flash attention with automatic dispatch.

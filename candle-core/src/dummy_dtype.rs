@@ -233,6 +233,20 @@ macro_rules! dummy_num_assign {
                     stringify!($ty)
                 )
             }
+
+            unsafe fn vec_dot_f32(_lhs: *const Self, _rhs: *const Self, _len: usize) -> f32 {
+                panic!(
+                    "{} is a dummy type and does not support operations",
+                    stringify!($ty)
+                )
+            }
+
+            fn vec_fmadd_to_f32(_acc: &mut [f32], _v: &[Self], _w: f32) {
+                panic!(
+                    "{} is a dummy type and does not support operations",
+                    stringify!($ty)
+                )
+            }
         }
     };
 }

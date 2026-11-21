@@ -51,8 +51,9 @@ impl Drop for ContextBinder {
 struct CudaRng(cudarc::curand::CudaRng);
 unsafe impl Send for CudaRng {}
 
-/// Scratch buffers owned by a device and reused across calls (quantized matmul workspaces). They
-/// are reallocated when too small and freed by [`CudaDevice::release_workspaces`].
+/// Scratch buffers owned by a device and reused across calls (quantized matmul, split-KV
+/// attention, and `lm_head` workspaces). They are reallocated when too small and freed by
+/// [`CudaDevice::release_workspaces`].
 #[derive(Default)]
 pub(crate) struct Workspaces {
     slots: HashMap<&'static str, CudaSlice<u8>>,
@@ -213,6 +214,9 @@ pub struct CudaDevice {
     param_cache: Arc<Mutex<HashMap<Vec<usize>, Arc<CudaSlice<usize>>>>>,
     /// Raw non-blocking stream used by [`super::offload::CopyStream`], created on first use.
     copy_stream: Arc<Mutex<Option<Arc<super::offload::RawStream>>>>,
+    /// Monotonic cache of `CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES` set per kernel name,
+    /// avoiding per-launch driver calls and cross-thread lowering races.
+    max_smem_cache: Arc<Mutex<HashMap<String, usize>>>,
 }
 
 impl std::fmt::Debug for CudaDevice {
@@ -771,12 +775,33 @@ impl CudaDevice {
         self.workspaces.lock().unwrap_or_else(|p| p.into_inner())
     }
 
-    /// Bytes currently held by the quantized matmul workspaces of this device.
+    /// Ensures `func` allows at least `bytes` of dynamic shared memory (monotonic per kernel
+    /// name on this device, skipping redundant driver calls above 48 KiB).
+    pub(crate) fn ensure_func_max_smem(
+        &self,
+        name: &str,
+        func: &CudaFunc,
+        bytes: usize,
+    ) -> Result<()> {
+        if bytes <= 48 * 1024 {
+            return Ok(());
+        }
+        let mut cache = self.max_smem_cache.lock().unwrap_or_else(|p| p.into_inner());
+        if cache.get(name).copied().unwrap_or(0) >= bytes {
+            return Ok(());
+        }
+        func.set_max_dynamic_shared_memory(bytes)?;
+        cache.insert(name.to_string(), bytes);
+        Ok(())
+    }
+
+    /// Bytes currently held by the per-device scratch workspaces (quantized matmul, split-KV,
+    /// `lm_head`).
     pub fn workspace_bytes(&self) -> usize {
         self.workspaces().bytes()
     }
 
-    /// Frees the quantized matmul workspaces and cached kernel parameters of this device (they
+    /// Frees the per-device scratch workspaces and cached kernel parameters of this device (they
     /// are reallocated on demand). The frees are stream ordered, so work in flight is not
     /// affected; the memory goes back to the pool (see [`Self::trim_memory_pool`]).
     pub fn release_workspaces(&self) -> Result<()> {
@@ -886,6 +911,7 @@ impl CudaDevice {
             workspaces: Arc::new(Mutex::new(Workspaces::default())),
             param_cache: Arc::new(Mutex::new(HashMap::new())),
             copy_stream: Arc::new(Mutex::new(None)),
+            max_smem_cache: Arc::new(Mutex::new(HashMap::new())),
         })
     }
 }

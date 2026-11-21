@@ -34,8 +34,10 @@ use float8::F8E4M3;
 use half::{bf16, f16};
 use std::collections::HashMap;
 use std::mem::ManuallyDrop;
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, Weak};
+
+static NEXT_CTX_ID: AtomicU64 = AtomicU64::new(1);
 
 /// The `DeviceLocation::Vulkan` variant carries a `gpu_id`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -55,6 +57,8 @@ pub(crate) struct Limits {
 
 /// One Vulkan logical device with its queue, kernel cache and allocator state.
 pub(crate) struct VulkanContext {
+    /// Monotonically unique identifier for this logical device context (never reused after drop).
+    pub(crate) ctx_id: u64,
     #[allow(dead_code)]
     entry: ash::Entry,
     instance: ash::Instance,
@@ -68,9 +72,17 @@ pub(crate) struct VulkanContext {
     /// True while `exec.cmd` holds unsubmitted GPU dispatches (fast-path guard
     /// for host reads and deferred buffer recycling).
     pub(crate) has_pending_gpu_work: AtomicBool,
-    /// Buffers dropped while a deferred command batch was still open/in-flight;
-    /// drained back into `pool` (or released) immediately after the batch fence completes.
-    deferred_returns: Mutex<Vec<PooledBuffer>>,
+    /// Monotonic batch epoch incremented whenever a new command batch begins recording.
+    pub(crate) batch_epoch: AtomicU64,
+    /// Highest batch epoch whose fence wait has completed.
+    pub(crate) completed_epoch: AtomicU64,
+    /// Sticky error captured if a deferred batch submit/wait fails; prevents host reads from
+    /// silently observing uncomputed output buffers.
+    pub(crate) batch_error: Mutex<Option<String>>,
+    /// Buffers dropped while a deferred command batch was still open/in-flight, tagged with the
+    /// active `batch_epoch` at drop time; only entries with `epoch <= completed_epoch` are
+    /// recycled into `pool` (or released).
+    deferred_returns: Mutex<Vec<(u64, PooledBuffer)>>,
     kernels: Mutex<HashMap<String, Arc<shaders::Kernel>>>,
     memory_properties: vk::PhysicalDeviceMemoryProperties,
     /// HOST_VISIBLE | HOST_COHERENT memory types, best first.
@@ -104,7 +116,7 @@ pub(crate) struct VulkanContext {
 unsafe impl Send for VulkanContext {}
 unsafe impl Sync for VulkanContext {}
 
-struct PooledBuffer {
+pub(crate) struct PooledBuffer {
     buffer: vk::Buffer,
     memory: vk::DeviceMemory,
     mapped: *mut u8,
@@ -193,12 +205,29 @@ impl VulkanContext {
         }
     }
 
-    pub(crate) fn drain_deferred_returns(&self) {
-        let pending = match self.deferred_returns.lock() {
-            Ok(mut v) => std::mem::take(&mut *v),
-            Err(_) => return,
+    /// Extracts deferred buffers whose batch epoch has completed (`epoch <= upto_epoch`).
+    /// Must be called while holding `exec` right after fence completion so buffers dropped by a
+    /// newly opened batch on another thread are never reclaimed early.
+    pub(crate) fn take_deferred_completed(&self, upto_epoch: u64) -> Vec<PooledBuffer> {
+        let mut def = match self.deferred_returns.lock() {
+            Ok(v) => v,
+            Err(_) => return Vec::new(),
         };
-        for b in pending {
+        let mut ready = Vec::new();
+        let mut i = 0;
+        while i < def.len() {
+            if def[i].0 <= upto_epoch {
+                ready.push(def.swap_remove(i).1);
+            } else {
+                i += 1;
+            }
+        }
+        ready
+    }
+
+    /// Returns completed buffers to `pool` (or releases them if over `pool_limit`).
+    pub(crate) fn recycle_buffers(&self, buffers: Vec<PooledBuffer>) {
+        for b in buffers {
             if b.bucket <= POOL_MAX_BUFFER {
                 if let Ok(mut pool) = self.pool.lock() {
                     if pool.bytes + b.alloc_size <= self.pool_limit {
@@ -212,7 +241,34 @@ impl VulkanContext {
         }
     }
 
+    pub(crate) fn drain_deferred_returns(&self) {
+        let done = self.completed_epoch.load(Ordering::Acquire);
+        let ready = self.take_deferred_completed(done);
+        self.recycle_buffers(ready);
+    }
+
+    pub(crate) fn check_batch_error(&self) -> Result<()> {
+        if let Ok(g) = self.batch_error.lock() {
+            if let Some(msg) = g.as_ref() {
+                return Err(Error::Msg(format!(
+                    "vulkan: prior batched GPU submission failed: {msg}"
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    pub(crate) fn record_batch_error(&self, msg: String) {
+        if let Ok(mut g) = self.batch_error.lock() {
+            if g.is_none() {
+                *g = Some(msg);
+            }
+        }
+    }
+
     fn trim_pool(&self) {
+        // Only drain deferred buffers whose batch has already completed; never free buffers still
+        // referenced by an open/unsubmitted command buffer.
         self.drain_deferred_returns();
         let drained: Vec<PooledBuffer> = match self.pool.lock() {
             Ok(mut pool) => {
@@ -252,6 +308,8 @@ impl Drop for VulkanContext {
             let _ = self.device.device_wait_idle();
         }
         self.has_pending_gpu_work.store(false, Ordering::Release);
+        let ep = self.batch_epoch.load(Ordering::Acquire);
+        self.completed_epoch.store(ep, Ordering::Release);
         self.trim_pool();
         self.gpu.release_scratch(&self.device);
         let chunks: Vec<SlabChunk> = match self.slabs.lock() {
@@ -639,6 +697,7 @@ fn init_vulkan(gpu_id: usize) -> Result<VulkanContext> {
 
     use rand::SeedableRng;
     Ok(VulkanContext {
+        ctx_id: NEXT_CTX_ID.fetch_add(1, Ordering::Relaxed),
         entry,
         instance,
         physical,
@@ -646,6 +705,9 @@ fn init_vulkan(gpu_id: usize) -> Result<VulkanContext> {
         queue,
         exec: Mutex::new(exec),
         has_pending_gpu_work: AtomicBool::new(false),
+        batch_epoch: AtomicU64::new(0),
+        completed_epoch: AtomicU64::new(0),
+        batch_error: Mutex::new(None),
         deferred_returns: Mutex::new(Vec::new()),
         kernels: Mutex::new(HashMap::new()),
         memory_properties,
@@ -714,6 +776,11 @@ impl VulkanDevice {
         }
     }
 
+    /// Returns `true` for CPU-backed Vulkan implementations (e.g. lavapipe / SwiftShader).
+    pub fn is_cpu_device(&self) -> bool {
+        self.inner.device_type == vk::PhysicalDeviceType::CPU
+    }
+
     /// `(free, total)` bytes of the memory heap that backs this device's
     /// tensors. Uses `VK_EXT_memory_budget` when the driver exposes it,
     /// otherwise the heap size minus what this process allocated.
@@ -775,18 +842,20 @@ impl VulkanDevice {
         self.inner.pool.lock().map(|p| p.bytes).unwrap_or(0)
     }
 
-    /// Returns the buffers kept for reuse to the driver.
+    /// Flushes pending GPU work, waits for idle, and returns cached/scratch buffers to the driver.
     pub fn trim_memory_pool(&self) -> Result<()> {
+        // Maintain lock order: scratch -> exec (via release_scratch_synced), then wait_idle + trim.
+        qgpu::release_scratch_synced(self)?;
+        shaders::wait_idle(self)?;
         self.inner.trim_pool();
-        self.inner.gpu.release_scratch(&self.inner.device);
         Ok(())
     }
 
     /// Frees the scratch buffer of the GPU quantized matmuls once the queue is idle (it is
     /// re-created on demand). The reuse pool is left alone, see [`Self::trim_memory_pool`].
     pub fn release_workspaces(&self) -> Result<()> {
+        qgpu::release_scratch_synced(self)?;
         shaders::wait_idle(self)?;
-        self.inner.gpu.release_scratch(&self.inner.device);
         Ok(())
     }
 
@@ -1204,7 +1273,8 @@ impl Drop for VulkanStorage {
         };
         if ctx.has_pending_gpu_work.load(Ordering::Acquire) {
             if let Ok(mut def) = ctx.deferred_returns.lock() {
-                def.push(b);
+                let epoch = ctx.batch_epoch.load(Ordering::Acquire);
+                def.push((epoch, b));
                 return;
             }
         }
@@ -1235,7 +1305,8 @@ unsafe fn view_vec<T>(ptr: *mut u8, len: usize) -> Vec<T> {
 
 impl VulkanStorage {
     pub fn transfer_to_device(&self, dst: &VulkanDevice) -> Result<Self> {
-        dst.upload_bytes(self.as_bytes(), self.numel, self.dtype)
+        self.ensure_host_visible_res()?;
+        dst.upload_bytes(self.as_bytes_raw(), self.numel, self.dtype)
     }
 
     pub fn from_vec<T: crate::WithDType>(data: Vec<T>, device: &VulkanDevice) -> Result<Self> {
@@ -1245,7 +1316,18 @@ impl VulkanStorage {
         device.upload_bytes(bytes, data.len(), T::DTYPE)
     }
 
-    /// Flushes any pending batched GPU dispatches before CPU access to mapped memory.
+    /// Flushes any pending batched GPU dispatches before CPU access and propagates any
+    /// sticky or flush-time submission error so callers never read uncomputed buffers.
+    #[inline]
+    pub(crate) fn ensure_host_visible_res(&self) -> Result<()> {
+        if self.device.inner.has_pending_gpu_work.load(Ordering::Acquire) {
+            shaders::flush(&self.device)?;
+        }
+        self.device.inner.check_batch_error()
+    }
+
+    /// Best-effort flush for infallible slice getters; errors are preserved in `batch_error` and
+    /// surfaced by `Result`-returning readback APIs (`as_slice`, `to_cpu_storage`, etc.).
     #[inline]
     fn ensure_host_visible(&self) {
         if self.device.inner.has_pending_gpu_work.load(Ordering::Acquire) {
@@ -1253,13 +1335,18 @@ impl VulkanStorage {
         }
     }
 
-    /// The raw bytes of the buffer.
-    pub fn as_bytes(&self) -> &[u8] {
-        self.ensure_host_visible();
+    #[inline]
+    fn as_bytes_raw(&self) -> &[u8] {
         if self.capacity_bytes == 0 {
             return &[];
         }
         unsafe { std::slice::from_raw_parts(self.mapped, self.capacity_bytes) }
+    }
+
+    /// The raw bytes of the buffer.
+    pub fn as_bytes(&self) -> &[u8] {
+        self.ensure_host_visible();
+        self.as_bytes_raw()
     }
 
     pub(crate) fn invalidate_mirror(&mut self) {
@@ -1280,7 +1367,7 @@ impl VulkanStorage {
 
     /// The elements of the buffer as a slice of `T`.
     pub fn as_slice<T: crate::WithDType>(&self) -> Result<&[T]> {
-        self.ensure_host_visible();
+        self.ensure_host_visible_res()?;
         if T::DTYPE != self.dtype {
             crate::bail!(
                 "vulkan as_slice: expected {:?}, got {:?}",
@@ -1295,7 +1382,7 @@ impl VulkanStorage {
     }
 
     pub(crate) fn as_mut_slice<T: crate::WithDType>(&mut self) -> Result<&mut [T]> {
-        self.ensure_host_visible();
+        self.ensure_host_visible_res()?;
         self.invalidate_mirror();
         if T::DTYPE != self.dtype {
             crate::bail!(
@@ -1313,6 +1400,16 @@ impl VulkanStorage {
     /// A `CpuStorage` aliasing the mapped memory, for read-only CPU fallbacks.
     pub(crate) fn host_view(&self) -> ManuallyDrop<CpuStorage> {
         self.ensure_host_visible();
+        self.host_view_raw()
+    }
+
+    /// Fallible `host_view` that propagates any pending batch flush error.
+    pub(crate) fn try_host_view(&self) -> Result<ManuallyDrop<CpuStorage>> {
+        self.ensure_host_visible_res()?;
+        Ok(self.host_view_raw())
+    }
+
+    fn host_view_raw(&self) -> ManuallyDrop<CpuStorage> {
         let (p, n) = (self.mapped, self.numel);
         let s = unsafe {
             match self.dtype {
@@ -1345,6 +1442,7 @@ impl VulkanStorage {
     /// Overwrites the buffer with `cpu`, reallocating when the element count or
     /// the dtype changed.
     pub fn overwrite_from_cpu(&mut self, cpu: &CpuStorage) -> Result<()> {
+        self.ensure_host_visible_res()?;
         let (bytes, numel) = cpu_bytes(cpu);
         if cpu.dtype() == self.dtype && numel == self.numel {
             self.as_bytes_mut().copy_from_slice(bytes);
@@ -1361,7 +1459,7 @@ impl VulkanStorage {
 
     /// Runs `f` on a `CpuStorage` that reads this buffer's memory in place.
     pub fn with_cpu_view<R>(&self, f: impl FnOnce(&CpuStorage) -> Result<R>) -> Result<R> {
-        let view = self.host_view();
+        let view = self.try_host_view()?;
         f(&view)
     }
 
@@ -1442,8 +1540,9 @@ impl BackendStorage for VulkanStorage {
     type Device = VulkanDevice;
 
     fn try_clone(&self, _layout: &Layout) -> Result<Self> {
+        self.ensure_host_visible_res()?;
         self.device
-            .upload_bytes(self.as_bytes(), self.numel, self.dtype)
+            .upload_bytes(self.as_bytes_raw(), self.numel, self.dtype)
     }
 
     fn dtype(&self) -> DType {
@@ -1459,12 +1558,13 @@ impl BackendStorage for VulkanStorage {
         if shaders::const_set(self, s, layout)? {
             return Ok(());
         }
+        self.ensure_host_visible_res()?;
         let mut view = self.host_view_mut();
         view.const_set(s, layout)
     }
 
     fn to_cpu_storage(&self) -> Result<CpuStorage> {
-        let view = self.host_view();
+        let view = self.try_host_view()?;
         Ok((*view).clone())
     }
 

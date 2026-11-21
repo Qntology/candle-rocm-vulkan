@@ -184,9 +184,7 @@ fn flash_attn_decode_lean<T: WithDType>(
                 online_softmax_step(score, &mut m, &mut ssum, acc, |acc, w| {
                     if v_contiguous {
                         let v_row = &v_data[v_base..v_base + dv];
-                        for d_i in 0..dv {
-                            acc[d_i] += v_row[d_i].to_f64() as f32 * w;
-                        }
+                        T::vec_fmadd_to_f32(acc, v_row, w);
                     } else {
                         for d_i in 0..dv {
                             acc[d_i] += v_data[v_base + d_i * vstride[3]].to_f64() as f32 * w;
@@ -285,9 +283,7 @@ fn flash_attn_decode<T: WithDType>(
                 online_softmax_step(score, &mut m, &mut ssum, acc, |acc, w| {
                     if v_contiguous {
                         let v_row = &v_data[v_base..v_base + dv];
-                        for d_i in 0..dv {
-                            acc[d_i] += v_row[d_i].to_f64() as f32 * w;
-                        }
+                        T::vec_fmadd_to_f32(acc, v_row, w);
                     } else {
                         for d_i in 0..dv {
                             acc[d_i] += v_data[v_base + d_i * vstride[3]].to_f64() as f32 * w;
@@ -360,9 +356,7 @@ fn flash_attn_prefill_lean<T: WithDType>(
                     online_softmax_step(score, &mut m, &mut ssum, acc, |acc, w| {
                         if v_contiguous {
                             let v_row = &v_data[v_base..v_base + dv];
-                            for d_i in 0..dv {
-                                acc[d_i] += v_row[d_i].to_f64() as f32 * w;
-                            }
+                            T::vec_fmadd_to_f32(acc, v_row, w);
                         } else {
                             for d_i in 0..dv {
                                 acc[d_i] += v_data[v_base + d_i * vstride[3]].to_f64() as f32 * w;
@@ -467,9 +461,7 @@ fn flash_attn_prefill<T: WithDType>(
                     online_softmax_step(score, &mut m, &mut ssum, acc, |acc, w| {
                         if v_contiguous {
                             let v_row = &v_data[v_base..v_base + dv];
-                            for d_i in 0..dv {
-                                acc[d_i] += v_row[d_i].to_f64() as f32 * w;
-                            }
+                            T::vec_fmadd_to_f32(acc, v_row, w);
                         } else {
                             for d_i in 0..dv {
                                 acc[d_i] += v_data[v_base + d_i * vstride[3]].to_f64() as f32 * w;

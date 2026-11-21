@@ -86,7 +86,98 @@ extern "C" __global__ void asort_copy_out(const uint32_t *buf, uint32_t *dst, co
 }
 CANDLE_REGISTER(asort_copy_out)
 
-// Global single bitonic compare-exchange stage for rows with ncols_pad > 2048.
+// Fused LDS Bitonic Sort initialization + stages k = 2..2048 for rows with ncols_pad > 2048.
+// Replaces `asort_init_pad` + 66 global stage launches with 1 launch (8 KiB LDS per tile).
+// Grid: (nrows * (ncols_pad / 2048), 1, 1), Block: (256, 1, 1).
+template <typename T, bool ASC>
+DEVFN void asort_tile_init_impl(const T *src, uint32_t *buf, const size_t nrows, const uint32_t ncols,
+                                const uint32_t ncols_pad) {
+    __shared__ uint32_t s_idx[ASORT_LDS_MAX];
+    const uint32_t tid = threadIdx.x;
+    const size_t tiles_per_row = (size_t)(ncols_pad / ASORT_LDS_MAX);
+    const size_t total_tiles = nrows * tiles_per_row;
+    for (size_t t = blockIdx.x; t < total_tiles; t += gridDim.x) {
+        const size_t row = t / tiles_per_row;
+        const uint32_t tile = (uint32_t)(t - row * tiles_per_row);
+        const uint32_t base = tile * ASORT_LDS_MAX;
+        const T *row_src = src + row * (size_t)ncols;
+        uint32_t *rbuf = buf + row * (size_t)ncols_pad + base;
+
+        for (uint32_t i = tid; i < ASORT_LDS_MAX; i += ASORT_THREADS) s_idx[i] = base + i;
+        __syncthreads();
+
+        for (uint32_t k = 2u; k <= ASORT_LDS_MAX; k <<= 1u) {
+            for (uint32_t j = k >> 1u; j > 0u; j >>= 1u) {
+                for (uint32_t i = tid; i < ASORT_LDS_MAX; i += ASORT_THREADS) {
+                    const uint32_t ixj = i ^ j;
+                    if (ixj > i) {
+                        const bool dir_asc = ((base + i) & k) == 0u;
+                        const uint32_t ia = s_idx[i];
+                        const uint32_t ib = s_idx[ixj];
+                        if (asort_should_swap<T, ASC>(row_src, ia, ib, ncols, dir_asc)) {
+                            s_idx[i] = ib;
+                            s_idx[ixj] = ia;
+                        }
+                    }
+                }
+                __syncthreads();
+            }
+        }
+
+        for (uint32_t i = tid; i < ASORT_LDS_MAX; i += ASORT_THREADS) rbuf[i] = s_idx[i];
+        __syncthreads();
+    }
+}
+
+// Fused LDS Bitonic tail merge for j = 1024, 512, ..., 1 given k >= 4096.
+// When `dst != nullptr` (final k == ncols_pad pass), writes directly to `dst` and skips `copy_out`.
+template <typename T, bool ASC>
+DEVFN void asort_tile_merge_impl(const T *src, uint32_t *buf, uint32_t *dst, const size_t nrows,
+                                 const uint32_t ncols, const uint32_t ncols_pad, const uint32_t k) {
+    __shared__ uint32_t s_idx[ASORT_LDS_MAX];
+    const uint32_t tid = threadIdx.x;
+    const size_t tiles_per_row = (size_t)(ncols_pad / ASORT_LDS_MAX);
+    const size_t total_tiles = nrows * tiles_per_row;
+    for (size_t t = blockIdx.x; t < total_tiles; t += gridDim.x) {
+        const size_t row = t / tiles_per_row;
+        const uint32_t tile = (uint32_t)(t - row * tiles_per_row);
+        const uint32_t base = tile * ASORT_LDS_MAX;
+        const T *row_src = src + row * (size_t)ncols;
+        uint32_t *rbuf = buf + row * (size_t)ncols_pad + base;
+        const bool dir_asc = (base & k) == 0u;
+
+        for (uint32_t i = tid; i < ASORT_LDS_MAX; i += ASORT_THREADS) s_idx[i] = rbuf[i];
+        __syncthreads();
+
+        for (uint32_t j = ASORT_LDS_MAX >> 1u; j > 0u; j >>= 1u) {
+            for (uint32_t i = tid; i < ASORT_LDS_MAX; i += ASORT_THREADS) {
+                const uint32_t ixj = i ^ j;
+                if (ixj > i) {
+                    const uint32_t ia = s_idx[i];
+                    const uint32_t ib = s_idx[ixj];
+                    if (asort_should_swap<T, ASC>(row_src, ia, ib, ncols, dir_asc)) {
+                        s_idx[i] = ib;
+                        s_idx[ixj] = ia;
+                    }
+                }
+            }
+            __syncthreads();
+        }
+
+        if (dst != nullptr) {
+            uint32_t *row_dst = dst + row * (size_t)ncols;
+            for (uint32_t i = tid; i < ASORT_LDS_MAX; i += ASORT_THREADS) {
+                const uint32_t col = base + i;
+                if (col < ncols) row_dst[col] = s_idx[i];
+            }
+        } else {
+            for (uint32_t i = tid; i < ASORT_LDS_MAX; i += ASORT_THREADS) rbuf[i] = s_idx[i];
+        }
+        __syncthreads();
+    }
+}
+
+// Global single bitonic compare-exchange stage for rows with ncols_pad > 2048 (used for j >= 2048).
 template <typename T, bool ASC>
 DEVFN void asort_global_step_impl(const T *src, uint32_t *buf, const size_t nrows, const uint32_t ncols,
                                   const uint32_t ncols_pad, const uint32_t k, const uint32_t j) {
@@ -122,6 +213,30 @@ DEVFN void asort_global_step_impl(const T *src, uint32_t *buf, const size_t nrow
         asort_lds_impl<T, false>(src, dst, nrows, ncols, ncols_pad);                                           \
     }                                                                                                          \
     CANDLE_REGISTER(asort_lds_desc_##SFX)                                                                      \
+    extern "C" __global__ void __launch_bounds__(ASORT_THREADS)                                                \
+        asort_tile_init_asc_##SFX(const T *src, uint32_t *buf, const size_t nrows, const uint32_t ncols,       \
+                                  const uint32_t ncols_pad) {                                                  \
+        asort_tile_init_impl<T, true>(src, buf, nrows, ncols, ncols_pad);                                      \
+    }                                                                                                          \
+    CANDLE_REGISTER(asort_tile_init_asc_##SFX)                                                                 \
+    extern "C" __global__ void __launch_bounds__(ASORT_THREADS)                                                \
+        asort_tile_init_desc_##SFX(const T *src, uint32_t *buf, const size_t nrows, const uint32_t ncols,      \
+                                   const uint32_t ncols_pad) {                                                 \
+        asort_tile_init_impl<T, false>(src, buf, nrows, ncols, ncols_pad);                                     \
+    }                                                                                                          \
+    CANDLE_REGISTER(asort_tile_init_desc_##SFX)                                                                \
+    extern "C" __global__ void __launch_bounds__(ASORT_THREADS)                                                \
+        asort_tile_merge_asc_##SFX(const T *src, uint32_t *buf, uint32_t *dst, const size_t nrows,             \
+                                   const uint32_t ncols, const uint32_t ncols_pad, const uint32_t k) {         \
+        asort_tile_merge_impl<T, true>(src, buf, dst, nrows, ncols, ncols_pad, k);                             \
+    }                                                                                                          \
+    CANDLE_REGISTER(asort_tile_merge_asc_##SFX)                                                                \
+    extern "C" __global__ void __launch_bounds__(ASORT_THREADS)                                                \
+        asort_tile_merge_desc_##SFX(const T *src, uint32_t *buf, uint32_t *dst, const size_t nrows,            \
+                                    const uint32_t ncols, const uint32_t ncols_pad, const uint32_t k) {        \
+        asort_tile_merge_impl<T, false>(src, buf, dst, nrows, ncols, ncols_pad, k);                            \
+    }                                                                                                          \
+    CANDLE_REGISTER(asort_tile_merge_desc_##SFX)                                                               \
     extern "C" __global__ void                                                                                 \
         asort_step_asc_##SFX(const T *src, uint32_t *buf, const size_t nrows, const uint32_t ncols,            \
                              const uint32_t ncols_pad, const uint32_t k, const uint32_t j) {                   \

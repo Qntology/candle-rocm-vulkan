@@ -3,10 +3,12 @@
 //!
 //! All data lives in a single 256-byte-aligned planar buffer `[qdata | bscale | rscale]`
 //! compatible with:
-//! * HuggingFace modelopt / compressed-tensors zero-copy checkpoints (`from_safetensors_parts`);
-//! * `kernels/w8a16_impl.h` (`w8a16_nvfp4_{mv,dq}`, `w8a16_nvfp8_{mv,dq}`) on ROCm & CUDA;
-//! * CPU SIMD/scalar dequantization & matvec;
-//! * `accel::formats` bit-exact OCP E4M3FN & E2M1 numerical rules.
+//! * HuggingFace modelopt / compressed-tensors checkpoints (`from_safetensors_parts`,
+//!   `from_safetensors_tensors`);
+//! * `kernels/w8a16_impl.h` (`w8a16_nvfp4_{mv,dq}`, `w8a16_nvfp8_{mv,dq}`) on ROCm (hipcc) and
+//!   CUDA (NVRTC), plus 32 MiB tiled prefill dequantization + GEMM on ROCm;
+//! * CPU scalar dequantization & matmul (bit-exact with `accel::formats` OCP E4M3FN & E2M1).
+//!   Vulkan currently falls back to host dequantization (emitting a one-time warning).
 
 use crate::accel::formats::{e4m3_to_f32, f32_to_e4m3, f32_to_fp4, fp4_to_f32};
 use crate::{bail, DType, Device, Result, Tensor};
@@ -166,6 +168,80 @@ impl NvfpWeight {
         Ok(Self { layout, data })
     }
 
+    /// Loads an [`NvfpWeight`] directly from safetensors-loaded tensors (`weight_packed` /
+    /// `weight`, optional `weight_scale` for NVFP4 16-element blocks, and per-row or scalar
+    /// `weight_scale_2` / global scale).
+    ///
+    /// Accepts `weight_packed` as `[rows, cols/2]` (`Nvfp4`, U8) or `[rows, cols]` (`Nvfp8`,
+    /// U8/F8E4M3), `weight_scale` as `[rows, cols/16]` (U8/F8E4M3) for NVFP4, and `rscale` as
+    /// scalar / `[1]` / `[rows]` float tensor (`Q1-F01` / `Q1-O01`).
+    pub fn from_safetensors_tensors(
+        weight_packed: &Tensor,
+        weight_scale: Option<&Tensor>,
+        weight_scale_2: &Tensor,
+        format: NvfpFormat,
+        device: &Device,
+    ) -> Result<Self> {
+        let (rows, packed_cols) = weight_packed.dims2()?;
+        let cols = match format {
+            NvfpFormat::Nvfp4 => packed_cols * 2,
+            NvfpFormat::Nvfp8 => packed_cols,
+        };
+        let qdata = match weight_packed.dtype() {
+            DType::U8 => weight_packed
+                .contiguous()?
+                .to_device(&Device::Cpu)?
+                .flatten_all()?
+                .to_vec1::<u8>()?,
+            DType::F8E4M3 => weight_packed
+                .contiguous()?
+                .to_device(&Device::Cpu)?
+                .flatten_all()?
+                .to_vec1::<float8::F8E4M3>()?
+                .into_iter()
+                .map(|v| v.to_bits())
+                .collect(),
+            dt => bail!("NvfpWeight::from_safetensors_tensors: unsupported qdata dtype {dt:?}"),
+        };
+        let bscale = match (format, weight_scale) {
+            (NvfpFormat::Nvfp4, Some(bs)) => Some(match bs.dtype() {
+                DType::U8 => bs
+                    .contiguous()?
+                    .to_device(&Device::Cpu)?
+                    .flatten_all()?
+                    .to_vec1::<u8>()?,
+                DType::F8E4M3 => bs
+                    .contiguous()?
+                    .to_device(&Device::Cpu)?
+                    .flatten_all()?
+                    .to_vec1::<float8::F8E4M3>()?
+                    .into_iter()
+                    .map(|v| v.to_bits())
+                    .collect(),
+                dt => bail!("NvfpWeight::from_safetensors_tensors: unsupported bscale dtype {dt:?}"),
+            }),
+            (NvfpFormat::Nvfp4, None) => {
+                bail!("NvfpWeight::from_safetensors_tensors: Nvfp4 requires weight_scale")
+            }
+            (NvfpFormat::Nvfp8, _) => None,
+        };
+        let rscale = weight_scale_2
+            .contiguous()?
+            .to_device(&Device::Cpu)?
+            .to_dtype(DType::F32)?
+            .flatten_all()?
+            .to_vec1::<f32>()?;
+        Self::from_safetensors_parts(
+            &qdata,
+            bscale.as_deref(),
+            &rscale,
+            rows,
+            cols,
+            format,
+            device,
+        )
+    }
+
     /// Quantizes a 2D weight tensor `[rows, cols]` into planar NVFP4 or NVFP8 on `tensor.device()`.
     pub fn quantize(tensor: &Tensor, format: NvfpFormat) -> Result<Self> {
         Self::quantize_onto(tensor, format, tensor.device())
@@ -284,6 +360,42 @@ impl NvfpWeight {
             }
         }
 
+        #[cfg(feature = "cuda")]
+        if let Device::Cuda(dev) = self.data.device() {
+            if matches!(dtype, DType::F32 | DType::F16 | DType::BF16) {
+                let (st, _) = self.data.storage_and_layout();
+                if let crate::Storage::Cuda(cs) = &*st {
+                    let data_slice = cs.as_cuda_slice::<u8>()?;
+                    let out_st = super::w8a16::nvfp_dq(
+                        dev,
+                        data_slice,
+                        self.layout.bscale_off,
+                        self.layout.rscale_off,
+                        self.layout.format == NvfpFormat::Nvfp4,
+                        cols,
+                        rows,
+                        dtype,
+                    )?;
+                    return Ok(crate::tensor::from_storage(
+                        crate::Storage::Cuda(out_st),
+                        (rows, cols),
+                        crate::op::BackpropOp::none(),
+                        false,
+                    ));
+                }
+            }
+        }
+
+        #[cfg(feature = "vulkan")]
+        if matches!(self.data.device(), Device::Vulkan(_)) {
+            static WARNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+            if !WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                eprintln!(
+                    "[candle-core] NvfpWeight::dequantize_to: Vulkan has no native NVFP shader yet; falling back to host dequantization"
+                );
+            }
+        }
+
         // Portable CPU / fallback dequantization (bit-exact with GPU decoders).
         let raw = self.data.to_device(&Device::Cpu)?.to_vec1::<u8>()?;
         let mut out = vec![0.0f32; rows * cols];
@@ -348,7 +460,7 @@ impl NvfpWeight {
 
         #[cfg(feature = "rocm")]
         if let Device::Rocm(dev) = self.data.device() {
-            if m > 0 && m <= 8 && self.layout.rows > 0 {
+            if m > 0 && self.layout.rows > 0 {
                 if let Some(sfx) = match in_dtype {
                     DType::F32 => Some("f32"),
                     DType::F16 => Some("f16"),
@@ -357,55 +469,211 @@ impl NvfpWeight {
                 } {
                     use crate::rocm_backend::kernels::Module;
                     use crate::rocm_backend::utils::LaunchArgs;
-                    use crate::rocm_backend::RocmStorage;
-                    let x_c = x.force_contiguous()?;
+                    use crate::rocm_backend::{GemmCall, GemmOutcome, RocmStorage};
+                    use hip_runtime::blas::GemmType;
+                    use std::ffi::c_void;
+                    let esz = in_dtype.size_in_bytes();
+                    let x_owned;
+                    let x_ref = if x.is_contiguous()
+                        && (x.layout().start_offset() * esz).is_multiple_of(16)
+                    {
+                        x
+                    } else {
+                        x_owned = x.force_contiguous()?;
+                        &x_owned
+                    };
                     let (wst, _) = self.data.storage_and_layout();
-                    let (xst, _) = x_c.storage_and_layout();
+                    let (xst, xl) = x_ref.storage_and_layout();
                     if let (crate::Storage::Rocm(ws), crate::Storage::Rocm(xs)) = (&*wst, &*xst) {
-                        let m_tag = if m == 1 { "1" } else { "8" };
-                        let fname = match self.layout.format {
-                            NvfpFormat::Nvfp4 => format!("w8a16_nvfp4_mv{m_tag}_{sfx}"),
-                            NvfpFormat::Nvfp8 => format!("w8a16_nvfp8_mv{m_tag}_{sfx}"),
-                        };
-                        if let Ok(func) = dev.get_func(Module::W8A16, &fname) {
-                            let base = ws.device_ptr();
-                            let out = dev.alloc(m * self.layout.rows * in_dtype.size_in_bytes())?;
-                            let mut args = LaunchArgs::new();
-                            match self.layout.format {
-                                NvfpFormat::Nvfp4 => {
-                                    let bs_ptr = unsafe { base.add(self.layout.bscale_off) };
-                                    let rs_ptr = unsafe { base.add(self.layout.rscale_off) };
-                                    args.ptr(base)
-                                        .ptr(bs_ptr)
-                                        .ptr(rs_ptr)
-                                        .ptr(xs.device_ptr())
-                                        .ptr(out.as_mut_ptr())
-                                        .u32(k as u32)
-                                        .u32(self.layout.rows as u32)
-                                        .u32(m as u32);
+                        let x_ptr = unsafe { xs.device_ptr().add(xl.start_offset() * esz) };
+                        let base = ws.device_ptr();
+                        if m <= 8 {
+                            let m_tag = if m == 1 { "1" } else { "8" };
+                            let fname = match self.layout.format {
+                                NvfpFormat::Nvfp4 => format!("w8a16_nvfp4_mv{m_tag}_{sfx}"),
+                                NvfpFormat::Nvfp8 => format!("w8a16_nvfp8_mv{m_tag}_{sfx}"),
+                            };
+                            if let Ok(func) = dev.get_func(Module::W8A16, &fname) {
+                                let out = dev.alloc(m * self.layout.rows * esz)?;
+                                let mut args = LaunchArgs::new();
+                                match self.layout.format {
+                                    NvfpFormat::Nvfp4 => {
+                                        let bs_ptr = unsafe { base.add(self.layout.bscale_off) };
+                                        let rs_ptr = unsafe { base.add(self.layout.rscale_off) };
+                                        args.ptr(base)
+                                            .ptr(bs_ptr)
+                                            .ptr(rs_ptr)
+                                            .ptr(x_ptr)
+                                            .ptr(out.as_mut_ptr())
+                                            .u32(k as u32)
+                                            .u32(self.layout.rows as u32)
+                                            .u32(m as u32);
+                                    }
+                                    NvfpFormat::Nvfp8 => {
+                                        let rs_ptr = unsafe { base.add(self.layout.rscale_off) };
+                                        args.ptr(base)
+                                            .ptr(rs_ptr)
+                                            .ptr(x_ptr)
+                                            .ptr(out.as_mut_ptr())
+                                            .u32(k as u32)
+                                            .u32(self.layout.rows as u32)
+                                            .u32(m as u32);
+                                    }
                                 }
-                                NvfpFormat::Nvfp8 => {
-                                    let rs_ptr = unsafe { base.add(self.layout.rscale_off) };
-                                    args.ptr(base)
-                                        .ptr(rs_ptr)
-                                        .ptr(xs.device_ptr())
-                                        .ptr(out.as_mut_ptr())
-                                        .u32(k as u32)
-                                        .u32(self.layout.rows as u32)
-                                        .u32(m as u32);
+                                let grid_x = self.layout.rows.div_ceil(4) as u32;
+                                dev.launch(func, (grid_x, 1, 1), (32, 4, 1), 0, &mut args)?;
+                                let out_st = RocmStorage::new(out, in_dtype, dev.clone());
+                                return Ok(crate::tensor::from_storage(
+                                    crate::Storage::Rocm(out_st),
+                                    out_dims,
+                                    crate::op::BackpropOp::none(),
+                                    false,
+                                ));
+                            }
+                        } else {
+                            // Prefill (M > 8): 32 MiB tiled dequant into reusable workspace + GEMM
+                            // so large weights never materialize a full `[N, K]` dense buffer (`Q1-O03`).
+                            let dq_name = match self.layout.format {
+                                NvfpFormat::Nvfp4 => format!("w8a16_nvfp4_dq_{sfx}"),
+                                NvfpFormat::Nvfp8 => format!("w8a16_nvfp8_dq_{sfx}"),
+                            };
+                            if let Ok(dq_func) = dev.get_func(Module::W8A16, &dq_name) {
+                                let n = self.layout.rows;
+                                let tile_bytes: usize = 32 << 20;
+                                let tile_n = (tile_bytes / (k * esz).max(1)).clamp(1, n);
+                                let gemm_ty = match in_dtype {
+                                    DType::F32 => GemmType::F32,
+                                    DType::F16 => GemmType::F16,
+                                    DType::BF16 => GemmType::BF16,
+                                    _ => unreachable!(),
+                                };
+                                let out = dev.alloc(m * n * esz)?;
+                                let tile_lease =
+                                    dev.workspace_ensure("rocm_dq_tile", tile_n * k * esz)?;
+                                let tile_ptr = tile_lease.as_mut_ptr();
+                                let mut n0 = 0usize;
+                                let mut ok = true;
+                                while n0 < n {
+                                    let tn = tile_n.min(n - n0);
+                                    let mut args = LaunchArgs::new();
+                                    let total_work = match self.layout.format {
+                                        NvfpFormat::Nvfp4 => {
+                                            let q_p = unsafe { base.add(n0 * (k / 2)) };
+                                            let bs_p = unsafe {
+                                                base.add(self.layout.bscale_off + n0 * (k / 16))
+                                            };
+                                            let rs_p =
+                                                unsafe { base.add(self.layout.rscale_off + n0 * 4) };
+                                            args.ptr(q_p)
+                                                .ptr(bs_p)
+                                                .ptr(rs_p)
+                                                .ptr(tile_ptr)
+                                                .u32(k as u32)
+                                                .u32(tn as u32);
+                                            tn * (k / 16)
+                                        }
+                                        NvfpFormat::Nvfp8 => {
+                                            let q_p = unsafe { base.add(n0 * k) };
+                                            let rs_p =
+                                                unsafe { base.add(self.layout.rscale_off + n0 * 4) };
+                                            args.ptr(q_p)
+                                                .ptr(rs_p)
+                                                .ptr(tile_ptr)
+                                                .u32(k as u32)
+                                                .u32(tn as u32);
+                                            tn * (k / 8)
+                                        }
+                                    };
+                                    let block = 256u32;
+                                    let grid =
+                                        total_work.div_ceil(block as usize).clamp(1, 65535) as u32;
+                                    dev.launch(dq_func, (grid, 1, 1), (block, 1, 1), 0, &mut args)?;
+                                    let c = unsafe { out.as_mut_ptr().add(n0 * esz) } as *mut c_void;
+                                    let call = GemmCall {
+                                        ty: gemm_ty,
+                                        transa: true,
+                                        transb: false,
+                                        m: tn,
+                                        n: m,
+                                        k,
+                                        a: tile_ptr as *const c_void,
+                                        lda: k,
+                                        stride_a: 0,
+                                        b: x_ptr as *const c_void,
+                                        ldb: k,
+                                        stride_b: 0,
+                                        c,
+                                        ldc: n,
+                                        stride_c: 0,
+                                        batch: 1,
+                                        batched: false,
+                                    };
+                                    match dev.gemm(&call)? {
+                                        GemmOutcome::Done => {}
+                                        GemmOutcome::Rocblas(_) => {
+                                            if !matches!(dev.hip_gemm(&call)?, GemmOutcome::Done) {
+                                                ok = false;
+                                                break;
+                                            }
+                                        }
+                                        GemmOutcome::NoKernel(_) => {
+                                            ok = false;
+                                            break;
+                                        }
+                                    }
+                                    n0 += tn;
+                                }
+                                drop(tile_lease);
+                                if ok {
+                                    let out_st = RocmStorage::new(out, in_dtype, dev.clone());
+                                    return Ok(crate::tensor::from_storage(
+                                        crate::Storage::Rocm(out_st),
+                                        out_dims,
+                                        crate::op::BackpropOp::none(),
+                                        false,
+                                    ));
                                 }
                             }
-                            let grid_x = self.layout.rows.div_ceil(4) as u32;
-                            dev.launch(func, (grid_x, 1, 1), (32, 4, 1), 0, &mut args)?;
-                            let out_st = RocmStorage::new(out, in_dtype, dev.clone());
-                            return Ok(crate::tensor::from_storage(
-                                crate::Storage::Rocm(out_st),
-                                out_dims,
-                                crate::op::BackpropOp::none(),
-                                false,
-                            ));
                         }
                     }
+                }
+            }
+        }
+
+        #[cfg(feature = "cuda")]
+        if let Device::Cuda(dev) = self.data.device() {
+            if m > 0 && m <= 8 && self.layout.rows > 0 && matches!(in_dtype, DType::F32 | DType::F16 | DType::BF16) {
+                let esz = in_dtype.size_in_bytes();
+                let x_owned;
+                let x_ref = if x.is_contiguous()
+                    && (x.layout().start_offset() * esz).is_multiple_of(16)
+                {
+                    x
+                } else {
+                    x_owned = x.force_contiguous()?;
+                    &x_owned
+                };
+                let (wst, _) = self.data.storage_and_layout();
+                let (xst, xl) = x_ref.storage_and_layout();
+                if let (crate::Storage::Cuda(ws), crate::Storage::Cuda(xs)) = (&*wst, &*xst) {
+                    let out_st = super::w8a16::nvfp_mv(
+                        dev,
+                        ws.as_cuda_slice::<u8>()?,
+                        self.layout.bscale_off,
+                        self.layout.rscale_off,
+                        self.layout.format == NvfpFormat::Nvfp4,
+                        k,
+                        self.layout.rows,
+                        xs,
+                        xl.start_offset(),
+                        m,
+                    )?;
+                    return Ok(crate::tensor::from_storage(
+                        crate::Storage::Cuda(out_st),
+                        out_dims,
+                        crate::op::BackpropOp::none(),
+                        false,
+                    ));
                 }
             }
         }

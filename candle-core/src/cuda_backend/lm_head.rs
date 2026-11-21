@@ -94,17 +94,17 @@ impl CudaStorage {
             let n_tiles = plan.n_tiles as usize;
             let pv_bytes = ((m * n_tiles).max(1) * 4).div_ceil(256) * 256;
             let pi_bytes = (m * n_tiles).max(1) * 4;
-            let base = dev
-                .workspaces
-                .lock()
-                .unwrap_or_else(|p| p.into_inner())
-                .ensure(dev, "lm_head_parts", pv_bytes + pi_bytes)?;
-            let pv_p = base;
-            let pi_p = base + pv_bytes as u64;
 
             let f1 = dev.lm_head_func(&plan.kernel_name(sfx))?;
             let f2 = dev.lm_head_func(&format!("lm_stage2_reduce_cs_{sfx}"))?;
             let stream = dev.cuda_stream();
+
+            // Hold the workspace lock across both Stage 1 and Stage 2 queueing so another
+            // thread sharing this device cannot alias or reallocate `"lm_head_parts"`.
+            let mut ws = dev.workspaces();
+            let base = ws.ensure(dev, "lm_head_parts", pv_bytes + pi_bytes)?;
+            let pv_p = base;
+            let pi_p = base + pv_bytes as u64;
 
             // Stage 1: Tile matmul + in-register/smem tile argmax
             {
@@ -184,6 +184,154 @@ impl CudaStorage {
                     shared_mem_bytes: lmh::stage2_smem_bytes(),
                 };
                 unsafe { bld.launch(cfg) }.w()?;
+            }
+        }
+
+        Ok((
+            CudaStorage {
+                slice: CudaStorageSlice::U32(out_ids),
+                device: dev.clone(),
+            },
+            CudaStorage {
+                slice: CudaStorageSlice::F32(out_vals),
+                device: dev.clone(),
+            },
+            CudaStorage {
+                slice: CudaStorageSlice::U8(out_rescue),
+                device: dev.clone(),
+            },
+        ))
+    }
+
+    /// Quantized Mode A on CUDA: 2-Stage Fused Tile Argmax + Mean-Centered CS Guard directly over
+    /// quantized weights (`Q8_0`, `Q4_0`, `Q4K`, `Q5K`, `Q6K`) with 0-byte `[M, V]` logits
+    /// materialization (`P1-O03` / `Q5-O07`). Supports arbitrary `M` by chunking 8 rows per pass.
+    #[allow(clippy::too_many_arguments)]
+    pub fn fused_quant_argmax_cs(
+        &self,
+        x_off: usize,
+        wq: &cudarc::driver::CudaSlice<u8>,
+        wtype: crate::quantized::GgmlDType,
+        row_bytes: usize,
+        bias: Option<(&Self, usize)>,
+        core_ids: Option<(&Self, usize)>,
+        mu_rest: Option<(&Self, usize)>,
+        w_rest_bound: f32,
+        b_rest_max: f32,
+        check_cs: bool,
+        m: usize,
+        v_valid: usize,
+        k: usize,
+    ) -> Result<(Self, Self, Self)> {
+        use crate::backend::BackendStorage;
+        let dtype = self.dtype();
+        let sfx = float_sfx(dtype)?;
+        let dev = &self.device;
+
+        let mut out_ids = unsafe { dev.alloc::<u32>(m.max(1))? };
+        let mut out_vals = unsafe { dev.alloc::<f32>(m.max(1))? };
+        let mut out_rescue = unsafe { dev.alloc::<u8>(m.max(1))? };
+
+        if m > 0 && v_valid > 0 && k > 0 {
+            let n_tiles = v_valid.div_ceil(32);
+            let max_chunk = m.min(8);
+            let pv_bytes = ((max_chunk * n_tiles).max(1) * 4).div_ceil(256) * 256;
+            let pi_bytes = (max_chunk * n_tiles).max(1) * 4;
+
+            let f2 = dev.lm_head_func(&format!("lm_stage2_reduce_cs_{sfx}"))?;
+            let stream = dev.cuda_stream();
+
+            let mut ws = dev.workspaces();
+            let base = ws.ensure(dev, "lm_head_parts", pv_bytes + pi_bytes)?;
+            let pv_p = base;
+            let pi_p = base + pv_bytes as u64;
+
+            let (wq_p, _g_wq) = wq.device_ptr(&stream);
+            let (b_p, _g_b) = match bias {
+                Some((bs, off)) => {
+                    let (p, g) = dptr(bs, off, &stream)?;
+                    (p, Some(g))
+                }
+                None => (0u64, None),
+            };
+            let (cid_p, _g_c) = match core_ids {
+                Some((cs, off)) => {
+                    let (p, g) = dptr(cs, off, &stream)?;
+                    (p, Some(g))
+                }
+                None => (0u64, None),
+            };
+            let (mu_p, _g_m) = match mu_rest {
+                Some((ms, off)) => {
+                    let (p, g) = dptr(ms, off, &stream)?;
+                    (p, Some(g))
+                }
+                None => (0u64, None),
+            };
+
+            let mut row0 = 0usize;
+            while row0 < m {
+                let cm = (m - row0).min(8);
+                let f1 = crate::quantized::w8a16::lm_stage1_quant_func(dev, wtype, dtype, cm)?;
+                let (x_p, _g_x) = dptr(self, x_off + row0 * k, &stream)?;
+                {
+                    let m_i = cm as i32;
+                    let v_i = v_valid as i32;
+                    let k_i = k as i32;
+                    let nt_i = n_tiles as i32;
+                    let rb_i = row_bytes as i64;
+                    let mut bld = stream.launch_builder(&f1);
+                    bld.arg(&x_p)
+                        .arg(&wq_p)
+                        .arg(&b_p)
+                        .arg(&pv_p)
+                        .arg(&pi_p)
+                        .arg(&m_i)
+                        .arg(&v_i)
+                        .arg(&k_i)
+                        .arg(&nt_i)
+                        .arg(&rb_i);
+                    let cfg = LaunchConfig {
+                        grid_dim: (n_tiles as u32, 1, 1),
+                        block_dim: (32, 8, 1),
+                        shared_mem_bytes: 0,
+                    };
+                    unsafe { bld.launch(cfg) }.w()?;
+                }
+                {
+                    let (oid_p, _g5) = out_ids.device_ptr_mut(&stream);
+                    let (oval_p, _g6) = out_vals.device_ptr_mut(&stream);
+                    let (ores_p, _g7) = out_rescue.device_ptr_mut(&stream);
+                    let oid_c = oid_p + (row0 * 4) as u64;
+                    let oval_c = oval_p + (row0 * 4) as u64;
+                    let ores_c = ores_p + row0 as u64;
+                    let m32 = cm as u32;
+                    let nt32 = n_tiles as u32;
+                    let k32 = k as u32;
+                    let cs32 = u32::from(check_cs);
+                    let mut bld = f2.builder();
+                    bld.arg(&pv_p)
+                        .arg(&pi_p)
+                        .arg(&cid_p)
+                        .arg(&x_p)
+                        .arg(&mu_p)
+                        .arg(&w_rest_bound)
+                        .arg(&b_rest_max)
+                        .arg(&oid_c)
+                        .arg(&oval_c)
+                        .arg(&ores_c)
+                        .arg(&m32)
+                        .arg(&nt32)
+                        .arg(&k32)
+                        .arg(&cs32);
+                    let cfg = LaunchConfig {
+                        grid_dim: (cm as u32, 1, 1),
+                        block_dim: (LM_NT, 1, 1),
+                        shared_mem_bytes: lmh::stage2_smem_bytes(),
+                    };
+                    unsafe { bld.launch(cfg) }.w()?;
+                }
+                row0 += cm;
             }
         }
 
