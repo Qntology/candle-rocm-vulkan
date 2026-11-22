@@ -122,11 +122,13 @@ impl CudaStorage {
         let mut cs_out = alloc(dev, dtype, p.b * c * km1)?;
         let mut s_out = alloc(dev, DType::F32, p.b * p.hv * p.dk * p.dv)?;
         if p.b > 0 && p.hv > 0 && p.dv > 0 {
-            let func = dev.gdn_func(&tile.kernel_name(sfx))?;
-            let smem = tile.smem_bytes();
-            if smem > 48 * 1024 {
-                func.set_max_dynamic_shared_memory(smem)?;
-            }
+            let (kname, smem) = if p.t == 1 {
+                (tile.decode1_kernel_name(sfx), tile.decode1_smem_bytes())
+            } else {
+                (tile.kernel_name(sfx), tile.smem_bytes())
+            };
+            let func = dev.gdn_func(&kname)?;
+            dev.ensure_func_max_smem(&kname, &func, smem)?;
             let stream = dev.cuda_stream();
             let (x_p, _g0) = dptr(self, p.x[0], &stream)?;
             let (cs_p, _g1) = dptr_opt(conv_state, p.cs_off, &stream)?;

@@ -1279,6 +1279,49 @@ impl QTensor {
     )> {
         self.storage.device_ptr_with_guard(stream)
     }
+
+    /// Single-rounding fused dual-projection SwiGLU:
+    /// `silu(x @ self^T) * (x @ up^T)`.
+    ///
+    /// On CUDA and ROCm for decode / speculative batches (`rows <= 8`), runs the fused
+    /// `w8a16_gate_up_silu_mv` kernel (single `x` read, F32 gate+up accumulation and SiLU,
+    /// single rounding on store, zero intermediate HBM buffer). Falls back to exact
+    /// `self.forward_exact(x)?.silu()? * up.forward_exact(x)?` otherwise.
+    pub fn fused_gate_up_silu(&self, up: &Self, x: &Tensor) -> Result<Tensor> {
+        let x_c = x.contiguous()?;
+        match (&self.storage, &up.storage, &*x_c.storage()) {
+            #[cfg(feature = "cuda")]
+            (QStorage::Cuda(wg), QStorage::Cuda(wu), Storage::Cuda(xs)) => {
+                if let Some((storage, out_shape)) =
+                    wg.fwd_gate_up_silu(self.shape(), wu, up.shape(), xs, x_c.layout())?
+                {
+                    return Ok(crate::tensor::from_storage(
+                        Storage::Cuda(storage),
+                        out_shape,
+                        crate::op::BackpropOp::none(),
+                        false,
+                    ));
+                }
+            }
+            #[cfg(feature = "rocm")]
+            (QStorage::Rocm(wg), QStorage::Rocm(wu), Storage::Rocm(xs)) => {
+                if let Some((storage, out_shape)) =
+                    wg.fwd_gate_up_silu(self.shape(), wu, up.shape(), xs, x_c.layout())?
+                {
+                    return Ok(crate::tensor::from_storage(
+                        Storage::Rocm(storage),
+                        out_shape,
+                        crate::op::BackpropOp::none(),
+                        false,
+                    ));
+                }
+            }
+            _ => {}
+        }
+        let g = self.forward_exact(&x_c)?;
+        let u = up.forward_exact(&x_c)?;
+        g.silu()? * u
+    }
 }
 
 /// Input rows up to which [`QTensor::forward_exact`] uses the exact mat-vec path.
@@ -1594,6 +1637,20 @@ impl crate::Module for QMatMul {
                     _ => w.t()?,
                 };
                 xs.to_dtype(DType::F16)?.matmul(&w)?.to_dtype(in_dtype)
+            }
+        }
+    }
+}
+
+impl QMatMul {
+    /// Single-rounding fused dual-projection SwiGLU: `silu(x @ self^T) * (x @ up^T)`.
+    pub fn fused_gate_up_silu(&self, up: &Self, x: &Tensor) -> Result<Tensor> {
+        match (self, up) {
+            (Self::QTensor(g), Self::QTensor(u)) => g.fused_gate_up_silu(u, x),
+            _ => {
+                let g = self.forward_exact(x)?;
+                let u = up.forward_exact(x)?;
+                g.silu()? * u
             }
         }
     }

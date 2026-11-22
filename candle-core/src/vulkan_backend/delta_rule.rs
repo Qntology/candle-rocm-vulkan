@@ -127,16 +127,21 @@ float load_a(uint idx) {{ return {ld_a}; }}
 float load_b(uint idx) {{ return {ld_b}; }}
 shared float sh_q[{dk_cap_val}];
 shared float sh_k[{dk_cap_val}];
-shared float red[64];
-float wg_sum64(float v) {{
+shared float red_q[64];
+shared float red_k[64];
+vec2 wg_sum64_pair(float vq, float vk) {{
     uint tid = gl_LocalInvocationID.x;
-    red[tid] = v;
+    red_q[tid] = vq;
+    red_k[tid] = vk;
     barrier();
     for (uint s = 32u; s > 0u; s >>= 1u) {{
-        if (tid < s) {{ red[tid] += red[tid + s]; }}
+        if (tid < s) {{
+            red_q[tid] += red_q[tid + s];
+            red_k[tid] += red_k[tid + s];
+        }}
         barrier();
     }}
-    float r = red[0];
+    vec2 r = vec2(red_q[0], red_k[0]);
     barrier();
     return r;
 }}
@@ -182,8 +187,9 @@ void main() {{
             sk += kv * kv;
         }}
         if (use_l2) {{
-            float inv_q = inversesqrt(wg_sum64(sq) + eps) * scale;
-            float inv_k = inversesqrt(wg_sum64(sk) + eps);
+            vec2 sums = wg_sum64_pair(sq, sk);
+            float inv_q = inversesqrt(sums.x + eps) * scale;
+            float inv_k = inversesqrt(sums.y + eps);
             for (uint i = tid; i < Dk; i += 64u) {{
                 sh_q[i] *= inv_q;
                 sh_k[i] *= inv_k;

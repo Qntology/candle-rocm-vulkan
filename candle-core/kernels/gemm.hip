@@ -31,12 +31,23 @@ DEVFN void gemm_impl(const T *A, const T *B, T *C, const uint32_t transa, const 
     const size_t ty = tid / (GEMM_BM / GEMM_TM);
     const size_t tiles_m = (m + GEMM_BM - 1) / GEMM_BM;
     const size_t tiles_n = (n + GEMM_BN - 1) / GEMM_BN;
+    constexpr size_t GROUP_M = 8;
     for (size_t bz = blockIdx.z; bz < batch; bz += gridDim.z) {
         const T *a = A + (int64_t)bz * stride_a;
         const T *b = B + (int64_t)bz * stride_b;
         T *c = C + (int64_t)bz * stride_c;
-        for (size_t tj = blockIdx.y; tj < tiles_n; tj += gridDim.y) {
-            for (size_t ti = blockIdx.x; ti < tiles_m; ti += gridDim.x) {
+        for (size_t raw_j = blockIdx.y; raw_j < tiles_n; raw_j += gridDim.y) {
+            for (size_t raw_i = blockIdx.x; raw_i < tiles_m; raw_i += gridDim.x) {
+                // 2D CTA tile swizzling (GROUP_M = 8): consecutive workgroups reuse A/B stripes in L2.
+                const size_t pid = raw_j * tiles_m + raw_i;
+                const size_t num_pid_in_group = GROUP_M * tiles_n;
+                const size_t group_id = pid / num_pid_in_group;
+                const size_t first_pid_m = group_id * GROUP_M;
+                const size_t group_size_m =
+                    (tiles_m - first_pid_m) < GROUP_M ? (tiles_m - first_pid_m) : GROUP_M;
+                const size_t rem = pid - group_id * num_pid_in_group;
+                const size_t ti = first_pid_m + (rem % group_size_m);
+                const size_t tj = rem / group_size_m;
                 const size_t i0 = ti * GEMM_BM;
                 const size_t j0 = tj * GEMM_BN;
                 Acc acc[GEMM_TM][GEMM_TN];

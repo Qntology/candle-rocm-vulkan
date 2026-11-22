@@ -224,8 +224,14 @@ impl TurboQuantizer {
                 .for_each(|row| fwht_f32_inplace(row, sb, forward));
             return Ok(Some(Tensor::from_vec(v, shape, x.device())?));
         }
-        #[cfg(any(feature = "cuda", feature = "rocm"))]
-        if self.kernels() && matches!(x.device(), Device::Cuda(_) | Device::Rocm(_)) && d <= 256 {
+        #[cfg(any(feature = "cuda", feature = "rocm", feature = "vulkan"))]
+        if self.kernels()
+            && matches!(
+                x.device(),
+                Device::Cuda(_) | Device::Rocm(_) | Device::Vulkan(_)
+            )
+            && d <= 256
+        {
             let x2 = x.contiguous()?.reshape((rows, d))?;
             match x2.apply_op2_no_bwd(
                 signs_t,
@@ -289,10 +295,42 @@ impl TurboQuantizer {
     }
 
     /// Packs `x: (rows, dim)` into `(rows, row_words)` u32 rows.
+    /// When `RotationKind::Hadamard` is active on CUDA/ROCm (`dim <= 256`), executes a single-pass
+    /// fused `FWHT + Quantize` kernel with zero intermediate F32 HBM roundtrip.
     pub fn quantize_rows(&self, x: &Tensor) -> Result<Tensor> {
         let (rows, d) = x.dims2()?;
         if d != self.dim {
             bail!("turbo-quant: expected rows of {} values, got {d}", self.dim)
+        }
+        #[cfg(any(feature = "cuda", feature = "rocm"))]
+        if self.kernels()
+            && matches!(x.device(), Device::Cuda(_) | Device::Rocm(_))
+            && d <= 256
+        {
+            if let Some((signs_t, _)) = &self.hadamard_signs {
+                if let Ok(args) = TqRowArgs::new(self.format, rows, self.dim) {
+                    let xc = x.contiguous()?;
+                    let res = match &self.qjl {
+                        None => xc.apply_op3_no_bwd(
+                            &self.tab,
+                            signs_t,
+                            &TqFwhtQuantFused { args },
+                        ),
+                        Some((_, st)) => xc.apply_op3_no_bwd(
+                            &self.tab,
+                            st,
+                            &TqFwhtQuantProdFused {
+                                args,
+                                signs: signs_t.clone(),
+                            },
+                        ),
+                    };
+                    match res {
+                        Ok(t) => return Ok(t),
+                        Err(e) => warn_cpu_fallback("tq_fwht_quant_fused", &e),
+                    }
+                }
+            }
         }
         let y = self.rotate(x)?.contiguous()?;
         if self.kernels() {
@@ -447,15 +485,15 @@ fn contiguous_offset(l: &Layout, what: &str) -> Result<usize> {
     }
 }
 
-/// On-chip `O(d log d)` FWHT rotation/unrotation op on CUDA/ROCm.
-#[cfg(any(feature = "cuda", feature = "rocm"))]
+/// On-chip `O(d log d)` FWHT rotation/unrotation op on CUDA/ROCm/Vulkan.
+#[cfg(any(feature = "cuda", feature = "rocm", feature = "vulkan"))]
 struct TqFwht {
     rows: usize,
     dim: usize,
     forward: bool,
 }
 
-#[cfg(any(feature = "cuda", feature = "rocm"))]
+#[cfg(any(feature = "cuda", feature = "rocm", feature = "vulkan"))]
 impl candle::CustomOp2 for TqFwht {
     fn name(&self) -> &'static str {
         "turbo-quant-fwht"
@@ -493,6 +531,20 @@ impl candle::CustomOp2 for TqFwht {
         signs: &candle::RocmStorage,
         sl: &Layout,
     ) -> Result<(candle::RocmStorage, Shape)> {
+        let xo = contiguous_offset(xl, "fwht input")?;
+        let so = contiguous_offset(sl, "fwht signs")?;
+        let out = x.tq_fwht(xo, signs, so, self.rows, self.dim, self.forward)?;
+        Ok((out, Shape::from((self.rows, self.dim))))
+    }
+
+    #[cfg(feature = "vulkan")]
+    fn vulkan_fwd(
+        &self,
+        x: &candle::VulkanStorage,
+        xl: &Layout,
+        signs: &candle::VulkanStorage,
+        sl: &Layout,
+    ) -> Result<(candle::VulkanStorage, Shape)> {
         let xo = contiguous_offset(xl, "fwht input")?;
         let so = contiguous_offset(sl, "fwht signs")?;
         let out = x.tq_fwht(xo, signs, so, self.rows, self.dim, self.forward)?;
@@ -555,6 +607,135 @@ impl candle::CustomOp3 for TqQuantProdFused {
         let to = contiguous_offset(tl, "prod tab")?;
         let so = contiguous_offset(sl, "prod s_mat")?;
         let out = y.tq_quantize_prod_fused(yo, tab, to, s_mat, so, &self.args)?;
+        Ok((out, Shape::from((self.args.rows, self.args.row_words))))
+    }
+}
+
+/// Single-pass zero-HBM-roundtrip FWHT + Quantize op on CUDA/ROCm.
+#[cfg(any(feature = "cuda", feature = "rocm"))]
+struct TqFwhtQuantFused {
+    args: TqRowArgs,
+}
+
+#[cfg(any(feature = "cuda", feature = "rocm"))]
+impl candle::CustomOp3 for TqFwhtQuantFused {
+    fn name(&self) -> &'static str {
+        "turbo-quant-fwht-quant-fused"
+    }
+
+    fn cpu_fwd(
+        &self,
+        _: &CpuStorage,
+        _: &Layout,
+        _: &CpuStorage,
+        _: &Layout,
+        _: &CpuStorage,
+        _: &Layout,
+    ) -> Result<(CpuStorage, Shape)> {
+        bail!("turbo-quant-fwht-quant-fused: GPU-only op")
+    }
+
+    #[cfg(feature = "cuda")]
+    fn cuda_fwd(
+        &self,
+        x: &candle::CudaStorage,
+        xl: &Layout,
+        tab: &candle::CudaStorage,
+        tl: &Layout,
+        signs: &candle::CudaStorage,
+        sl: &Layout,
+    ) -> Result<(candle::CudaStorage, Shape)> {
+        let xo = contiguous_offset(xl, "fwht-quant input")?;
+        let to = contiguous_offset(tl, "fwht-quant tab")?;
+        let so = contiguous_offset(sl, "fwht-quant signs")?;
+        let out = x.tq_fwht_quant_fused(xo, tab, to, signs, so, &self.args)?;
+        Ok((out, Shape::from((self.args.rows, self.args.row_words))))
+    }
+
+    #[cfg(feature = "rocm")]
+    fn rocm_fwd(
+        &self,
+        x: &candle::RocmStorage,
+        xl: &Layout,
+        tab: &candle::RocmStorage,
+        tl: &Layout,
+        signs: &candle::RocmStorage,
+        sl: &Layout,
+    ) -> Result<(candle::RocmStorage, Shape)> {
+        let xo = contiguous_offset(xl, "fwht-quant input")?;
+        let to = contiguous_offset(tl, "fwht-quant tab")?;
+        let so = contiguous_offset(sl, "fwht-quant signs")?;
+        let out = x.tq_fwht_quant_fused(xo, tab, to, signs, so, &self.args)?;
+        Ok((out, Shape::from((self.args.rows, self.args.row_words))))
+    }
+}
+
+/// Single-pass zero-HBM-roundtrip FWHT + TurboProd (codebook + QJL signs) op on CUDA/ROCm.
+#[cfg(any(feature = "cuda", feature = "rocm"))]
+struct TqFwhtQuantProdFused {
+    args: TqRowArgs,
+    signs: Tensor,
+}
+
+#[cfg(any(feature = "cuda", feature = "rocm"))]
+impl candle::CustomOp3 for TqFwhtQuantProdFused {
+    fn name(&self) -> &'static str {
+        "turbo-quant-fwht-quant-prod-fused"
+    }
+
+    fn cpu_fwd(
+        &self,
+        _: &CpuStorage,
+        _: &Layout,
+        _: &CpuStorage,
+        _: &Layout,
+        _: &CpuStorage,
+        _: &Layout,
+    ) -> Result<(CpuStorage, Shape)> {
+        bail!("turbo-quant-fwht-quant-prod-fused: GPU-only op")
+    }
+
+    #[cfg(feature = "cuda")]
+    fn cuda_fwd(
+        &self,
+        x: &candle::CudaStorage,
+        xl: &Layout,
+        tab: &candle::CudaStorage,
+        tl: &Layout,
+        s_mat: &candle::CudaStorage,
+        sl: &Layout,
+    ) -> Result<(candle::CudaStorage, Shape)> {
+        let xo = contiguous_offset(xl, "fwht-prod input")?;
+        let to = contiguous_offset(tl, "fwht-prod tab")?;
+        let so = contiguous_offset(sl, "fwht-prod s_mat")?;
+        let (ss, s_l) = self.signs.storage_and_layout();
+        let candle::Storage::Cuda(signs_s) = &*ss else {
+            bail!("turbo-quant-fwht-quant-prod-fused: signs not on CUDA")
+        };
+        let sbo = contiguous_offset(s_l, "fwht-prod signs")?;
+        let out = x.tq_fwht_quant_prod_fused(xo, tab, to, s_mat, so, signs_s, sbo, &self.args)?;
+        Ok((out, Shape::from((self.args.rows, self.args.row_words))))
+    }
+
+    #[cfg(feature = "rocm")]
+    fn rocm_fwd(
+        &self,
+        x: &candle::RocmStorage,
+        xl: &Layout,
+        tab: &candle::RocmStorage,
+        tl: &Layout,
+        s_mat: &candle::RocmStorage,
+        sl: &Layout,
+    ) -> Result<(candle::RocmStorage, Shape)> {
+        let xo = contiguous_offset(xl, "fwht-prod input")?;
+        let to = contiguous_offset(tl, "fwht-prod tab")?;
+        let so = contiguous_offset(sl, "fwht-prod s_mat")?;
+        let (ss, s_l) = self.signs.storage_and_layout();
+        let candle::Storage::Rocm(signs_s) = &*ss else {
+            bail!("turbo-quant-fwht-quant-prod-fused: signs not on ROCm")
+        };
+        let sbo = contiguous_offset(s_l, "fwht-prod signs")?;
+        let out = x.tq_fwht_quant_prod_fused(xo, tab, to, s_mat, so, signs_s, sbo, &self.args)?;
         Ok((out, Shape::from((self.args.rows, self.args.row_words))))
     }
 }

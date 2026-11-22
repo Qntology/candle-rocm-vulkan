@@ -387,12 +387,29 @@ impl NvfpWeight {
         }
 
         #[cfg(feature = "vulkan")]
-        if matches!(self.data.device(), Device::Vulkan(_)) {
-            static WARNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-            if !WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
-                eprintln!(
-                    "[candle-core] NvfpWeight::dequantize_to: Vulkan has no native NVFP shader yet; falling back to host dequantization"
-                );
+        if let Device::Vulkan(dev) = self.data.device() {
+            if matches!(dtype, DType::F32 | DType::F16 | DType::BF16)
+                && crate::vulkan_backend::decoder_ops::vk_fused_ready(dev)
+            {
+                let (st, _) = self.data.storage_and_layout();
+                if let crate::Storage::Vulkan(vs) = &*st {
+                    let out_st = crate::vulkan_backend::nvfp::dequantize(
+                        dev,
+                        vs,
+                        self.layout.bscale_off,
+                        self.layout.rscale_off,
+                        self.layout.format == NvfpFormat::Nvfp4,
+                        rows,
+                        cols,
+                        dtype,
+                    )?;
+                    return Ok(crate::tensor::from_storage(
+                        crate::Storage::Vulkan(out_st),
+                        (rows, cols),
+                        crate::op::BackpropOp::none(),
+                        false,
+                    ));
+                }
             }
         }
 
@@ -712,6 +729,45 @@ impl NvfpWeight {
             }
         }
 
+        #[cfg(feature = "vulkan")]
+        if let Device::Vulkan(dev) = self.data.device() {
+            if m > 0
+                && m <= 8
+                && self.layout.rows > 0
+                && matches!(in_dtype, DType::F32 | DType::F16 | DType::BF16)
+                && crate::vulkan_backend::decoder_ops::vk_fused_ready(dev)
+            {
+                let x_c = x.contiguous()?;
+                let (wst, _) = self.data.storage_and_layout();
+                let (xst, xl) = x_c.storage_and_layout();
+                if let (crate::Storage::Vulkan(ws), crate::Storage::Vulkan(xs)) = (&*wst, &*xst) {
+                    let out_f32 = crate::vulkan_backend::nvfp::matvec_f32(
+                        dev,
+                        ws,
+                        self.layout.bscale_off,
+                        self.layout.rscale_off,
+                        self.layout.format == NvfpFormat::Nvfp4,
+                        self.layout.rows,
+                        k,
+                        xs,
+                        xl.start_offset(),
+                        m,
+                    )?;
+                    let t_f32 = crate::tensor::from_storage(
+                        crate::Storage::Vulkan(out_f32),
+                        out_dims,
+                        crate::op::BackpropOp::none(),
+                        false,
+                    );
+                    return if in_dtype == DType::F32 {
+                        Ok(t_f32)
+                    } else {
+                        t_f32.to_dtype(in_dtype)
+                    };
+                }
+            }
+        }
+
         // Prefill / portable fallback: dequantize on device and multiply.
         let compute = if x.device().is_cpu() && in_dtype == DType::BF16 {
             DType::F32
@@ -760,6 +816,31 @@ mod tests {
             let rel = (&y_q - &y_orig)?.sqr()?.sum_all()?.to_scalar::<f32>()?.sqrt()
                 / y_orig.sqr()?.sum_all()?.to_scalar::<f32>()?.sqrt().max(1e-6);
             assert!(rel < max_rel, "{fmt:?} relative error {rel} >= {max_rel}");
+        }
+        Ok(())
+    }
+
+    #[cfg(feature = "vulkan")]
+    #[test]
+    fn nvfp4_and_nvfp8_vulkan_native_matches_cpu() -> Result<()> {
+        let Ok(dev) = Device::new_vulkan(0) else {
+            return Ok(());
+        };
+        let cpu = Device::Cpu;
+        let w = Tensor::randn(0f32, 0.5, (16, 64), &cpu)?;
+        let x = Tensor::randn(0f32, 0.5, (2, 64), &cpu)?;
+        for fmt in [NvfpFormat::Nvfp4, NvfpFormat::Nvfp8] {
+            let qc = NvfpWeight::quantize(&w, fmt)?;
+            let qv = NvfpWeight::quantize(&w.to_device(&dev)?, fmt)?;
+            let dc = qc.dequantize_to(DType::F32)?;
+            let dv = qv.dequantize_to(DType::F32)?.to_device(&cpu)?;
+            let d_dq = (&dc - &dv)?.abs()?.max_all()?.to_scalar::<f32>()?;
+            assert!(d_dq < 1e-6, "{fmt:?} vulkan dq diff {d_dq}");
+
+            let yc = qc.forward(&x)?;
+            let yv = qv.forward(&x.to_device(&dev)?)?.to_device(&cpu)?;
+            let d_mv = (&yc - &yv)?.abs()?.max_all()?.to_scalar::<f32>()?;
+            assert!(d_mv < 1e-4, "{fmt:?} vulkan mv diff {d_mv}");
         }
         Ok(())
     }

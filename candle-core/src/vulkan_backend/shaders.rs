@@ -192,6 +192,164 @@ pub(crate) fn test_force_fused() -> bool {
 /// auto-flushing to stay safely below driver watchdog (TDR / amdgpu job timeout) limits.
 pub(crate) const MAX_IGPU_BATCH_FLOPS: u64 = 1u64 << 34;
 
+/// Adaptive submission FLOPs budget (scales up on discrete GPUs with larger CU/VRAM budgets and
+/// honors `CANDLE_VULKAN_BATCH_FLOPS` overrides).
+pub(crate) fn adaptive_batch_flops(dev: &VulkanDevice) -> u64 {
+    static ENV_LIMIT: OnceLock<Option<u64>> = OnceLock::new();
+    if let Some(v) = *ENV_LIMIT.get_or_init(|| {
+        std::env::var("CANDLE_VULKAN_BATCH_FLOPS")
+            .ok()
+            .and_then(|s| s.trim().parse::<u64>().ok())
+            .filter(|&v| v > 0)
+    }) {
+        return v;
+    }
+    match dev.ctx().device_type {
+        vk::PhysicalDeviceType::DISCRETE_GPU => 1u64 << 36,
+        vk::PhysicalDeviceType::INTEGRATED_GPU => MAX_IGPU_BATCH_FLOPS,
+        _ => MAX_IGPU_BATCH_FLOPS,
+    }
+}
+
+/// Folds a 1D workgroup count `total_groups` into a 2D `[gx, gy, 1]` dispatch grid respecting
+/// `max_workgroup_count[0..2]` so large matrices/sequences never clamp at `65535`.
+pub(crate) fn grid_2d(dev: &VulkanDevice, total_groups: usize) -> [u32; 3] {
+    let total = total_groups.max(1);
+    let limits = dev.limits();
+    let max_x = (limits.max_workgroup_count[0] as usize).clamp(1, 65535);
+    let max_y = (limits.max_workgroup_count[1] as usize).clamp(1, 65535);
+    if total <= max_x {
+        [total as u32, 1, 1]
+    } else {
+        let gy = total.div_ceil(max_x).min(max_y);
+        [max_x as u32, gy as u32, 1]
+    }
+}
+
+fn fnv1a_128(data: &[u8]) -> u128 {
+    let mut h: u128 = 0x6c62_272e_07bb_0142_62b8_2175_6295_c58d;
+    const PRIME: u128 = 0x0000_0000_0100_0000_0000_0000_0000_013b;
+    for &b in data {
+        h ^= b as u128;
+        h = h.wrapping_mul(PRIME);
+    }
+    h
+}
+
+fn vulkan_cache_dir() -> Option<std::path::PathBuf> {
+    if let Some(false) = env_flag(&["CANDLE_VULKAN_SHADER_CACHE"]) {
+        return None;
+    }
+    if let Ok(v) = std::env::var("CANDLE_CACHE_DIR") {
+        if !v.trim().is_empty() {
+            return Some(std::path::PathBuf::from(v).join("vulkan"));
+        }
+    }
+    #[cfg(windows)]
+    {
+        std::env::var_os("LOCALAPPDATA")
+            .or_else(|| std::env::var_os("USERPROFILE"))
+            .map(|p| std::path::PathBuf::from(p).join("candle").join("vulkan"))
+    }
+    #[cfg(not(windows))]
+    {
+        if let Some(xdg) = std::env::var_os("XDG_CACHE_HOME") {
+            if !xdg.is_empty() {
+                return Some(std::path::PathBuf::from(xdg).join("candle").join("vulkan"));
+            }
+        }
+        std::env::var_os("HOME").map(|p| {
+            std::path::PathBuf::from(p)
+                .join(".cache")
+                .join("candle")
+                .join("vulkan")
+        })
+    }
+}
+
+fn write_bytes_atomic(path: &std::path::Path, data: &[u8]) {
+    if data.is_empty() {
+        return;
+    }
+    if let Some(parent) = path.parent() {
+        if std::fs::create_dir_all(parent).is_err() {
+            return;
+        }
+    }
+    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let n = SEQ.fetch_add(1, Ordering::Relaxed);
+    let pid = std::process::id();
+    let tmp = path.with_extension(format!("tmp.{pid}.{n}"));
+    if std::fs::write(&tmp, data).is_ok() && std::fs::rename(&tmp, path).is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+}
+
+/// Loads (or creates) a persistent `VkPipelineCache` keyed by `(vendor_id, device_id, uuid)`.
+pub(crate) fn load_pipeline_cache(
+    device: &ash::Device,
+    vendor_id: u32,
+    device_id: u32,
+    uuid: &[u8; 16],
+) -> (vk::PipelineCache, Option<std::path::PathBuf>) {
+    let mut uuid_hex = String::with_capacity(32);
+    for b in uuid {
+        use std::fmt::Write;
+        let _ = write!(&mut uuid_hex, "{b:02x}");
+    }
+    let path = vulkan_cache_dir()
+        .map(|d| d.join(format!("pipeline_{vendor_id:04x}_{device_id:04x}_{uuid_hex}.bin")));
+    let initial = path
+        .as_ref()
+        .and_then(|p| std::fs::read(p).ok())
+        .unwrap_or_default();
+    let info = vk::PipelineCacheCreateInfo::default().initial_data(&initial);
+    match unsafe { device.create_pipeline_cache(&info, None) } {
+        Ok(pc) => (pc, path),
+        Err(_) => (vk::PipelineCache::null(), None),
+    }
+}
+
+/// Atomically persists the accumulated `VkPipelineCache` blob to disk.
+pub(crate) fn save_pipeline_cache(
+    device: &ash::Device,
+    cache: vk::PipelineCache,
+    path: &std::path::Path,
+) {
+    if let Ok(bytes) = unsafe { device.get_pipeline_cache_data(cache) } {
+        write_bytes_atomic(path, &bytes);
+    }
+}
+
+fn load_spirv_disk(source: &str) -> (Option<std::path::PathBuf>, Option<Vec<u32>>) {
+    let Some(dir) = vulkan_cache_dir() else {
+        return (None, None);
+    };
+    let hash = fnv1a_128(source.as_bytes());
+    let path = dir.join(format!("spv_v1_{hash:032x}.spv"));
+    if let Ok(bytes) = std::fs::read(&path) {
+        if bytes.len() >= 20 && bytes.len() % 4 == 0 {
+            let mut words = Vec::with_capacity(bytes.len() / 4);
+            for chunk in bytes.chunks_exact(4) {
+                words.push(u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]));
+            }
+            // Check SPIR-V magic number 0x07230203 before trusting cached bytes.
+            if words.first() == Some(&0x0723_0203) {
+                return (Some(path), Some(words));
+            }
+        }
+    }
+    (Some(path), None)
+}
+
+fn save_spirv_disk(path: &std::path::Path, words: &[u32]) {
+    let mut bytes = Vec::with_capacity(words.len() * 4);
+    for &w in words {
+        bytes.extend_from_slice(&w.to_le_bytes());
+    }
+    write_bytes_atomic(path, &bytes);
+}
+
 /// Shared GLSL helpers for packed 16-bit (F16 / BF16) reads and race-free paired writes.
 pub(crate) const GLSL_PACK16_HELPERS: &str = r#"
 float ld_f16(uint w, uint idx) {
@@ -384,8 +542,9 @@ impl Kernel {
         let info = [vk::ComputePipelineCreateInfo::default()
             .stage(stage)
             .layout(layout)];
-        let pipeline =
-            match unsafe { d.create_compute_pipelines(vk::PipelineCache::null(), &info, None) } {
+        let pipeline = match unsafe {
+            d.create_compute_pipelines(dev.ctx().pipeline_cache, &info, None)
+        } {
                 Ok(p) => p[0],
                 Err((_, e)) => {
                     unsafe {
@@ -423,7 +582,18 @@ pub(crate) fn kernel(
     if let Some(k) = cache.get(key) {
         return Ok(k.clone());
     }
-    let spirv = glsl_to_spirv(&source())?;
+    let src = source();
+    let (disk_path, cached_spv) = load_spirv_disk(&src);
+    let spirv = match cached_spv {
+        Some(w) => w,
+        None => {
+            let w = glsl_to_spirv(&src)?;
+            if let Some(p) = &disk_path {
+                save_spirv_disk(p, &w);
+            }
+            w
+        }
+    };
     let k = Arc::new(Kernel::new(dev, &spirv, bindings, push_size)?);
     cache.insert(key.to_string(), k.clone());
     Ok(k)
@@ -740,10 +910,11 @@ pub(crate) fn run_with_flops(
             .exec
             .lock()
             .map_err(|_| Error::Msg("vulkan: exec state poisoned".into()))?;
+        let budget = adaptive_batch_flops(dev);
         let igpu_flops_overflow = ctx.default_native
             && exec.recording
             && exec.recorded_flops > 0
-            && exec.recorded_flops.saturating_add(est_flops) > MAX_IGPU_BATCH_FLOPS;
+            && exec.recorded_flops.saturating_add(est_flops) > budget;
         if exec.recording && (exec.recorded_dispatches >= MAX_SETS || igpu_flops_overflow) {
             to_recycle.extend(flush_locked(dev, &mut exec)?);
         }
@@ -905,10 +1076,11 @@ fn record_ops(
             .exec
             .lock()
             .map_err(|_| Error::Msg("vulkan: exec state poisoned".into()))?;
+        let budget = adaptive_batch_flops(dev);
         let igpu_flops_overflow = ctx.default_native
             && exec.recording
             && exec.recorded_flops > 0
-            && exec.recorded_flops.saturating_add(est_flops) > MAX_IGPU_BATCH_FLOPS;
+            && exec.recorded_flops.saturating_add(est_flops) > budget;
         if exec.recording
             && (exec.recorded_dispatches.saturating_add(dispatches) > MAX_SETS
                 || igpu_flops_overflow)
@@ -1859,7 +2031,9 @@ layout(push_constant, std430) uniform PC {{ uint rows; uint cols; uint off; }} p
 {ROW_REDUCE}
 void main() {{
     uint t = gl_LocalInvocationID.x;
-    for (uint row = gl_WorkGroupID.x; row < pc.rows; row += gl_NumWorkGroups.x) {{
+    uint wg_id = gl_WorkGroupID.y * gl_NumWorkGroups.x + gl_WorkGroupID.x;
+    uint wg_stride = gl_NumWorkGroups.x * gl_NumWorkGroups.y;
+    for (uint row = wg_id; row < pc.rows; row += wg_stride) {{
         uint base = pc.off + row * pc.cols;
         uint obase = row * pc.cols;
         float m = -1.0 / 0.0;
@@ -1894,7 +2068,9 @@ layout(push_constant, std430) uniform PC {{ uint rows; uint cols; uint off; uint
 {ROW_REDUCE}
 void main() {{
     uint t = gl_LocalInvocationID.x;
-    for (uint row = gl_WorkGroupID.x; row < pc.rows; row += gl_NumWorkGroups.x) {{
+    uint wg_id = gl_WorkGroupID.y * gl_NumWorkGroups.x + gl_WorkGroupID.x;
+    uint wg_stride = gl_NumWorkGroups.x * gl_NumWorkGroups.y;
+    for (uint row = wg_id; row < pc.rows; row += wg_stride) {{
         uint base = pc.off + row * pc.cols;
         uint obase = row * pc.cols;
         float s = 0.0;
@@ -1927,20 +2103,23 @@ layout(push_constant, std430) uniform PC {{
 {ROW_REDUCE}
 void main() {{
     uint t = gl_LocalInvocationID.x;
-    for (uint row = gl_WorkGroupID.x; row < pc.rows; row += gl_NumWorkGroups.x) {{
+    uint wg_id = gl_WorkGroupID.y * gl_NumWorkGroups.x + gl_WorkGroupID.x;
+    uint wg_stride = gl_NumWorkGroups.x * gl_NumWorkGroups.y;
+    for (uint row = wg_id; row < pc.rows; row += wg_stride) {{
         uint base = pc.off + row * pc.cols;
         uint obase = row * pc.cols;
         float s = 0.0;
-        float s2 = 0.0;
         for (uint c = t; c < pc.cols; c += 256u) {{
-            float v = x[base + c];
-            s += v;
-            s2 += v * v;
+            s += x[base + c];
         }}
-        s = row_sum(s);
-        s2 = row_sum(s2);
-        float mean = s / float(pc.cols);
-        float var = s2 / float(pc.cols) - mean * mean;
+        float mean = row_sum(s) / float(pc.cols);
+        // Two-pass centered variance eliminates catastrophic cancellation on large means (BUG LN-1).
+        float v2 = 0.0;
+        for (uint c = t; c < pc.cols; c += 256u) {{
+            float d = x[base + c] - mean;
+            v2 += d * d;
+        }}
+        float var = row_sum(v2) / float(pc.cols);
         float inv_std = 1.0 / sqrt(var + pc.eps);
         for (uint c = t; c < pc.cols; c += 256u) {{
             y[obase + c] = (x[base + c] - mean) * inv_std * w[pc.off_w + c] + bias[pc.off_b + c];
@@ -1952,8 +2131,7 @@ void main() {{
 }
 
 fn row_groups(dev: &VulkanDevice, rows: usize) -> [u32; 3] {
-    let g = rows.clamp(1, dev.limits().max_workgroup_count[0].min(65535) as usize);
-    [g as u32, 1, 1]
+    grid_2d(dev, rows)
 }
 
 /// `(rows, cols, start_offset)` of a contiguous f32 layout, or `None`.

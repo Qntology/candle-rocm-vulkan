@@ -17,6 +17,7 @@ const KERNELS: &[&str] = &[
     "lm_head_argmax",
     "w8a16",
     "sort",
+    "vis_ops",
 ];
 
 /// Kernels behind Cargo features: (file stem, `CARGO_FEATURE_*` variable). A disabled one is
@@ -30,12 +31,15 @@ const OPTIONAL_KERNELS: &[(&str, &str)] = &[
 const HEADERS: &[&str] = &[
     "common.h",
     "accel_common.h",
+    "accel_mma.h",
+    "accel_async.h",
     "flash_attn_impl.h",
     "turbo_quant_impl.h",
     "delta_rule_impl.h",
     "decoder_ops_impl.h",
     "lm_head_argmax_impl.h",
     "w8a16_impl.h",
+    "vis_ops_impl.h",
 ];
 
 /// Targets used when no GPU is detected, per ROCm track (see `hip-sys/build.rs`).

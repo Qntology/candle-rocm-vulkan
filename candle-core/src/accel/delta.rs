@@ -82,6 +82,15 @@ impl ScanTile {
         4 * self.smem_floats()
     }
 
+    /// Mirrors `GDN_DECODE1_SMEM_FLOATS` (~1.6 KiB for Dk=Dv=128 vs ~24 KiB for `gdn_scan`).
+    pub fn decode1_smem_floats(&self) -> usize {
+        2 * self.dk_cap + self.tv() + 8 + self.threads()
+    }
+
+    pub fn decode1_smem_bytes(&self) -> usize {
+        4 * self.decode1_smem_floats()
+    }
+
     /// Workgroups per multiprocessor the CUDA register allocation targets: the state slice
     /// plus about 48 registers must fit.
     pub fn min_blocks(&self) -> usize {
@@ -113,6 +122,14 @@ impl ScanTile {
         format!(
             "gdn_scan_{sfx}_d{}_c{}x{}_w{}_t{}",
             self.dk_cap, self.cw, self.cpl, self.nw, self.tc
+        )
+    }
+
+    /// Single-token decode kernel symbol, e.g. `gdn_dec1_bf16_d128_c16x2_w8`.
+    pub fn decode1_kernel_name(&self, sfx: &str) -> String {
+        format!(
+            "gdn_dec1_{sfx}_d{}_c{}x{}_w{}",
+            self.dk_cap, self.cw, self.cpl, self.nw
         )
     }
 
@@ -242,11 +259,41 @@ fn parse_scan_name(name: &str) -> Option<(&'static str, ScanTile)> {
     t.is_valid().then_some((ty, t))
 }
 
+fn parse_decode1_name(name: &str) -> Option<(&'static str, ScanTile)> {
+    let rest = name.strip_prefix("gdn_dec1_")?;
+    let mut it = rest.split('_');
+    let ty = ctype(it.next()?)?;
+    let dk_cap = it.next()?.strip_prefix('d')?.parse().ok()?;
+    let (cw, cpl) = it.next()?.strip_prefix('c')?.split_once('x')?;
+    let nw = it.next()?.strip_prefix('w')?.parse().ok()?;
+    if it.next().is_some() {
+        return None;
+    }
+    let t = ScanTile {
+        dk_cap,
+        cw: cw.parse().ok()?,
+        cpl: cpl.parse().ok()?,
+        nw,
+        tc: 1,
+    };
+    t.is_valid().then_some((ty, t))
+}
+
 /// The instantiation line of a Gated DeltaNet kernel name (`gdn_scan_f32_d128_c16x2_w8_t8`,
-/// `gdn_gnorm_bf16`).
+/// `gdn_dec1_f32_d128_c16x2_w8`, `gdn_gnorm_bf16`).
 pub fn gdn_instantiation(name: &str) -> Option<String> {
     if let Some(sfx) = name.strip_prefix("gdn_gnorm_") {
         return Some(format!("GDN_GNORM_KERNEL({name}, {})", ctype(sfx)?));
+    }
+    if let Some((ty, t)) = parse_decode1_name(name) {
+        return Some(format!(
+            "GDN_DECODE1_KERNEL({name}, {ty}, {}, {}, {}, {}, {GDN_REG_CONV_MAX}, {})",
+            t.dk_cap,
+            t.cw,
+            t.cpl,
+            t.nw,
+            t.min_blocks()
+        ));
     }
     let (ty, t) = parse_scan_name(name)?;
     Some(format!(
@@ -278,6 +325,7 @@ pub fn hip_instantiations() -> Vec<String> {
             for t in tiles_for(cap) {
                 if t.is_valid() {
                     v.push(gdn_instantiation(&t.kernel_name(sfx)).unwrap());
+                    v.push(gdn_instantiation(&t.decode1_kernel_name(sfx)).unwrap());
                 }
             }
         }

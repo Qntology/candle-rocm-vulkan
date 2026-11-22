@@ -426,6 +426,30 @@ impl QRocmStorage {
                         )?;
                         return Ok((RocmStorage::new(out, in_dtype, self.device.clone()), dst_shape));
                     }
+                } else if rows <= 64 {
+                    // Tier 2 (8 < rows <= 64): on-chip fused tile GEMM (BM=16, BN=4/block),
+                    // avoiding 32 MiB HBM dequant staging for medium batches & speculative verify.
+                    let fname = format!("w8a16_tile16_{q_sfx}_{x_sfx}");
+                    if let Ok(func) = self.device.get_func(Module::W8A16, &fname) {
+                        let out = self.device.alloc(rows * n * esz)?;
+                        let row_bytes = (k / bs * self.dtype.type_size()) as i64;
+                        let mut args = LaunchArgs::new();
+                        args.ptr(self.data.as_ptr())
+                            .ptr(x_ptr)
+                            .ptr(out.as_mut_ptr())
+                            .u32(k as u32)
+                            .u32(n as u32)
+                            .u32(rows as u32)
+                            .bits(row_bytes as u64);
+                        self.device.launch(
+                            func,
+                            (n.div_ceil(4) as u32, rows.div_ceil(16) as u32, 1),
+                            (32, 4, 1),
+                            0,
+                            &mut args,
+                        )?;
+                        return Ok((RocmStorage::new(out, in_dtype, self.device.clone()), dst_shape));
+                    }
                 } else {
                     // Prefill (rows > 8): dequantize tiles directly to in_dtype into reusable
                     // workspace and run GemmType::{F32,F16,BF16} (F32 compute in rocBLAS/HIP).
@@ -495,6 +519,73 @@ impl QRocmStorage {
         }
 
         self.fwd_legacy(self_shape, storage, layout)
+    }
+
+    /// Single-rounding fused dual-projection SwiGLU `silu(x @ W_gate^T) * (x @ W_up^T)` on ROCm
+    /// for decode / speculative batches (`rows <= 8`). Returns `Ok(None)` when unsupported.
+    pub fn fwd_gate_up_silu(
+        &self,
+        self_shape: &Shape,
+        up: &Self,
+        up_shape: &Shape,
+        storage: &RocmStorage,
+        layout: &Layout,
+    ) -> Result<Option<(RocmStorage, Shape)>> {
+        if self.dtype != up.dtype || self_shape != up_shape {
+            return Ok(None);
+        }
+        let (n, k) = self_shape.dims2()?;
+        let src_shape = layout.shape();
+        if src_shape.rank() < 1 || src_shape.dims()[src_shape.rank() - 1] != k {
+            return Ok(None);
+        }
+        let in_dtype = storage.dtype();
+        let (Some(q_sfx), Some(x_sfx)) = (w8a16_q_suffix(self.dtype), w8a16_x_suffix(in_dtype))
+        else {
+            return Ok(None);
+        };
+        let bs = self.dtype.block_size();
+        if !k.is_multiple_of(bs) || n == 0 || k == 0 {
+            return Ok(None);
+        }
+        let rows = src_shape.elem_count() / k;
+        if rows == 0 || rows > 8 {
+            return Ok(None);
+        }
+        let max_m = if rows == 1 { 1 } else { 8 };
+        let fname = format!("w8a16_gus{max_m}_{q_sfx}_{x_sfx}");
+        let Ok(func) = self.device.get_func(Module::W8A16, &fname) else {
+            return Ok(None);
+        };
+        let esz = in_dtype.size_in_bytes();
+        let x_owned;
+        let x_ptr = if layout.is_contiguous() && (layout.start_offset() * esz).is_multiple_of(16) {
+            unsafe { storage.device_ptr().add(layout.start_offset() * esz) }
+        } else {
+            x_owned = storage.contiguous_copy(layout)?;
+            x_owned.device_ptr()
+        };
+        let out = self.device.alloc(rows * n * esz)?;
+        let row_bytes = (k / bs * self.dtype.type_size()) as i64;
+        let mut args = LaunchArgs::new();
+        args.ptr(self.data.as_ptr())
+            .ptr(up.data.as_ptr())
+            .ptr(x_ptr)
+            .ptr(out.as_mut_ptr())
+            .u32(k as u32)
+            .u32(n as u32)
+            .u32(rows as u32)
+            .bits(row_bytes as u64);
+        self.device
+            .launch(func, (n.div_ceil(4) as u32, 1, 1), (32, 4, 1), 0, &mut args)?;
+        let mut dst_dims = src_shape.dims().to_vec();
+        dst_dims.pop();
+        dst_dims.push(n);
+        let dst_shape = Shape::from(dst_dims);
+        Ok(Some((
+            RocmStorage::new(out, in_dtype, self.device.clone()),
+            dst_shape,
+        )))
     }
 
     pub fn fwd(

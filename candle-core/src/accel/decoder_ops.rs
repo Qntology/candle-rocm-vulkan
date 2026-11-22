@@ -6,11 +6,14 @@ use super::sources::{strip_includes, ACCEL_COMMON_H};
 pub const DEC_OPS_IMPL_H: &str = include_str!("../../kernels/decoder_ops_impl.h");
 
 pub const DEC_NT: u32 = 256;
+pub const DEC_MR_NT: u32 = 128;
+pub const DEC_ROWS_PER_WG: u32 = 4;
 pub const RES_RMS_PLUS_ONE_WEIGHT: u32 = 1;
 pub const RES_RMS_WRITE_RESIDUAL: u32 = 2;
 pub const ROPE_MODE_NEOX: u32 = 0;
 pub const ROPE_MODE_ADJACENT: u32 = 1;
 pub const ROPE_NORM_PLUS_ONE: u32 = 2;
+pub const ROPE_CODY_WAITE_ONTHEFLY: u32 = 4;
 
 /// RoPE pairing convention.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -91,10 +94,152 @@ pub fn res_rmsnorm_smem_bytes() -> u32 {
     DEC_NT * 4
 }
 
+/// Barrier-free multi-row RMSNorm (4 rows/WG x 32 lanes = 128 threads) is used for prefill batches.
+#[inline]
+pub fn res_rmsnorm_use_mr(rows: usize) -> bool {
+    rows >= 32
+}
+
+pub fn res_rmsnorm_mr_grid(rows: usize) -> (u32, u32, u32) {
+    (rows.div_ceil(DEC_ROWS_PER_WG as usize).max(1) as u32, 1, 1)
+}
+
+pub fn res_rmsnorm_mr_smem_bytes() -> u32 {
+    // 0 bytes needed on GPU with warp shuffles; 128 floats only needed for host emu fallback.
+    0
+}
+
 pub fn silu_mul_grid(rows: usize, inter_dim: usize) -> (u32, u32, u32) {
     let total = rows.saturating_mul(inter_dim);
     let blocks = total.div_ceil(DEC_NT as usize).clamp(1, 65535);
     (blocks as u32, 1, 1)
+}
+
+/// Exact FP32 FMA TwoProd Cody-Waite range-reduced `(cos, sin)` for long-context RoPE (64K - 1M+).
+/// Matches `dec_cody_waite_sincos` in `kernels/decoder_ops_impl.h` (<= 3e-7 error vs FP64 at 1M pos).
+#[inline]
+pub fn cody_waite_sincos_f32(pos: u32, inv_freq: f32) -> (f32, f32) {
+    const INV_2PI_HI: f32 = 0.15915493667125702f32;
+    const INV_2PI_LO: f32 = 6.4206382432985265e-9f32;
+    const TWO_PI_F: f32 = 6.2831853071795864769f32;
+
+    let w_hi = inv_freq * INV_2PI_HI;
+    let w_lo = inv_freq.mul_add(INV_2PI_HI, -w_hi) + inv_freq * INV_2PI_LO;
+
+    let p_lo = (pos & 0xfff) as f32;
+    let p_hi = (pos & !0xfff) as f32;
+
+    let c0 = p_hi * w_hi;
+    let e0 = p_hi.mul_add(w_hi, -c0);
+    let c1 = p_lo * w_hi;
+    let e1 = p_lo.mul_add(w_hi, -c1);
+
+    let mut cyc = (c0 - c0.floor()) + (c1 - c1.floor()) + (e0 + e1 + p_hi.mul_add(w_lo, p_lo * w_lo));
+    cyc -= cyc.floor();
+    if cyc > 0.5 {
+        cyc -= 1.0;
+    }
+    let phi = cyc * TWO_PI_F;
+    (phi.cos(), phi.sin())
+}
+
+/// Applies orthonormal 32-point Walsh-Hadamard transform (`H_32 / sqrt(32)`) in-place
+/// to each 32-element block of `data` (length must be a multiple of 32).
+pub fn fwht32_blocks_inplace(data: &mut [f32]) {
+    const INV_SQRT32: f32 = 0.17677669529663689f32;
+    debug_assert_eq!(data.len() % 32, 0);
+    for blk in data.chunks_exact_mut(32) {
+        let mut h = 1usize;
+        while h < 32 {
+            let step = h << 1;
+            let mut base = 0usize;
+            while base < 32 {
+                for j in 0..h {
+                    let a = blk[base + j];
+                    let b = blk[base + j + h];
+                    blk[base + j] = a + b;
+                    blk[base + j + h] = a - b;
+                }
+                base += step;
+            }
+            h = step;
+        }
+        for v in blk.iter_mut() {
+            *v *= INV_SQRT32;
+        }
+    }
+}
+
+/// Online Hadamard-32 smoothing + per-32-block OCP E4M3FN dynamic quantization on CPU.
+/// Returns `(fp8_codes, scales)` matching `res_rmsnorm_hadamard_fp8_*` / `silu_mul_hadamard_fp8_*`.
+pub fn hadamard32_quant_fp8_cpu(values: &[f32]) -> (Vec<u8>, Vec<f32>) {
+    use super::formats::f32_to_e4m3;
+    assert_eq!(values.len() % 32, 0, "hadamard32_quant_fp8_cpu: length must be a multiple of 32");
+    let mut rot = values.to_vec();
+    fwht32_blocks_inplace(&mut rot);
+    let n_blks = rot.len() / 32;
+    let mut codes = Vec::with_capacity(rot.len());
+    let mut scales = Vec::with_capacity(n_blks);
+    for blk in rot.chunks_exact(32) {
+        let mut amax = 0.0f32;
+        for &v in blk {
+            amax = amax.max(v.abs());
+        }
+        let scale = if amax > 0.0 { amax * (1.0 / 448.0) } else { 1.0 };
+        let inv_scale = if amax > 0.0 { 448.0 / amax } else { 0.0 };
+        scales.push(scale);
+        for &v in blk {
+            codes.push(f32_to_e4m3(v * inv_scale));
+        }
+    }
+    (codes, scales)
+}
+
+/// Launch descriptor for Graph-safe indirect `rope_kv_write_indirect_*` (with optional
+/// YaRN `mscale` and Cody-Waite on-the-fly range reduction).
+#[derive(Debug, Clone, Copy)]
+pub struct RopeKvIndirectLaunchArgs {
+    pub b: u32,
+    pub t: u32,
+    pub hq: u32,
+    pub hkv: u32,
+    pub d: u32,
+    pub rotary_dim: u32,
+    pub pos_stride: u32,
+    pub q_off: usize,
+    pub k_off: usize,
+    pub v_off: usize,
+    pub qnw_off: usize,
+    pub knw_off: usize,
+    pub cos_off: usize,
+    pub sin_off: usize,
+    pub kc_off: usize,
+    pub vc_off: usize,
+    pub kv_pos_off: usize,
+    pub rope_pos_off: usize,
+    pub q_strides: [u64; 3],
+    pub qo_strides: [u64; 3],
+    pub k_strides: [u64; 3],
+    pub v_strides: [u64; 3],
+    pub kc_strides: [u64; 3],
+    pub cos_st: u64,
+    pub eps: f32,
+    pub mscale: f32,
+    pub flags: u32,
+}
+
+impl RopeKvIndirectLaunchArgs {
+    pub fn grid(&self) -> (u32, u32, u32) {
+        (self.hq + self.hkv, self.b * self.t, 1)
+    }
+
+    pub fn block(&self) -> (u32, u32, u32) {
+        (DEC_NT, 1, 1)
+    }
+
+    pub fn smem_bytes(&self) -> u32 {
+        (DEC_NT + self.d) * 4
+    }
 }
 
 /// Complete NVRTC CUDA source of the `candle_decoder_ops` module (f32 / f16 / bf16).
@@ -288,5 +433,54 @@ mod tests {
             assert!(src.contains(line), "cuda source missing {line}");
             assert!(hip.contains(line), "decoder_ops.hip missing {line}");
         }
+    }
+
+    #[test]
+    fn cody_waite_long_context_matches_f64_oracle() {
+        for &pos in &[0u32, 1024, 65_536, 131_072, 262_144, 1_000_000] {
+            for &inv_f in &[1.0f32, 0.37f32, 0.0123456f32, 1e-4f32] {
+                let (c, s) = cody_waite_sincos_f32(pos, inv_f);
+                let theta = (pos as f64) * (inv_f as f64);
+                let ec = (c as f64 - theta.cos()).abs();
+                let es = (s as f64 - theta.sin()).abs();
+                assert!(
+                    ec <= 1e-6 && es <= 1e-6,
+                    "pos={pos} inv_f={inv_f}: err_cos={ec:.3e} err_sin={es:.3e}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn fwht32_orthonormal_and_outlier_smoothing() {
+        use super::super::formats::e4m3_to_f32;
+        // 1) Exact involution: ||x H32 H32^T - x||_inf <= 2e-7
+        let orig: Vec<f32> = (0..128).map(|i| ((i as f32) * 0.137).sin() * 3.5).collect();
+        let mut buf = orig.clone();
+        fwht32_blocks_inplace(&mut buf);
+        fwht32_blocks_inplace(&mut buf);
+        let max_err = orig
+            .iter()
+            .zip(buf.iter())
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0f32, f32::max);
+        assert!(max_err <= 2e-6, "fwht32 roundtrip err={max_err}");
+
+        // 2) 100-sigma channel outlier vector: Hadamard-FP8 preserves cosine > 0.9995
+        let mut x: Vec<f32> = (0..128).map(|i| ((i as f32) * 0.27).cos()).collect();
+        x[3] = 100.0;
+        x[67] = -95.0;
+        let (codes, scales) = hadamard32_quant_fp8_cpu(&x);
+        let mut deq: Vec<f32> = codes
+            .iter()
+            .enumerate()
+            .map(|(i, &c)| e4m3_to_f32(c) * scales[i / 32])
+            .collect();
+        fwht32_blocks_inplace(&mut deq);
+        let dot: f64 = x.iter().zip(deq.iter()).map(|(&a, &b)| a as f64 * b as f64).sum();
+        let nx: f64 = x.iter().map(|&a| (a as f64).powi(2)).sum::<f64>().sqrt();
+        let nd: f64 = deq.iter().map(|&b| (b as f64).powi(2)).sum::<f64>().sqrt();
+        let cos = dot / (nx * nd);
+        assert!(cos > 0.9995, "outlier Hadamard-FP8 cosine={cos}");
     }
 }

@@ -6,7 +6,7 @@
 //! Kernel parameters go through a small storage buffer because many devices only offer 128
 //! bytes of push constants; indices are 32-bit.
 
-use super::shaders::{kernel, run};
+use super::shaders::{grid_2d, kernel, run, GLSL_PACK16_HELPERS};
 use super::{VulkanDevice, VulkanStorage};
 use crate::accel::attention::{self as att, AttnGeometry, FaExtra, FaPlan, FlashAttnParams};
 use crate::accel::profile::AccelProfile;
@@ -19,10 +19,12 @@ impl VulkanDevice {
     /// Fused attention / TurboQuant profile of this device (see `candle_core::accel::profile`).
     pub fn accel_profile(&self) -> AccelProfile {
         let l = self.limits();
-        AccelProfile::vulkan(
+        AccelProfile::vulkan_with_caps(
             self.name(),
             l.max_shared_memory as usize,
             l.max_invocations as usize,
+            l.subgroup_arithmetic,
+            l.compute_units_est,
         )
     }
 }
@@ -1353,6 +1355,114 @@ impl VulkanStorage {
         }
         Ok(out)
     }
+
+    /// Native Vulkan on-chip `O(d log d)` Randomized Walsh-Hadamard Transform (`d <= 256`,
+    /// power-of-two). Matches `RocmStorage::tq_fwht` / `CudaStorage::tq_fwht` semantics.
+    pub fn tq_fwht(
+        &self,
+        x_off: usize,
+        signs: &Self,
+        signs_off: usize,
+        rows: usize,
+        dim: usize,
+        forward: bool,
+    ) -> Result<Self> {
+        if dim == 0 || !dim.is_power_of_two() || dim > 256 {
+            bail!("vulkan tq_fwht: dim {dim} must be a power of two <= 256")
+        }
+        let tag = match self.dtype {
+            DType::F32 => "f32",
+            DType::F16 => "f16",
+            DType::BF16 => "bf16",
+            other => bail!("vulkan tq_fwht: unsupported input dtype {other:?}"),
+        };
+        let dev = &self.device;
+        let out = dev.alloc_buffer(rows * dim, DType::F32)?;
+        if rows > 0 {
+            let key = format!("accel_tq_fwht_{tag}");
+            let dt = self.dtype;
+            let kern = kernel(dev, &key, 4, 0, || tq_fwht_source(dt))?;
+            let inv_sqrt_d = 1.0f32 / (dim as f32).sqrt();
+            let prm = params(
+                dev,
+                &[
+                    rows as u32,
+                    dim as u32,
+                    fits(x_off)?,
+                    fits(signs_off)?,
+                    u32::from(forward),
+                    inv_sqrt_d.to_bits(),
+                ],
+            )?;
+            run(dev, &kern, &[self, signs, &out, &prm], &[], grid_2d(dev, rows))?;
+        }
+        Ok(out)
+    }
+}
+
+fn tq_fwht_source(dtype: DType) -> String {
+    let (decl, ld_x) = match dtype {
+        DType::F32 => ("float", "x[idx]"),
+        DType::F16 => ("uint", "ld_f16(x[idx >> 1u], idx)"),
+        DType::BF16 => ("uint", "ld_bf16(x[idx >> 1u], idx)"),
+        _ => unreachable!(),
+    };
+    format!(
+        r#"#version 450
+layout(local_size_x = 128) in;
+layout(set = 0, binding = 0) readonly buffer Xb {{ {decl} x[]; }};
+layout(set = 0, binding = 1) readonly buffer Sb {{ uint sign_bits[]; }};
+layout(set = 0, binding = 2) buffer Ob {{ float y[]; }};
+layout(set = 0, binding = 3) readonly buffer Pb {{ uint prm[]; }};
+{GLSL_PACK16_HELPERS}
+float load_x(uint idx) {{ return {ld_x}; }}
+float sign_mul(float v, uint s_off, uint j) {{
+    return (((sign_bits[s_off + (j >> 5u)] >> (j & 31u)) & 1u) != 0u) ? -v : v;
+}}
+shared float buf[256];
+void main() {{
+    uint t = gl_LocalInvocationID.x;
+    uint rows = prm[0];
+    uint d = prm[1];
+    uint x_off = prm[2];
+    uint s_off = prm[3];
+    bool fwd = prm[4] != 0u;
+    float inv_sq = uintBitsToFloat(prm[5]);
+    uint wg_id = gl_WorkGroupID.y * gl_NumWorkGroups.x + gl_WorkGroupID.x;
+    uint wg_stride = gl_NumWorkGroups.x * gl_NumWorkGroups.y;
+    for (uint r = wg_id; r < rows; r += wg_stride) {{
+        uint base = x_off + r * d;
+        for (uint i = t; i < d; i += 128u) {{
+            float v = load_x(base + i);
+            if (fwd) {{ v = sign_mul(v, s_off, i); }}
+            buf[i] = v;
+        }}
+        barrier();
+        for (uint len = 1u; len < d; len <<= 1u) {{
+            uint half_d = d >> 1u;
+            for (uint p = t; p < half_d; p += 128u) {{
+                uint blk = p / len;
+                uint off = p - blk * len;
+                uint i0 = blk * (len << 1u) + off;
+                uint i1 = i0 + len;
+                float a = buf[i0];
+                float b = buf[i1];
+                buf[i0] = a + b;
+                buf[i1] = a - b;
+            }}
+            barrier();
+        }}
+        uint obase = r * d;
+        for (uint i = t; i < d; i += 128u) {{
+            float v = buf[i] * inv_sq;
+            if (!fwd) {{ v = sign_mul(v, s_off, i); }}
+            y[obase + i] = v;
+        }}
+        barrier();
+    }}
+}}
+"#
+    )
 }
 
 #[cfg(test)]
@@ -1391,5 +1501,8 @@ mod tests {
         ));
         validate(&format!("{}{}{}{}", header(), COMMON, REDUCE, TQ_ATTN));
         validate(&format!("{}{}{}{}", header(), COMMON, REDUCE, TQ_ATTN_NVFP4));
+        for dt in [DType::F32, DType::F16, DType::BF16] {
+            validate(&tq_fwht_source(dt));
+        }
     }
 }

@@ -456,10 +456,85 @@ impl RowCodec {
 
     /// Reconstructs one vector in the rotated domain (QJL correction included).
     pub fn dequantize_row(&self, row: &[u32], out: &mut [f32]) {
+        const FP4_LUT: [f32; 16] = [
+            0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0, -0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0,
+            -6.0,
+        ];
+        #[cfg(target_arch = "x86_64")]
+        #[target_feature(enable = "avx2")]
+        unsafe fn unpack_nvfp4_16_avx2(w0: u32, w1: u32, eff: f32, dst: &mut [f32]) {
+            let s = std::arch::x86_64::_mm256_set1_ps(eff);
+            let a0 = [
+                FP4_LUT[(w0 & 0xf) as usize],
+                FP4_LUT[((w0 >> 4) & 0xf) as usize],
+                FP4_LUT[((w0 >> 8) & 0xf) as usize],
+                FP4_LUT[((w0 >> 12) & 0xf) as usize],
+                FP4_LUT[((w0 >> 16) & 0xf) as usize],
+                FP4_LUT[((w0 >> 20) & 0xf) as usize],
+                FP4_LUT[((w0 >> 24) & 0xf) as usize],
+                FP4_LUT[((w0 >> 28) & 0xf) as usize],
+            ];
+            let a1 = [
+                FP4_LUT[(w1 & 0xf) as usize],
+                FP4_LUT[((w1 >> 4) & 0xf) as usize],
+                FP4_LUT[((w1 >> 8) & 0xf) as usize],
+                FP4_LUT[((w1 >> 12) & 0xf) as usize],
+                FP4_LUT[((w1 >> 16) & 0xf) as usize],
+                FP4_LUT[((w1 >> 20) & 0xf) as usize],
+                FP4_LUT[((w1 >> 24) & 0xf) as usize],
+                FP4_LUT[((w1 >> 28) & 0xf) as usize],
+            ];
+            let v0 = std::arch::x86_64::_mm256_mul_ps(
+                std::arch::x86_64::_mm256_loadu_ps(a0.as_ptr()),
+                s,
+            );
+            let v1 = std::arch::x86_64::_mm256_mul_ps(
+                std::arch::x86_64::_mm256_loadu_ps(a1.as_ptr()),
+                s,
+            );
+            std::arch::x86_64::_mm256_storeu_ps(dst.as_mut_ptr(), v0);
+            std::arch::x86_64::_mm256_storeu_ps(dst.as_mut_ptr().add(8), v1);
+        }
         let d = self.layout.dim;
         let (r0, r1) = self.rsc(row);
-        for (j, o) in out.iter_mut().enumerate().take(d) {
-            *o = r0 * self.elem(row, j);
+        match self.format {
+            QuantFormat::Nvfp4 if d.is_multiple_of(16) => {
+                let aux = &row[self.layout.code_words..];
+                for blk in 0..d / 16 {
+                    let eff = r0 * e4m3_to_f32(get_byte(aux, blk));
+                    let w0 = row[blk * 2];
+                    let w1 = row[blk * 2 + 1];
+                    let dst = &mut out[blk * 16..(blk + 1) * 16];
+                    #[cfg(target_arch = "x86_64")]
+                    if std::arch::is_x86_feature_detected!("avx2") {
+                        unsafe { unpack_nvfp4_16_avx2(w0, w1, eff, dst) };
+                        continue;
+                    }
+                    for i in 0..8 {
+                        dst[i] = FP4_LUT[((w0 >> (i * 4)) & 0xf) as usize] * eff;
+                        dst[8 + i] = FP4_LUT[((w1 >> (i * 4)) & 0xf) as usize] * eff;
+                    }
+                }
+            }
+            QuantFormat::Mxfp4 if d.is_multiple_of(32) => {
+                let aux = &row[self.layout.code_words..];
+                for blk in 0..d / 32 {
+                    let eff = r0 * e8m0_to_f32(get_byte(aux, blk));
+                    let dst = &mut out[blk * 32..(blk + 1) * 32];
+                    for wi in 0..4 {
+                        let w = row[blk * 4 + wi];
+                        let sub = &mut dst[wi * 8..(wi + 1) * 8];
+                        for i in 0..8 {
+                            sub[i] = FP4_LUT[((w >> (i * 4)) & 0xf) as usize] * eff;
+                        }
+                    }
+                }
+            }
+            _ => {
+                for (j, o) in out.iter_mut().enumerate().take(d) {
+                    *o = r0 * self.elem(row, j);
+                }
+            }
         }
         if let Some(s) = &self.qjl {
             let c = r0 * r1 * QJL_CONST / d as f32;
@@ -613,7 +688,8 @@ pub fn tq_tile_smem_bytes(d: usize, br: usize, bc: usize) -> usize {
 }
 
 /// Launch plan for cooperative tiled prefill (`tq_tile*` / `tq_tilep*`) when `lq > FA_DECODE_MAX_Q`
-/// and keys are non-`TurboProd`. Returns `(kernel_name, br, bc, smem_bytes)` when eligible.
+/// (supports all key formats including unbiased `TurboProd` with inline QJL residual scoring).
+/// Returns `(kernel_name, br, bc, smem_bytes)` when eligible.
 pub fn tq_tile_launch(
     args: &TqAttnArgs,
     version: super::config::FlashAttnVersion,
@@ -622,10 +698,8 @@ pub fn tq_tile_launch(
 ) -> Option<(String, usize, usize, usize)> {
     use super::attention::{tile_config, FA_DECODE_MAX_Q, FA_MAX_HEAD_DIM};
     use super::config::FlashAttnVersion;
-    use super::formats::mode;
     if args.lq <= FA_DECODE_MAX_Q
         || args.d > FA_MAX_HEAD_DIM
-        || args.k.mode == mode::TURBO_PROD
         || version == FlashAttnVersion::V1
     {
         return None;

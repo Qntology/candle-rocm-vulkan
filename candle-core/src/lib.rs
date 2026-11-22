@@ -103,6 +103,7 @@ pub mod utils;
 pub mod decoder_ops;
 pub mod delta_rule;
 pub mod lm_head;
+pub mod vis_ops;
 mod variable;
 
 #[cfg(feature = "cudnn")]

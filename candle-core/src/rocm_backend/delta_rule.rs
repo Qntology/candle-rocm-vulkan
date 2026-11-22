@@ -55,7 +55,12 @@ impl RocmStorage {
         let cs_out = dev.alloc((p.b * c * km1).max(1) * esz(dtype))?;
         let s_out = dev.alloc((p.b * p.hv * p.dk * p.dv).max(1) * 4)?;
         if p.b > 0 && p.hv > 0 && p.dv > 0 {
-            let func = dev.get_func(Module::DeltaRule, &tile.kernel_name(sfx))?;
+            let (kname, smem_bytes) = if p.t == 1 {
+                (tile.decode1_kernel_name(sfx), tile.decode1_smem_bytes())
+            } else {
+                (tile.kernel_name(sfx), tile.smem_bytes())
+            };
+            let func = dev.get_func(Module::DeltaRule, &kname)?;
             let mut la = LaunchArgs::new();
             la.ptr(self.ptr_at(p.x[0]))
                 .ptr(conv_state.map(|s| s.ptr_at(p.cs_off)).unwrap_or(null()))
@@ -88,7 +93,7 @@ impl RocmStorage {
                 func,
                 tile.grid(p.b, p.hv, p.dv),
                 (tile.threads() as u32, 1, 1),
-                tile.smem_bytes() as u32,
+                smem_bytes as u32,
                 &mut la,
             )?;
         }

@@ -48,6 +48,15 @@ pub struct FlashAttnConfig {
     /// when `fused == Some(true)` but the device has no fused kernels). Self-checks use it so
     /// that they test the kernels, not the fallback.
     pub strict: bool,
+    /// Use Split-Invariant deterministic binary-tree LSE combine (`fa_combine_tree_*`).
+    pub deterministic: bool,
+    /// Per-head learned Attention Sink logits `[heads_q]` (F32): injects `exp(sink_h - m)`
+    /// into the softmax denominator without allocating dummy K/V tokens.
+    pub sink_logits: Option<Tensor>,
+    /// Speculative decoding tree mask `[batch, seq_q]` (U64 bitmask over the trailing `seq_q` tokens).
+    pub q_tree_mask: Option<Tensor>,
+    /// Multimodal / PrefixLM bidirectional spans `[batch, 2]` (U32 `[start, end)` per sequence).
+    pub mm_prefix_ranges: Option<Tensor>,
 }
 
 impl FlashAttnConfig {
@@ -64,6 +73,10 @@ impl FlashAttnConfig {
             split_kv: None,
             fused: None,
             strict: false,
+            deterministic: false,
+            sink_logits: None,
+            q_tree_mask: None,
+            mm_prefix_ranges: None,
         }
     }
 
@@ -113,6 +126,26 @@ impl FlashAttnConfig {
     pub fn descale(mut self, k: f32, v: f32) -> Self {
         self.k_descale = k;
         self.v_descale = v;
+        self
+    }
+
+    pub fn deterministic(mut self, deterministic: bool) -> Self {
+        self.deterministic = deterministic;
+        self
+    }
+
+    pub fn sink_logits(mut self, sink_logits: &Tensor) -> Self {
+        self.sink_logits = Some(sink_logits.clone());
+        self
+    }
+
+    pub fn q_tree_mask(mut self, q_tree_mask: &Tensor) -> Self {
+        self.q_tree_mask = Some(q_tree_mask.clone());
+        self
+    }
+
+    pub fn mm_prefix_ranges(mut self, mm_prefix_ranges: &Tensor) -> Self {
+        self.mm_prefix_ranges = Some(mm_prefix_ranges.clone());
         self
     }
 
@@ -204,6 +237,7 @@ impl FlashAttnOp {
             .unwrap_or(auto_version);
         p.split_kv = self.cfg.split_kv.unwrap_or(conf.flash_attn.split_kv);
         p.gqa_pack = conf.flash_attn.gqa_decode;
+        p.deterministic = self.cfg.deterministic;
         p
     }
 
@@ -506,6 +540,12 @@ fn metal_sdpa(q: &Tensor, k: &Tensor, v: &Tensor, cfg: &FlashAttnConfig) -> Resu
 }
 
 fn run(q: &Tensor, k: &Tensor, v: &Tensor, op: &FlashAttnOp) -> Result<Tensor> {
+    let has_extended_mask = op.cfg.sink_logits.is_some()
+        || op.cfg.q_tree_mask.is_some()
+        || op.cfg.mm_prefix_ranges.is_some();
+    if has_extended_mask {
+        return unfused(q, k, v, op);
+    }
     let fused = op
         .cfg
         .fused
@@ -989,19 +1029,76 @@ fn unfused_dense(
         s = ((s / cap as f64)?.tanh()? * cap as f64)?;
     }
     // additive mask, ALiBi distances and row validity, built on the host
+    let prefix_span: Option<(usize, usize)> = match &cfg.mm_prefix_ranges {
+        Some(pr) => {
+            let pr_u32 = pr.to_device(&Device::Cpu)?.to_dtype(DType::U32)?;
+            let flat = pr_u32.flatten_all()?.to_vec1::<u32>()?;
+            let bi = batch_index.unwrap_or(0);
+            if flat.len() >= (bi + 1) * 2 {
+                Some((flat[bi * 2] as usize, flat[bi * 2 + 1] as usize))
+            } else if flat.len() >= 2 {
+                Some((flat[0] as usize, flat[1] as usize))
+            } else {
+                None
+            }
+        }
+        None => None,
+    };
+    let tree_masks: Option<Vec<u64>> = match &cfg.q_tree_mask {
+        Some(tm) => {
+            let flat = tm
+                .to_device(&Device::Cpu)?
+                .to_dtype(DType::I64)?
+                .flatten_all()?
+                .to_vec1::<i64>()?;
+            let bi = batch_index.unwrap_or(0);
+            let start = bi * lq;
+            if flat.len() >= start + lq {
+                Some(flat[start..start + lq].iter().map(|&x| x as u64).collect())
+            } else {
+                None
+            }
+        }
+        None => None,
+    };
+    let draft_start = lk.saturating_sub(lq);
+
     let mut mask = vec![0f32; lq * lk];
     let mut dist = vec![0f32; lq * lk];
     let mut valid = vec![0f32; lq];
     for i in 0..lq {
         let (lo, hi) = att::key_range(i, lq, lk, wl, wr);
-        valid[i] = if lo < hi { 1.0 } else { 0.0 };
         let pos = i as i64 + lk as i64 - lq as i64;
+        let mut row_has_key = false;
         for j in 0..lk {
-            if j < lo || j >= hi {
+            let mut visible = j >= lo && j < hi;
+            if let Some((ps, pe)) = prefix_span {
+                if pos >= ps as i64 && pos < pe as i64 && j >= ps && j < pe {
+                    visible = true;
+                }
+            }
+            if visible {
+                if let Some(ref tms) = tree_masks {
+                    if j >= draft_start {
+                        let bit = j - draft_start;
+                        if bit < 64 && ((tms[i] >> bit) & 1) == 0 {
+                            visible = false;
+                        }
+                    }
+                }
+            }
+            if !visible {
                 mask[i * lk + j] = -1e30;
+            } else {
+                row_has_key = true;
             }
             dist[i * lk + j] = (pos - j as i64).abs() as f32;
         }
+        valid[i] = if row_has_key || cfg.sink_logits.is_some() {
+            1.0
+        } else {
+            0.0
+        };
     }
     s = s.broadcast_add(&Tensor::from_vec(mask, (1, 1, lq, lk), dev)?)?;
     if let Some(slopes) = alibi {
@@ -1015,10 +1112,260 @@ fn unfused_dense(
         let dist = Tensor::from_vec(dist, (1, 1, lq, lk), dev)?;
         s = s.broadcast_sub(&slopes.broadcast_mul(&dist)?)?;
     }
-    let p = crate::ops::softmax_last_dim(&s)?;
+    let p = if let Some(sink) = &cfg.sink_logits {
+        // Exact Attention Sink denominator: append sink_h as a virtual logit with zero V contribution.
+        let sink_col = sink
+            .to_device(dev)?
+            .to_dtype(DType::F32)?
+            .reshape((1, hq, 1, 1))?
+            .broadcast_as((b, hq, lq, 1))?;
+        let s_ext = Tensor::cat(&[&s, &sink_col], D::Minus1)?;
+        let p_ext = crate::ops::softmax_last_dim(&s_ext)?;
+        p_ext.narrow(D::Minus1, 0, lk)?
+    } else {
+        crate::ops::softmax_last_dim(&s)?
+    };
     let o = p.matmul(&v32)?;
     let o = o.broadcast_mul(&Tensor::from_vec(valid, (1, 1, lq, 1), dev)?)?;
     o.transpose(1, 2)?.contiguous()?.to_dtype(q.dtype())
+}
+
+/// Native O(1) device block-table paged varlen FlashAttention (zero D2H sync & zero `Tensor::cat`
+/// on CUDA / ROCm; supports unlimited pages, `mm_prefix_ranges`, and `sink_logits`).
+///
+/// - `q`: `(total_q, hq, d)`
+/// - `k_pool`, `v_pool`: `(num_blocks, page_size, hkv, d)`
+/// - `seqlens_q`, `seqlens_k`: `(batch + 1,)` cumulative token offsets
+/// - `block_table`: `(batch, max_blocks_per_seq)` physical block indices
+#[allow(clippy::too_many_arguments)]
+pub fn flash_attn_varlen_paged_block_table(
+    q: &Tensor,
+    k_pool: &Tensor,
+    v_pool: &Tensor,
+    seqlens_q: &Tensor,
+    seqlens_k: &Tensor,
+    block_table: &Tensor,
+    max_seqlen_q: usize,
+    max_seqlen_k: usize,
+    page_block_size: usize,
+    cfg: &FlashAttnConfig,
+) -> Result<Tensor> {
+    #[allow(unused_variables)]
+    let (total_q, hq, d) = q.dims3()?;
+    let (_, page, hkv, dk) = k_pool.dims4()?;
+    if page != page_block_size || dk != d {
+        bail!(
+            "flash-attn-bt: k_pool page/d ({page}, {dk}) != ({page_block_size}, {d})"
+        );
+    }
+    #[allow(unused_variables)]
+    let (batch_bt, bt_stride) = block_table.dims2()?;
+    let n_seq = seqlens_q.dims1()?;
+    let batch = n_seq.saturating_sub(1);
+    if batch_bt < batch {
+        bail!("flash-attn-bt: block_table rows {batch_bt} < batch {batch}");
+    }
+
+    #[cfg(any(feature = "cuda", feature = "rocm"))]
+    {
+        let fused = cfg
+            .fused
+            .unwrap_or_else(|| accel::config().flash_attn_allowed(q.device()));
+        if fused
+            && matches!(q.device(), Device::Cuda(_) | Device::Rocm(_))
+            && d <= att::FA_MAX_HEAD_DIM
+            && k_pool.dtype() == q.dtype()
+            && v_pool.dtype() == q.dtype()
+            && cfg.alibi_slopes.is_none()
+            && cfg.q_tree_mask.is_none()
+            && matches!(q.dtype(), DType::F32 | DType::F16 | DType::BF16)
+        {
+            let dev = q.device();
+            let q_c = q.contiguous()?;
+            let k_c = k_pool.contiguous()?;
+            let v_c = v_pool.contiguous()?;
+            let cq_c = seqlens_q.to_device(dev)?.to_dtype(DType::U32)?.contiguous()?;
+            let ck_c = seqlens_k.to_device(dev)?.to_dtype(DType::U32)?.contiguous()?;
+            let bt_c = block_table.to_device(dev)?.to_dtype(DType::I32)?.contiguous()?;
+            let pfx_c = match &cfg.mm_prefix_ranges {
+                Some(t) => Some(t.to_device(dev)?.to_dtype(DType::U32)?.contiguous()?),
+                None => None,
+            };
+            let sink_c = match &cfg.sink_logits {
+                Some(t) => Some(t.to_device(dev)?.to_dtype(DType::F32)?.contiguous()?),
+                None => None,
+            };
+            let (wl, wr) = cfg.window_i32();
+            let mut p = FlashAttnParams::new(cfg.softmax_scale);
+            p.window_left = wl;
+            p.window_right = wr;
+            p.softcap = cfg.softcap.unwrap_or(0.0);
+
+            let out_storage = match dev {
+                #[cfg(feature = "cuda")]
+                Device::Cuda(_) => {
+                    let (qs, ql) = q_c.storage_and_layout();
+                    let (ks, kl) = k_c.storage_and_layout();
+                    let (vs, vl) = v_c.storage_and_layout();
+                    let (cqs, cql) = cq_c.storage_and_layout();
+                    let (cks, ckl) = ck_c.storage_and_layout();
+                    let (bts, btl) = bt_c.storage_and_layout();
+                    let pfx_g = pfx_c.as_ref().map(|t| t.storage_and_layout());
+                    let sink_g = sink_c.as_ref().map(|t| t.storage_and_layout());
+                    let (
+                        Storage::Cuda(qc),
+                        Storage::Cuda(kc),
+                        Storage::Cuda(vc),
+                        Storage::Cuda(cqc),
+                        Storage::Cuda(ckc),
+                        Storage::Cuda(btc),
+                    ) = (&*qs, &*ks, &*vs, &*cqs, &*cks, &*bts)
+                    else {
+                        unreachable!()
+                    };
+                    let pfx_arg = pfx_g.as_ref().map(|(s, l)| match &**s {
+                        Storage::Cuda(c) => (c, l.start_offset()),
+                        _ => unreachable!(),
+                    });
+                    let sink_arg = sink_g.as_ref().map(|(s, l)| match &**s {
+                        Storage::Cuda(c) => (c, l.start_offset()),
+                        _ => unreachable!(),
+                    });
+                    Some(Storage::Cuda(qc.flash_attn_paged_block_table(
+                        ql.start_offset(),
+                        kc,
+                        kl.start_offset(),
+                        vc,
+                        vl.start_offset(),
+                        cqc,
+                        cql.start_offset(),
+                        ckc,
+                        ckl.start_offset(),
+                        btc,
+                        btl.start_offset(),
+                        pfx_arg,
+                        sink_arg,
+                        batch,
+                        total_q,
+                        max_seqlen_q,
+                        hq,
+                        hkv,
+                        d,
+                        page_block_size,
+                        bt_stride,
+                        &p,
+                    )?))
+                }
+                #[cfg(feature = "rocm")]
+                Device::Rocm(_) => {
+                    let (qs, ql) = q_c.storage_and_layout();
+                    let (ks, kl) = k_c.storage_and_layout();
+                    let (vs, vl) = v_c.storage_and_layout();
+                    let (cqs, cql) = cq_c.storage_and_layout();
+                    let (cks, ckl) = ck_c.storage_and_layout();
+                    let (bts, btl) = bt_c.storage_and_layout();
+                    let pfx_g = pfx_c.as_ref().map(|t| t.storage_and_layout());
+                    let sink_g = sink_c.as_ref().map(|t| t.storage_and_layout());
+                    let (
+                        Storage::Rocm(qr),
+                        Storage::Rocm(kr),
+                        Storage::Rocm(vr),
+                        Storage::Rocm(cqr),
+                        Storage::Rocm(ckr),
+                        Storage::Rocm(btr),
+                    ) = (&*qs, &*ks, &*vs, &*cqs, &*cks, &*bts)
+                    else {
+                        unreachable!()
+                    };
+                    let pfx_arg = pfx_g.as_ref().map(|(s, l)| match &**s {
+                        Storage::Rocm(r) => (r, l.start_offset()),
+                        _ => unreachable!(),
+                    });
+                    let sink_arg = sink_g.as_ref().map(|(s, l)| match &**s {
+                        Storage::Rocm(r) => (r, l.start_offset()),
+                        _ => unreachable!(),
+                    });
+                    Some(Storage::Rocm(qr.flash_attn_paged_block_table(
+                        ql.start_offset(),
+                        kr,
+                        kl.start_offset(),
+                        vr,
+                        vl.start_offset(),
+                        cqr,
+                        cql.start_offset(),
+                        ckr,
+                        ckl.start_offset(),
+                        btr,
+                        btl.start_offset(),
+                        pfx_arg,
+                        sink_arg,
+                        batch,
+                        total_q,
+                        max_seqlen_q,
+                        hq,
+                        hkv,
+                        d,
+                        page_block_size,
+                        bt_stride,
+                        &p,
+                    )?))
+                }
+                _ => None,
+            };
+            if let Some(s) = out_storage {
+                return Ok(Tensor::from((s, (total_q, hq, d))));
+            }
+        }
+    }
+
+    // Portable fallback for CPU / Vulkan / Metal / unsupported dtypes (also supports mm_prefix_ranges & sink_logits).
+    let cu_k: Vec<usize> = seqlens_k
+        .to_device(&Device::Cpu)?
+        .to_dtype(DType::I64)?
+        .to_vec1::<i64>()?
+        .into_iter()
+        .map(|v| v.max(0) as usize)
+        .collect();
+    let table: Vec<Vec<usize>> = block_table
+        .to_device(&Device::Cpu)?
+        .to_dtype(DType::I64)?
+        .to_vec2::<i64>()?
+        .into_iter()
+        .map(|r| r.into_iter().map(|v| v.max(0) as usize).collect())
+        .collect();
+    let mut ks = Vec::with_capacity(batch);
+    let mut vs = Vec::with_capacity(batch);
+    for b in 0..batch {
+        let len = cu_k[b + 1] - cu_k[b];
+        let nb = len.div_ceil(page);
+        if nb > table[b].len() {
+            bail!(
+                "flash-attn-bt: sequence {b} needs {nb} blocks, block_table has {}",
+                table[b].len()
+            );
+        }
+        let idx: Vec<u32> = table[b][..nb].iter().map(|&x| x as u32).collect();
+        let idx = Tensor::new(idx.as_slice(), k_pool.device())?;
+        let gather = |x: &Tensor| -> Result<Tensor> {
+            x.index_select(&idx, 0)?
+                .reshape((nb * page, hkv, d))?
+                .narrow(0, 0, len)
+        };
+        ks.push(gather(k_pool)?);
+        vs.push(gather(v_pool)?);
+    }
+    let k = Tensor::cat(&ks, 0)?;
+    let v = Tensor::cat(&vs, 0)?;
+    flash_attn_varlen_with_config(
+        q,
+        &k,
+        &v,
+        seqlens_q,
+        seqlens_k,
+        max_seqlen_q,
+        max_seqlen_k,
+        cfg,
+    )
 }
 
 #[cfg(test)]

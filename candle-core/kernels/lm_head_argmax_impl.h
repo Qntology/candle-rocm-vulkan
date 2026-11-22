@@ -494,6 +494,96 @@ AX_DEV void lm_logits_argmax_cs_impl(
     }
 }
 
+// ---------------------------------------------------------------------------
+// Kernel 3b: Graph-Safe GPU Conditional REST Rescue (0 HBM reads when mask == 0)
+// Grid: (M, 1, 1), Block: (256, 1, 1), Shared memory: 2 * 256 * 4 = 2 KiB
+// ---------------------------------------------------------------------------
+// Always queued in the stream/CUDA/HIP graph after Stage-2; on >= 95% of decode
+// steps `d_rescue_mask[m] == 0u` returns immediately without touching `w_rest`.
+// When `d_rescue_mask[m] != 0u`, evaluates `w_rest` on-device and updates
+// `io_id[m]` and `io_val[m]` if a REST row beats the CORE winner (tie -> smaller ID).
+template <typename TX>
+AX_DEV void lm_rest_conditional_rescue_impl(
+    const TX *hidden,
+    const TX *w_rest,
+    const float *b_rest,
+    const ax_u32 *rest_ids,
+    const ax_u8 *d_rescue_mask,
+    ax_u32 *io_id,
+    float *io_val,
+    ax_u32 M,
+    ax_u32 V_rest,
+    ax_u32 K
+) {
+    const ax_u32 m = AX_BID_X;
+    if (m >= M) return;
+    if (d_rescue_mask[m] == 0u) return;
+
+    const ax_u32 tid = AX_TID;
+    const ax_u32 wid = tid >> 5;
+    const ax_u32 lane = tid & 31u;
+    constexpr ax_u32 NWARPS = LM_NT >> 5;
+    const ax_u64 h_base = (ax_u64)m * (ax_u64)K;
+
+    float best_v = -AX_INF;
+    ax_u32 best_i = 0xffffffffu;
+
+    // Each warp evaluates rows r = wid, wid + NWARPS, ... cooperatively over K.
+    for (ax_u32 r = wid; r < V_rest; r += NWARPS) {
+        const ax_u64 w_base = (ax_u64)r * (ax_u64)K;
+        float dot = 0.0f;
+        for (ax_u32 k = lane; k < K; k += 32u) {
+            dot = fmaf(ax_load(hidden, h_base + k), ax_load(w_rest, w_base + k), dot);
+        }
+#if AX_HAS_WARP32_SHFL
+        dot = ax_warp32_sum(dot);
+#else
+        float *s_tmp = ax_smem() + LM_NT * 2u;
+        s_tmp[tid] = dot;
+        AX_SYNC();
+        for (ax_u32 s = 16u; s > 0u; s >>= 1u) {
+            if (lane < s) s_tmp[tid] += s_tmp[tid + s];
+            AX_SYNC();
+        }
+        dot = s_tmp[wid * 32u];
+        AX_SYNC();
+#endif
+        if (lane == 0u) {
+            if (b_rest != nullptr) dot += b_rest[r];
+            const ax_u32 gid = (rest_ids != nullptr) ? rest_ids[r] : r;
+            if (lm_better(dot, gid, best_v, best_i)) {
+                best_v = dot;
+                best_i = gid;
+            }
+        }
+    }
+
+    float *s_val = ax_smem();
+    ax_u32 *s_idx = reinterpret_cast<ax_u32 *>(s_val + LM_NT);
+    if (lane == 0u) {
+        s_val[wid] = best_v;
+        s_idx[wid] = best_i;
+    }
+    AX_SYNC();
+
+    if (tid == 0u) {
+        float rv = s_val[0];
+        ax_u32 ri = s_idx[0];
+        for (ax_u32 w = 1u; w < NWARPS; ++w) {
+            if (lm_better(s_val[w], s_idx[w], rv, ri)) {
+                rv = s_val[w];
+                ri = s_idx[w];
+            }
+        }
+        const float cv = io_val[m];
+        const ax_u32 ci = io_id[m];
+        if (lm_better(rv, ri, cv, ci)) {
+            io_val[m] = rv;
+            io_id[m] = ri;
+        }
+    }
+}
+
 #define LM_HEAD_DENSE_INSTANTIATE(SFX, TX) \
 AX_KERNEL void AX_BOUNDS(LM_NT) lm_stage1_decode1_##SFX( \
     const TX *x, const TX *w, const float *bias, \
@@ -520,6 +610,13 @@ AX_KERNEL void AX_BOUNDS(LM_NT) lm_stage2_reduce_cs_##SFX( \
     ax_u32 M, ax_u32 n_tiles, ax_u32 K, ax_u32 check_cs) { \
     lm_stage2_reduce_cs_impl<TX>(part_val, part_idx, core_ids, hidden, mu_rest, \
         w_rest_bound, b_rest_max, out_id, out_val, out_rescue, M, n_tiles, K, check_cs); \
+} \
+AX_KERNEL void AX_BOUNDS(LM_NT) lm_rest_conditional_rescue_##SFX( \
+    const TX *hidden, const TX *w_rest, const float *b_rest, const ax_u32 *rest_ids, \
+    const ax_u8 *d_rescue_mask, ax_u32 *io_id, float *io_val, \
+    ax_u32 M, ax_u32 V_rest, ax_u32 K) { \
+    lm_rest_conditional_rescue_impl<TX>(hidden, w_rest, b_rest, rest_ids, d_rescue_mask, \
+        io_id, io_val, M, V_rest, K); \
 }
 
 #define LM_HEAD_LOGITS_INSTANTIATE(LSFX, TL, HSFX, TH) \

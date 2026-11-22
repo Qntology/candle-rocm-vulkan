@@ -71,11 +71,18 @@ impl Workspaces {
         bytes: usize,
     ) -> Result<u64> {
         let bytes = bytes.max(1);
-        if self.slots.get(name).map_or(true, |s| s.len() < bytes) {
+        let prev_len = self.slots.get(name).map_or(0, |s| s.len());
+        if prev_len < bytes {
+            // 2x hysteresis growth up to 16 MiB avoids allocator thrashing during decode growth.
+            let alloc_bytes = if prev_len > 0 && bytes < (16 << 20) {
+                bytes.max(prev_len.saturating_mul(2)).min(16 << 20)
+            } else {
+                bytes
+            };
             // The old buffer is freed right below: the context must be current.
             dev.bind_to_thread()?;
             self.slots.remove(name);
-            let slice = unsafe { dev.alloc::<u8>(bytes)? };
+            let slice = unsafe { dev.alloc::<u8>(alloc_bytes)? };
             self.slots.insert(name, slice);
         }
         let slice = &self.slots[name];
@@ -311,6 +318,9 @@ pub struct CudaDevice {
     custom_modules: Arc<std::sync::RwLock<HashMap<String, Arc<cudarc::driver::CudaModule>>>>,
     stream: Arc<cudarc::driver::CudaStream>,
     pub(crate) blas: Arc<cudarc::cublas::CudaBlas>,
+    /// Dedicated immutable cuBLAS handle permanently configured with
+    /// `CUBLAS_MATH_DISALLOW_REDUCED_PRECISION_REDUCTION` for lock-free exact F32 reductions.
+    exact_blas: Arc<Mutex<Option<Arc<cudarc::cublas::CudaBlas>>>>,
     /// Created on the first random op or `set_seed`.
     curand: Arc<Mutex<Option<CudaRng>>>,
     seed_value: Arc<RwLock<u64>>,
@@ -1079,6 +1089,28 @@ impl CudaDevice {
             .clone()
     }
 
+    /// Returns a dedicated cuBLAS handle permanently configured with
+    /// `CUBLAS_MATH_DISALLOW_REDUCED_PRECISION_REDUCTION`, avoiding per-GEMM mutex locking and
+    /// `cublasGetMathMode` / `cublasSetMathMode` toggling on the default handle.
+    pub(crate) fn exact_blas(&self) -> Result<Arc<cudarc::cublas::CudaBlas>> {
+        let mut slot = self.exact_blas.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some(h) = slot.as_ref() {
+            return Ok(h.clone());
+        }
+        let h = cudarc::cublas::CudaBlas::new(self.stream.clone()).w()?;
+        unsafe {
+            cudarc::cublas::sys::cublasSetMathMode(
+                *h.handle(),
+                cudarc::cublas::sys::cublasMath_t::CUBLAS_MATH_DISALLOW_REDUCED_PRECISION_REDUCTION,
+            )
+        }
+        .result()
+        .w()?;
+        let arc = Arc::new(h);
+        *slot = Some(arc.clone());
+        Ok(arc)
+    }
+
     /// The raw copy stream, created on first use.
     pub(crate) fn raw_copy_stream(&self) -> Result<Arc<super::offload::RawStream>> {
         let mut slot = self.copy_stream.lock().unwrap_or_else(|p| p.into_inner());
@@ -1146,6 +1178,7 @@ impl CudaDevice {
             context,
             stream,
             blas: Arc::new(blas),
+            exact_blas: Arc::new(Mutex::new(None)),
             curand: Arc::new(Mutex::new(None)),
             modules: Arc::new(std::sync::RwLock::new(module_store)),
             custom_modules: Arc::new(std::sync::RwLock::new(HashMap::new())),

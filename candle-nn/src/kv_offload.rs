@@ -15,6 +15,10 @@ use candle::{bail, DType, Device, Result, Tensor};
 /// pinned `CopyStream`. Re-exported from `candle_core::accel::ASYNC_DMA_MIN_BYTES`.
 pub use candle::accel::ASYNC_DMA_MIN_BYTES;
 
+/// Recommended minimum combined byte size for [`SuperSlabBundle`] multi-layer DMA bundling
+/// (8 MiB ensures every bundled PCIe upload amortizes pinned DMA setup cleanly).
+pub const SUPER_SLAB_MIN_BYTES: usize = 8 << 20;
+
 /// Host-side compressed K/V slab backed by page-locked pinned memory on ROCm/CUDA when allocated
 /// for a GPU device, or naturally 4-byte-aligned `Vec<u32>` on CPU/Vulkan/Metal (`Q6-F12`).
 enum HostBuf {
@@ -271,6 +275,9 @@ enum InflightEvent {
         candle::cuda_backend::offload::CopyEvent,
         candle::cuda_backend::offload::CopyEvent,
     ),
+    /// Vulkan staging completion marker (compute queue barrier synchronizes device writes).
+    #[cfg(feature = "vulkan")]
+    Vulkan,
     None,
 }
 
@@ -323,6 +330,8 @@ impl StagingSlot {
                 }
                 Ok(())
             }
+            #[cfg(feature = "vulkan")]
+            InflightEvent::Vulkan => Ok(()),
         }
     }
 
@@ -342,7 +351,95 @@ impl StagingSlot {
                 ev.synchronize()?;
                 Ok(())
             }
+            #[cfg(feature = "vulkan")]
+            InflightEvent::Vulkan => Ok(()),
         }
+    }
+}
+
+/// Multi-layer Super-Slab bundle packing `L` consecutive layers into one contiguous page-locked
+/// [`PinnedKvSlab`] (`batch * layers`, `hkv`, `kv_len`, `words`) so small per-layer compressed KV
+/// slabs (`< ASYNC_DMA_MIN_BYTES`) combine into `>= 8 MiB` async DMA transfers.
+#[derive(Debug)]
+pub struct SuperSlabBundle {
+    pub slab: PinnedKvSlab,
+    pub num_layers: usize,
+    pub orig_batch: usize,
+}
+
+impl SuperSlabBundle {
+    /// Packs `slabs` (all sharing the same `(batch, hkv, kv_len, k_words, v_words)`) into one
+    /// super-slab pinned for `target_device`.
+    pub fn from_slabs(slabs: &[&PinnedKvSlab], target_device: &Device) -> Result<Self> {
+        if slabs.is_empty() {
+            bail!("SuperSlabBundle::from_slabs: empty slab slice");
+        }
+        let first = slabs[0];
+        let mut k_all = Vec::with_capacity(slabs.len() * first.k_u32_slice().len());
+        let mut v_all = Vec::with_capacity(slabs.len() * first.v_u32_slice().len());
+        for (i, s) in slabs.iter().enumerate() {
+            if (s.batch, s.hkv, s.kv_len, s.k_words, s.v_words)
+                != (
+                    first.batch,
+                    first.hkv,
+                    first.kv_len,
+                    first.k_words,
+                    first.v_words,
+                )
+            {
+                bail!("SuperSlabBundle: slab {i} geometry mismatch");
+            }
+            k_all.extend_from_slice(s.k_u32_slice());
+            v_all.extend_from_slice(s.v_u32_slice());
+        }
+        let total_bytes = (k_all.len() + v_all.len()) * 4;
+        let slab = PinnedKvSlab::from_u32_slices_with_pinned(
+            &k_all,
+            &v_all,
+            first.batch * slabs.len(),
+            first.hkv,
+            first.kv_len,
+            first.k_words,
+            first.v_words,
+            target_device,
+            Some(total_bytes >= ASYNC_DMA_MIN_BYTES),
+        )?;
+        Ok(Self {
+            slab,
+            num_layers: slabs.len(),
+            orig_batch: first.batch,
+        })
+    }
+
+    /// Slices the staged super-slab `(k_view, v_view)` of shape `(orig_batch * num_layers, hkv, kv_len, words)`
+    /// for layer `layer_idx` (`0..num_layers`) in zero-copy fashion via `narrow`.
+    pub fn slice_layer(
+        &self,
+        k_staged: &Tensor,
+        v_staged: &Tensor,
+        layer_idx: usize,
+    ) -> Result<(Tensor, Tensor)> {
+        if layer_idx >= self.num_layers {
+            bail!(
+                "SuperSlabBundle::slice_layer: layer {layer_idx} >= {}",
+                self.num_layers
+            );
+        }
+        let b0 = layer_idx * self.orig_batch;
+        Ok((
+            k_staged.narrow(0, b0, self.orig_batch)?,
+            v_staged.narrow(0, b0, self.orig_batch)?,
+        ))
+    }
+
+    /// Recommended number of layers to group together to reach at least [`SUPER_SLAB_MIN_BYTES`].
+    pub fn recommended_group_size(single_layer_bytes: usize, max_layers: usize) -> usize {
+        if single_layer_bytes == 0 {
+            return 1;
+        }
+        SUPER_SLAB_MIN_BYTES
+            .div_ceil(single_layer_bytes)
+            .clamp(1, max_layers.max(1))
     }
 }
 
@@ -507,6 +604,10 @@ impl OffloadedTurboKvEngine {
         )?;
         slot.k_tensor.slice_set(&k_src, 2, 0)?;
         slot.v_tensor.slice_set(&v_src, 2, 0)?;
+        #[cfg(feature = "vulkan")]
+        if matches!(self.device, Device::Vulkan(_)) {
+            slot.inflight = InflightEvent::Vulkan;
+        }
         Ok(())
     }
 

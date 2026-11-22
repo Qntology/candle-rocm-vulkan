@@ -17,6 +17,7 @@ pub mod lm_head;
 pub mod profile;
 pub mod sources;
 pub mod turbo;
+pub mod vis_ops;
 
 pub use attention::{AttnGeometry, FaPlan, FlashAttnParams};
 pub use config::{

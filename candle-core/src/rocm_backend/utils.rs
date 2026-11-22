@@ -5,60 +5,141 @@ use std::ffi::c_void;
 /// Maximum rank of the by-value stride descriptors (`SI1`/`SI2`/`SI3` in `kernels/common.h`).
 pub const MAX_DIMS: usize = 8;
 
-/// Kernel parameters, each stored in its own 8-byte aligned buffer so that the pointers handed to
-/// `hipModuleLaunchKernel` stay valid until the launch call returns.
-#[derive(Default)]
+/// Stack capacity of [`LaunchArgs`] before overflowing to heap (covers every kernel in candle).
+const INLINE_LAUNCH_CAP: usize = 48;
+const OVERFLOW_TAG: u16 = 0x8000;
+
+/// Zero-heap-allocation kernel argument buffer for `hipModuleLaunchKernel`.
+///
+/// Up to [`INLINE_LAUNCH_CAP`] scalar arguments (pointers, integers, floats) are stored inline on
+/// the stack and handed to `hipModuleLaunchKernel` via a stack pointer slice, eliminating 12-40
+/// heap allocations per kernel launch. Multi-word structs ([`Self::words`]) or launches with more
+/// than [`INLINE_LAUNCH_CAP`] arguments seamlessly spill to `overflow`.
 pub struct LaunchArgs {
-    params: Vec<Vec<u64>>,
+    inline_vals: [u64; INLINE_LAUNCH_CAP],
+    inline_len: usize,
+    overflow: Vec<Vec<u64>>,
+    order: [u16; INLINE_LAUNCH_CAP],
+    extra_order: Vec<u16>,
+    count: usize,
+}
+
+impl Default for LaunchArgs {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl LaunchArgs {
     pub fn new() -> Self {
         Self {
-            params: Vec::with_capacity(12),
+            inline_vals: [0u64; INLINE_LAUNCH_CAP],
+            inline_len: 0,
+            overflow: Vec::new(),
+            order: [0u16; INLINE_LAUNCH_CAP],
+            extra_order: Vec::new(),
+            count: 0,
         }
     }
 
+    #[inline]
+    fn push_scalar(&mut self, v: u64) -> &mut Self {
+        let tag = if self.inline_len < INLINE_LAUNCH_CAP {
+            let idx = self.inline_len;
+            self.inline_vals[idx] = v;
+            self.inline_len += 1;
+            idx as u16
+        } else {
+            let idx = self.overflow.len();
+            self.overflow.push(vec![v]);
+            OVERFLOW_TAG | (idx as u16)
+        };
+        if self.count < INLINE_LAUNCH_CAP {
+            self.order[self.count] = tag;
+        } else {
+            self.extra_order.push(tag);
+        }
+        self.count += 1;
+        self
+    }
+
+    #[inline]
     pub fn usize(&mut self, v: usize) -> &mut Self {
-        self.params.push(vec![v as u64]);
-        self
+        self.push_scalar(v as u64)
     }
 
+    #[inline]
     pub fn u32(&mut self, v: u32) -> &mut Self {
-        self.params.push(vec![v as u64]);
-        self
+        self.push_scalar(v as u64)
     }
 
+    #[inline]
     pub fn f32(&mut self, v: f32) -> &mut Self {
-        self.params.push(vec![v.to_bits() as u64]);
-        self
+        self.push_scalar(v.to_bits() as u64)
     }
 
+    #[inline]
     pub fn f64(&mut self, v: f64) -> &mut Self {
-        self.params.push(vec![v.to_bits()]);
-        self
+        self.push_scalar(v.to_bits())
     }
 
+    #[inline]
     pub fn bits(&mut self, v: u64) -> &mut Self {
-        self.params.push(vec![v]);
-        self
+        self.push_scalar(v)
     }
 
+    #[inline]
     pub fn ptr<T>(&mut self, p: *const T) -> &mut Self {
-        self.params.push(vec![p as usize as u64]);
-        self
+        self.push_scalar(p as usize as u64)
     }
 
     pub fn words(&mut self, w: Vec<u64>) -> &mut Self {
-        self.params.push(w);
+        let idx = self.overflow.len();
+        self.overflow.push(w);
+        let tag = OVERFLOW_TAG | (idx as u16);
+        if self.count < INLINE_LAUNCH_CAP {
+            self.order[self.count] = tag;
+        } else {
+            self.extra_order.push(tag);
+        }
+        self.count += 1;
         self
     }
 
-    pub(crate) fn pointers(&mut self) -> Vec<*mut c_void> {
-        self.params
-            .iter_mut()
-            .map(|p| p.as_mut_ptr() as *mut c_void)
-            .collect()
+    /// Invokes `f` with a slice of parameter pointers valid for the duration of the call, using
+    /// pure stack storage when `self.count <= INLINE_LAUNCH_CAP`.
+    pub(crate) fn with_pointers<R>(&mut self, f: impl FnOnce(&mut [*mut c_void]) -> R) -> R {
+        let inline_base = self.inline_vals.as_mut_ptr();
+        if self.count <= INLINE_LAUNCH_CAP {
+            let mut ptrs = [std::ptr::null_mut::<c_void>(); INLINE_LAUNCH_CAP];
+            for i in 0..self.count {
+                let tag = self.order[i];
+                ptrs[i] = if (tag & OVERFLOW_TAG) == 0 {
+                    unsafe { inline_base.add(tag as usize) as *mut c_void }
+                } else {
+                    self.overflow[(tag & !OVERFLOW_TAG) as usize].as_mut_ptr() as *mut c_void
+                };
+            }
+            f(&mut ptrs[..self.count])
+        } else {
+            let mut ptrs = Vec::with_capacity(self.count);
+            for i in 0..INLINE_LAUNCH_CAP {
+                let tag = self.order[i];
+                ptrs.push(if (tag & OVERFLOW_TAG) == 0 {
+                    unsafe { inline_base.add(tag as usize) as *mut c_void }
+                } else {
+                    self.overflow[(tag & !OVERFLOW_TAG) as usize].as_mut_ptr() as *mut c_void
+                });
+            }
+            for &tag in &self.extra_order {
+                ptrs.push(if (tag & OVERFLOW_TAG) == 0 {
+                    unsafe { inline_base.add(tag as usize) as *mut c_void }
+                } else {
+                    self.overflow[(tag & !OVERFLOW_TAG) as usize].as_mut_ptr() as *mut c_void
+                });
+            }
+            f(&mut ptrs)
+        }
     }
 }
 

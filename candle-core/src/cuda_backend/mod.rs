@@ -23,6 +23,7 @@ mod fp8_cast;
 mod lm_head;
 pub mod offload;
 mod utils;
+mod vis_ops;
 pub use device::{clear_cuda_graph_htod_cache, CudaDevice, CudaPoolStats, DeviceId};
 pub use error::{CudaError, WrapErr};
 pub use utils::{Map1, Map1Any, Map2, Map2Any, Map2InPlace, Map3, S};
