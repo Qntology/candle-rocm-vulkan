@@ -649,3 +649,38 @@ fn bench_pinned_copy_stream_vs_pageable_upload() -> Result<()> {
     }
     Ok(())
 }
+
+/// Regression test for sub-warp (< 32 elements) CUDA reductions (`fast_sum_*_vec` in
+/// `candle-kernels >= 0.11.1` divides `blockDim.x / 32`, returning 0.0 if `block_dim < 32`).
+#[test]
+fn subwarp_reduce_matches_cpu_cuda() -> Result<()> {
+    let _g = serial();
+    let dev = device()?;
+    for d in [1usize, 3, 8, 16, 31, 32, 64] {
+        let rows = 12usize;
+        let data: Vec<f32> = (0..rows * d)
+            .map(|i| ((i as f32 * 0.37).sin() * 2.5) + 0.15)
+            .collect();
+        let cpu = Tensor::from_vec(data, (2, 6, d), &Device::Cpu)?;
+        for dt in [DType::F32, DType::F16, DType::BF16] {
+            let c = cpu.to_dtype(dt)?;
+            let g = c.to_device(&dev)?;
+            let want_mean = c.mean_keepdim(2)?.to_dtype(DType::F32)?.flatten_all()?.to_vec1::<f32>()?;
+            let got_mean = g.mean_keepdim(2)?.to_device(&Device::Cpu)?.to_dtype(DType::F32)?.flatten_all()?.to_vec1::<f32>()?;
+            let tol = if dt == DType::F32 { 1e-5 } else { 2e-2 };
+            for (i, (&a, &b)) in got_mean.iter().zip(&want_mean).enumerate() {
+                assert!(
+                    (a - b).abs() <= tol * b.abs().max(1.0),
+                    "mean_keepdim mismatch d={d} dt={dt:?} idx={i}: got={a} want={b}"
+                );
+            }
+            let want_max = c.max_keepdim(2)?.to_dtype(DType::F32)?.flatten_all()?.to_vec1::<f32>()?;
+            let got_max = g.max_keepdim(2)?.to_device(&Device::Cpu)?.to_dtype(DType::F32)?.flatten_all()?.to_vec1::<f32>()?;
+            assert_eq!(got_max, want_max, "max_keepdim mismatch d={d} dt={dt:?}");
+            let want_min = c.min_keepdim(2)?.to_dtype(DType::F32)?.flatten_all()?.to_vec1::<f32>()?;
+            let got_min = g.min_keepdim(2)?.to_device(&Device::Cpu)?.to_dtype(DType::F32)?.flatten_all()?.to_vec1::<f32>()?;
+            assert_eq!(got_min, want_min, "min_keepdim mismatch d={d} dt={dt:?}");
+        }
+    }
+    Ok(())
+}

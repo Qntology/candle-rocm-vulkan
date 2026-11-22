@@ -350,9 +350,10 @@ impl Map1Any for FastReduce<'_> {
             stride.push(src_stride[dim_idx]);
         }
         let el_to_sum_per_block = src_el / dst_el;
-        // The reduction loop requires the shared array to be properly initialized and for
-        // this we want the number of threads to be a power of two.
-        let block_dim = usize::min(1024, el_to_sum_per_block).next_power_of_two();
+        // The reduction loop requires a power-of-two block size of at least one full warp (32).
+        // `candle-kernels >= 0.11.1` uses warp-shuffle reductions in `fast_sum_*_vec` with
+        // `num_warps = blockDim.x / 32`, which silently produces 0.0 whenever `blockDim.x < 32`.
+        let block_dim = el_to_sum_per_block.clamp(32, 1024).next_power_of_two();
         let cfg = LaunchConfig {
             // TODO: Maybe use grid_y if the output is too large?
             // TODO: Specialized implementation when reducing on no or all dimensions or when
