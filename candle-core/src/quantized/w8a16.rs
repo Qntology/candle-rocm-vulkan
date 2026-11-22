@@ -137,41 +137,15 @@ fn ggml_float_ctype(dtype: GgmlDType) -> Option<(&'static str, &'static str, DTy
     }
 }
 
-fn arch(dev: &CudaDevice) -> &'static str {
-    use cudarc::driver::sys::CUdevice_attribute as A;
-    use std::collections::HashMap;
-    use std::sync::Mutex;
-    static ARCHS: Mutex<Option<HashMap<(i32, i32), &'static str>>> = Mutex::new(None);
-    let major = dev
-        .device_attribute(A::CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR)
-        .unwrap_or(7);
-    let minor = dev
-        .device_attribute(A::CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR)
-        .unwrap_or(5);
-    let mut g = ARCHS.lock().unwrap_or_else(|p| p.into_inner());
-    g.get_or_insert_with(HashMap::new)
-        .entry((major, minor))
-        .or_insert_with(|| Box::leak(format!("compute_{major}{minor}").into_boxed_str()))
-}
-
-/// Kernel `name` of the module built from `kernels/w8a16_impl.h` + `inst` (compiled on first use).
+/// Kernel `name` of the module built from `kernels/w8a16_impl.h` + `inst` (compiled on first use,
+/// backed by the process + on-disk NVRTC PTX cache).
 fn func(dev: &CudaDevice, name: &str, inst: String) -> Result<CudaFunction> {
     let module = format!("candle_{name}");
-    let f = dev.get_or_compile_func(name, &module, || {
-        let src = format!(
+    let f = dev.get_or_compile_source_func(name, &module, || {
+        Ok(format!(
             "{}\n{inst}\n",
             crate::accel::sources::strip_includes(SOURCE)
-        );
-        let opts = |arch: Option<&'static str>| cudarc::nvrtc::CompileOptions {
-            arch,
-            options: vec!["--std=c++17".into()],
-            ..Default::default()
-        };
-        match cudarc::nvrtc::safe::compile_ptx_with_opts(&src, opts(Some(arch(dev)))) {
-            Ok(p) => Ok(p),
-            // An NVRTC older than the GPU: let the driver JIT the default target.
-            Err(_) => cudarc::nvrtc::safe::compile_ptx_with_opts(&src, opts(None)).w(),
-        }
+        ))
     })?;
     Ok(f.into_cuda_function())
 }
@@ -363,7 +337,7 @@ pub fn dequantize(
 
 /// Byte budget of one transient dequantization tile (and of one f32 GEMM tile):
 /// `CANDLE_W8A16_DEQUANT_TILE_MB` (default 32) MiB.
-fn dequant_tile_bytes() -> usize {
+pub(crate) fn dequant_tile_bytes() -> usize {
     static TILE_BYTES: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
     *TILE_BYTES.get_or_init(|| {
         std::env::var("CANDLE_W8A16_DEQUANT_TILE_MB")
@@ -421,8 +395,21 @@ pub fn prefill_gemm_mode() -> PrefillGemm {
 /// the more precise reduction.
 fn with_f32_reductions<R>(dev: &CudaDevice, f: impl FnOnce() -> Result<R>) -> Result<R> {
     use cudarc::cublas::sys::{self, cublasMath_t as M};
-    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-    let _guard = LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    use std::collections::HashMap;
+    use std::sync::{Arc, Mutex, OnceLock};
+    // Per-device lock avoids serializing cuBLAS handles across independent GPUs (`P1-O05`).
+    static DEV_LOCKS: OnceLock<Mutex<HashMap<crate::cuda_backend::DeviceId, Arc<Mutex<()>>>>> =
+        OnceLock::new();
+    let dev_lock = {
+        let mut map = DEV_LOCKS
+            .get_or_init(|| Mutex::new(HashMap::new()))
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        map.entry(dev.id())
+            .or_insert_with(|| Arc::new(Mutex::new(())))
+            .clone()
+    };
+    let _guard = dev_lock.lock().unwrap_or_else(|p| p.into_inner());
     let handle = *dev.blas.handle();
     let mut prev = 0u32;
     // SAFETY: valid handle; the mode is written as a C int into `prev` (read as u32, never
@@ -854,15 +841,18 @@ pub fn nvfp_mv(
     }
 }
 
-/// Planar NVFP4 / NVFP8 exact dequantization on CUDA via `kernels/w8a16_impl.h`.
-pub fn nvfp_dq(
+/// Planar NVFP4 / NVFP8 exact row-range dequantization (`row0..row0 + nrows`) on CUDA via
+/// `kernels/w8a16_impl.h`. Used both by full `nvfp_dq` and 32 MiB tiled prefill (`Q1-O03`).
+#[allow(clippy::too_many_arguments)]
+pub fn nvfp_dq_rows(
     dev: &CudaDevice,
     data: &CudaSlice<u8>,
     bscale_off: usize,
     rscale_off: usize,
     is_fp4: bool,
     k: usize,
-    n: usize,
+    row0: usize,
+    nrows: usize,
     out_dtype: DType,
 ) -> Result<CudaStorage> {
     use cudarc::driver::DevicePtr;
@@ -870,11 +860,11 @@ pub fn nvfp_dq(
     let (name, inst, total_work) = if is_fp4 {
         let name = format!("w8a16_nvfp4_dq_{osfx}");
         let inst = format!("W8A16_NVFP4_DQ_KERNEL({name}, {octype})");
-        (name, inst, n * (k / 16))
+        (name, inst, nrows * (k / 16))
     } else {
         let name = format!("w8a16_nvfp8_dq_{osfx}");
         let inst = format!("W8A16_NVFP8_DQ_KERNEL({name}, {octype})");
-        (name, inst, n * (k / 8))
+        (name, inst, nrows * (k / 8))
     };
     let f = func(dev, &name, inst)?;
     let lc = LaunchConfig {
@@ -882,20 +872,25 @@ pub fn nvfp_dq(
         block_dim: (256, 1, 1),
         shared_mem_bytes: 0,
     };
-    let (k_i, n_i) = (k as i32, n as i32);
+    let (k_i, n_i) = (k as i32, nrows as i32);
     let stream = dev.cuda_stream();
     let (base_p, _g_w) = data.device_ptr(&stream);
-    let bs_p = base_p + bscale_off as u64;
-    let rs_p = base_p + rscale_off as u64;
+    let q_p = if is_fp4 {
+        base_p + (row0 * (k / 2)) as u64
+    } else {
+        base_p + (row0 * k) as u64
+    };
+    let bs_p = base_p + (bscale_off + row0 * (k / 16)) as u64;
+    let rs_p = base_p + (rscale_off + row0 * 4) as u64;
     macro_rules! launch {
         ($t:ty) => {{
-            let mut out = unsafe { dev.alloc::<$t>((n * k).max(1))? };
-            if n > 0 && k > 0 {
+            let mut out = unsafe { dev.alloc::<$t>((nrows * k).max(1))? };
+            if nrows > 0 && k > 0 {
                 let mut b = stream.launch_builder(&f);
                 if is_fp4 {
-                    b.arg(&base_p).arg(&bs_p).arg(&rs_p);
+                    b.arg(&q_p).arg(&bs_p).arg(&rs_p);
                 } else {
-                    b.arg(&base_p).arg(&rs_p);
+                    b.arg(&q_p).arg(&rs_p);
                 }
                 b.arg(&mut out).arg(&k_i).arg(&n_i);
                 unsafe { b.launch(lc) }.w()?;
@@ -909,6 +904,21 @@ pub fn nvfp_dq(
         DType::BF16 => launch!(half::bf16),
         d => bail!("w8a16 nvfp_dq: unsupported dtype {d:?}"),
     }
+}
+
+/// Planar NVFP4 / NVFP8 exact dequantization on CUDA via `kernels/w8a16_impl.h`.
+#[allow(clippy::too_many_arguments)]
+pub fn nvfp_dq(
+    dev: &CudaDevice,
+    data: &CudaSlice<u8>,
+    bscale_off: usize,
+    rscale_off: usize,
+    is_fp4: bool,
+    k: usize,
+    n: usize,
+    out_dtype: DType,
+) -> Result<CudaStorage> {
+    nvfp_dq_rows(dev, data, bscale_off, rscale_off, is_fp4, k, 0, n, out_dtype)
 }
 
 #[cfg(test)]

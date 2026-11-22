@@ -9,43 +9,15 @@ use crate::accel::delta::{self as gd, GdnScanArgs, GNORM_THREADS};
 use crate::{bail, DType, Result};
 use cudarc::driver::{DevicePtr, DevicePtrMut, LaunchConfig, PushKernelArg, SyncOnDrop};
 
-/// NVRTC `--gpu-architecture` of the device (interned: NVRTC options take `&'static str`).
-pub(super) fn arch(dev: &CudaDevice) -> &'static str {
-    use cudarc::driver::sys::CUdevice_attribute as A;
-    use std::collections::HashMap;
-    use std::sync::Mutex;
-    static NAMES: Mutex<Option<HashMap<(i32, i32), &'static str>>> = Mutex::new(None);
-    let major = dev
-        .device_attribute(A::CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR)
-        .unwrap_or(7);
-    let minor = dev
-        .device_attribute(A::CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR)
-        .unwrap_or(5);
-    let mut g = NAMES.lock().unwrap_or_else(|p| p.into_inner());
-    g.get_or_insert_with(HashMap::new)
-        .entry((major, minor))
-        .or_insert_with(|| Box::leak(format!("compute_{major}{minor}").into_boxed_str()))
-}
-
 impl CudaDevice {
-    /// Gated DeltaNet kernel `name`, compiled with NVRTC on first use (retrying without
-    /// `--gpu-architecture` when the installed NVRTC does not know the GPU yet).
+    /// Gated DeltaNet kernel `name`, compiled with NVRTC on first use (with on-disk PTX caching).
     fn gdn_func(&self, name: &str) -> Result<super::device::CudaFunc> {
         let module = format!("candle_gdn_{name}");
-        self.get_or_compile_func(name, &module, || {
+        self.get_or_compile_source_func(name, &module, || {
             let Some(src) = gd::gdn_cuda_source(name) else {
                 bail!("gated delta rule: unknown kernel {name}")
             };
-            let arch = arch(self);
-            let opts = |arch: Option<&'static str>| cudarc::nvrtc::CompileOptions {
-                arch,
-                options: vec!["--std=c++17".into()],
-                ..Default::default()
-            };
-            match cudarc::nvrtc::safe::compile_ptx_with_opts(&src, opts(Some(arch))) {
-                Ok(p) => Ok(p),
-                Err(_) => cudarc::nvrtc::safe::compile_ptx_with_opts(&src, opts(None)).w(),
-            }
+            Ok(src)
         })
     }
 }

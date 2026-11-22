@@ -69,19 +69,9 @@ fn bits(t: &Tensor) -> Vec<u32> {
         .collect()
 }
 
-/// `t` in the K/V dtype `kvd` (FP8 casts go through the CPU: the CUDA cast kernels of the
-/// candle kernels crate need sm_89+ for FP8).
+/// `t` in the K/V dtype `kvd` (uses on-GPU software OCP E4M3FN cast on `sm < 89`, no CPU roundtrip).
 fn to_kv(t: &Tensor, kvd: DType) -> Tensor {
-    if kvd == DType::F8E4M3 {
-        t.to_device(&Device::Cpu)
-            .unwrap()
-            .to_dtype(kvd)
-            .unwrap()
-            .to_device(t.device())
-            .unwrap()
-    } else {
-        t.to_dtype(kvd).unwrap()
-    }
+    t.to_dtype(kvd).unwrap()
 }
 
 fn strict(scale: f32) -> FlashAttnConfig {
@@ -433,6 +423,474 @@ fn turbo_cache_with_capacity() {
     let cfg = strict(1.0 / 16.0);
     let (x, y) = (a.attention(&q, &cfg).unwrap(), b.attention(&q, &cfg).unwrap());
     assert_eq!(bits(&x), bits(&y));
+}
+
+/// CUDA OCP E4M3FN software cast kernels (`sm < 89` / fallback): verifies bit-exact parity with
+/// CPU `float8::F8E4M3` across all 256 codes, RNE midpoints, subnormals, 448 saturation, ±Inf,
+/// NaN, strided layouts, integer/half pairs, and `flash_attn_fp8` (with & without Hadamard).
+#[test]
+fn e4m3_cast_kernels_match_cpu_cuda() {
+    let _g = LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    let Some(dev) = gpu() else { return };
+
+    // 1. All 256 E4M3 codes -> F32 (bit-exact including -0.0 and NaN)
+    let raw: Vec<u8> = (0u8..=255u8).collect();
+    let codes_cpu = Tensor::from_raw_buffer(&raw, DType::F8E4M3, &[256], &Device::Cpu).unwrap();
+    let want_f32 = codes_cpu.to_dtype(DType::F32).unwrap().to_vec1::<f32>().unwrap();
+    let codes_gpu = codes_cpu.to_device(&dev).unwrap();
+    let got_f32 = codes_gpu
+        .to_dtype(DType::F32)
+        .unwrap()
+        .to_device(&Device::Cpu)
+        .unwrap()
+        .to_vec1::<f32>()
+        .unwrap();
+    for (i, (&g, &w)) in got_f32.iter().zip(want_f32.iter()).enumerate() {
+        if w.is_nan() {
+            assert!(g.is_nan(), "code {i:#04x}: expected NaN, got {g}");
+        } else {
+            assert_eq!(
+                g.to_bits(),
+                w.to_bits(),
+                "code {i:#04x}: got {g} ({:#010x}) != want {w} ({:#010x})",
+                g.to_bits(),
+                w.to_bits()
+            );
+        }
+    }
+
+    // 2. F32 -> F8E4M3 across all codes, midpoints (ties-to-even), subnormals, saturation, Inf, NaN
+    let mut xs: Vec<f32> = want_f32.iter().copied().filter(|x| x.is_finite()).collect();
+    for c in 0..0x7eu8 {
+        let m = 0.5 * (want_f32[c as usize] + want_f32[c as usize + 1]);
+        xs.push(m);
+        xs.push(-m);
+        xs.push(m * (1.0 + 1e-6));
+        xs.push(m * (1.0 - 1e-6));
+    }
+    xs.extend([
+        f32::INFINITY,
+        f32::NEG_INFINITY,
+        f32::NAN,
+        448.0,
+        449.0,
+        460.0,
+        464.0,
+        465.0,
+        1e6,
+        -1e6,
+        0.0009765625, // 2^-10: half of smallest subnormal
+        0.0009766,
+        0.0029296875, // 1.5 * 2^-9
+        1e-30,
+        -1e-30,
+    ]);
+    let r = Tensor::randn(0f32, 100.0, xs.len(), &Device::Cpu)
+        .unwrap()
+        .to_vec1::<f32>()
+        .unwrap();
+    xs.extend(r);
+    let x_cpu = Tensor::from_vec(xs.clone(), xs.len(), &Device::Cpu).unwrap();
+    let cpu_f8 = x_cpu
+        .to_dtype(DType::F8E4M3)
+        .unwrap()
+        .to_dtype(DType::F32)
+        .unwrap()
+        .to_vec1::<f32>()
+        .unwrap();
+    let gpu_f8 = x_cpu
+        .to_device(&dev)
+        .unwrap()
+        .to_dtype(DType::F8E4M3)
+        .unwrap()
+        .to_device(&Device::Cpu)
+        .unwrap()
+        .to_dtype(DType::F32)
+        .unwrap()
+        .to_vec1::<f32>()
+        .unwrap();
+    for (i, (&g, &w)) in gpu_f8.iter().zip(cpu_f8.iter()).enumerate() {
+        if w.is_nan() {
+            assert!(g.is_nan(), "f32->f8 idx {i} ({}): expected NaN, got {g}", xs[i]);
+        } else {
+            assert_eq!(
+                g.to_bits(),
+                w.to_bits(),
+                "f32->f8 idx {i} ({}): got {g} != want {w}",
+                xs[i]
+            );
+        }
+    }
+
+    // 3. Strided layout + F16/BF16/U32/I64 <-> F8E4M3 pairs
+    let mat = Tensor::randn(0f32, 4.0, (16, 24), &dev).unwrap();
+    let strided = mat.t().unwrap().narrow(0, 3, 10).unwrap();
+    let s_gpu = strided
+        .to_dtype(DType::F8E4M3)
+        .unwrap()
+        .to_dtype(DType::F32)
+        .unwrap()
+        .to_device(&Device::Cpu)
+        .unwrap();
+    let s_cpu = strided
+        .to_device(&Device::Cpu)
+        .unwrap()
+        .to_dtype(DType::F8E4M3)
+        .unwrap()
+        .to_dtype(DType::F32)
+        .unwrap();
+    assert_eq!(bits(&s_gpu), bits(&s_cpu), "strided f32->f8->f32 mismatch");
+    for dt in [DType::F16, DType::BF16, DType::F64] {
+        let a = mat.to_dtype(dt).unwrap();
+        let g = a
+            .to_dtype(DType::F8E4M3)
+            .unwrap()
+            .to_dtype(dt)
+            .unwrap()
+            .to_dtype(DType::F32)
+            .unwrap()
+            .to_device(&Device::Cpu)
+            .unwrap();
+        let w = a
+            .to_device(&Device::Cpu)
+            .unwrap()
+            .to_dtype(DType::F8E4M3)
+            .unwrap()
+            .to_dtype(dt)
+            .unwrap()
+            .to_dtype(DType::F32)
+            .unwrap();
+        assert_eq!(bits(&g), bits(&w), "cuda {dt:?}<->f8 mismatch");
+    }
+
+    // 4. `flash_attn_fp8` on CUDA (BSHD layout: exercises native GPU F8E4M3 cast + single-sync amax + Hadamard)
+    let (q, k, v) = (
+        randn(&[1, 16, 8, 64], &dev).to_dtype(DType::BF16).unwrap(),
+        randn(&[1, 128, 4, 64], &dev).to_dtype(DType::BF16).unwrap(),
+        randn(&[1, 128, 4, 64], &dev).to_dtype(DType::BF16).unwrap(),
+    );
+    let cfg = strict(1.0 / 8.0);
+    let ref_out = candle_nn::flash_attn::flash_attn_with_config(&q, &k, &v, &cfg).unwrap();
+    for had in [false, true] {
+        accel::update_config(|c| c.flash_attn.hadamard = had);
+        let fp8_out = candle_nn::flash_attn::flash_attn_fp8(&q, &k, &v, &cfg).unwrap();
+        assert_eq!(fp8_out.dtype(), DType::BF16);
+        let e = rel(&fp8_out, &ref_out);
+        assert!(e < 0.15, "flash_attn_fp8 hadamard={had} rel err {e}");
+    }
+    accel::update_config(|c| c.flash_attn.hadamard = false);
+}
+
+/// Paged tile prefill (`fa2p_*`) on CUDA with non-BC-aligned pages (`[48, 40, 17]`), partial last
+/// page, and sliding window (`window_left > 0`) matches concatenated dense tile prefill (`Q4-F03`).
+#[test]
+fn paged_tile_prefill_matches_concatenated_cuda() {
+    let _g = LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    let Some(dev) = gpu() else { return };
+    for d in [64usize, 128, 256] {
+        for kvd in [DType::F32, DType::F16, DType::BF16, DType::F8E4M3] {
+            let (hq, hkv, lq) = (8usize, 4usize, 16usize);
+            let qd = if kvd == DType::F8E4M3 { DType::F16 } else { kvd };
+            let page_rows = [48usize, 40, 17];
+            let blocks: Vec<(Tensor, Tensor, usize)> = page_rows
+                .iter()
+                .map(|&r| {
+                    let cap = 48usize;
+                    let k = to_kv(&randn(&[1, hkv, cap, d], &dev), kvd);
+                    let v = to_kv(&randn(&[1, hkv, cap, d], &dev), kvd);
+                    (k, v, r)
+                })
+                .collect();
+            let (k_cat, v_cat) = cat_valid(&blocks);
+            let q = randn(&[1, hq, lq, d], &dev).to_dtype(qd).unwrap();
+            for win in [-1i32, 40] {
+                let mut cfg = strict(1.0 / (d as f32).sqrt()).split_kv(SplitKv::Off);
+                if win >= 0 {
+                    cfg = cfg.window(Some(win as usize), Some(0));
+                }
+                let got = flash_attn_blocks(&q, &refs(&blocks), &cfg).unwrap();
+                let want = flash_attn_bhsd(&q, &k_cat, &v_cat, &cfg).unwrap();
+                let e = rel(&got, &want);
+                assert!(
+                    e <= 1e-6,
+                    "cuda fa2p d={d} kvd={kvd:?} win={win}: rel err {e}"
+                );
+            }
+        }
+    }
+}
+
+/// Real-GPU CUDA coverage for:
+/// - NVFP4/NVFP4 (`_nvfp4`) & NVFP4/FP8 (`_nvfp4_fp8`) dense+paged fast-vs-generic bit-exactness
+/// - CUDA `tq_fwht` (`d∈{64,128,256}`) vs dense `rotation_matrix` (`rel <= 1e-6`)
+/// - CUDA `tq_quant_prod_fused` (`TurboProd` `d∈{64,128}`)
+/// - CUDA `OffloadedTurboKvEngine` + `PinnedKvSlab` (both `<4 MiB` sync and `>=4 MiB` pinned async DMA + `kv_len < max_kv_len` compact view + 2-layer `run_layers`)
+/// - CUDA `GuardedQuantLmHead` (adversarial REST spike, exact tie row, tail tile `V=97`, `M=1,4,12`, `download_ids_and_mask()`).
+#[test]
+fn tq_nvfp4_fast_fwht_prod_offload_and_quant_lm_head_cuda() {
+    let _g = LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    let Some(dev) = gpu() else { return };
+
+    // 1. NVFP4/NVFP4 and NVFP4/FP8 dense + paged fast-vs-generic bit-exactness
+    for vf in [QuantFormat::Nvfp4, QuantFormat::Fp8] {
+        let (hq, hkv, d, lk) = (8usize, 2usize, 128usize, 256usize);
+        let kq = TurboQuantizer::new(QuantFormat::Nvfp4, d, RotationKind::Hadamard, 11, &dev).unwrap();
+        let vq = TurboQuantizer::new(vf, d, RotationKind::Hadamard, 13, &dev).unwrap();
+        let (k, v) = (randn(&[1, hkv, lk, d], &dev), randn(&[1, hkv, lk, d], &dev));
+        let (kr, vr) = (pack(&kq, &k), pack(&vq, &v));
+        let q = randn(&[1, hq, 1, d], &dev);
+        let cfg = strict(1.0 / (d as f32).sqrt()).split_kv(SplitKv::Off);
+        let blocks = [KvBlockRef { k: &kr, v: &vr, rows: lk }];
+        set_fp8_fast(false);
+        let slow = attention_packed(&q, &kr, &vr, lk, &kq, &vq, &cfg).unwrap();
+        let slow_p = attention_packed_blocks(&q, &blocks, &kq, &vq, &cfg).unwrap();
+        set_fp8_fast(true);
+        let fast = attention_packed(&q, &kr, &vr, lk, &kq, &vq, &cfg).unwrap();
+        let fast_p = attention_packed_blocks(&q, &blocks, &kq, &vq, &cfg).unwrap();
+        assert_eq!(bits(&fast), bits(&slow), "cuda nvfp4/{vf} dense fast vs generic");
+        assert_eq!(bits(&fast_p), bits(&slow_p), "cuda nvfp4/{vf} paged fast vs generic");
+    }
+
+    // 2. CUDA FWHT vs dense rotation_matrix (Step 1 gate: rel <= 1e-6 for d∈{64,128,256})
+    for d in [64usize, 128, 256] {
+        let qz = TurboQuantizer::new(QuantFormat::Fp8, d, RotationKind::Hadamard, 77, &dev).unwrap();
+        let pi = accel::turbo::rotation_matrix(d, RotationKind::Hadamard, 77).unwrap();
+        let pi_t = Tensor::from_vec(pi, (d, d), &dev).unwrap().t().unwrap().contiguous().unwrap();
+        let x = randn(&[17, d], &dev);
+        let y_fwht = qz.rotate(&x).unwrap();
+        let y_dense = x.matmul(&pi_t).unwrap();
+        let e = rel(&y_fwht, &y_dense);
+        assert!(e <= 1e-6, "cuda FWHT d={d} vs dense rel err {e}");
+        let rt = qz.unrotate(&y_fwht).unwrap();
+        let e_rt = rel(&rt, &x);
+        assert!(e_rt <= 1e-6, "cuda FWHT roundtrip d={d} rel err {e_rt}");
+    }
+
+    // 3. CUDA single-pass `tq_quant_prod_fused`
+    for d in [64usize, 128] {
+        let qp = TurboQuantizer::new(
+            QuantFormat::TurboProd { bits: 4 },
+            d,
+            RotationKind::Hadamard,
+            19,
+            &dev,
+        )
+        .unwrap();
+        let x = randn(&[32, d], &dev);
+        let packed = qp.quantize_rows(&x).unwrap();
+        let dq_gpu = qp.dequantize_rows(&packed).unwrap().to_device(&Device::Cpu).unwrap();
+        let qp_cpu = TurboQuantizer::new(
+            QuantFormat::TurboProd { bits: 4 },
+            d,
+            RotationKind::Hadamard,
+            19,
+            &Device::Cpu,
+        )
+        .unwrap();
+        let p_cpu = qp_cpu.quantize_rows(&x.to_device(&Device::Cpu).unwrap()).unwrap();
+        let dq_cpu = qp_cpu.dequantize_rows(&p_cpu).unwrap();
+        let e = rel(&dq_gpu, &dq_cpu);
+        assert!(e < 2e-2, "cuda tq_quant_prod_fused d={d} vs cpu rel err {e}");
+    }
+
+    // 4. CUDA `OffloadedTurboKvEngine`: both small sync and >=4 MiB pinned async DMA + compact view
+    {
+        use candle_nn::kv_offload::{OffloadedTurboKvEngine, PinnedKvSlab};
+        let (hq, hkv, d) = (8usize, 4usize, 128usize);
+        let kq = TurboQuantizer::new(QuantFormat::Nvfp4, d, RotationKind::Hadamard, 23, &dev).unwrap();
+        let vq = TurboQuantizer::new(QuantFormat::Fp8, d, RotationKind::Hadamard, 29, &dev).unwrap();
+        let cfg = strict(1.0 / (d as f32).sqrt()).split_kv(SplitKv::Off);
+
+        // 4a. Small slab (sync direct upload) + compact kv_len < max_kv_len
+        let (max_len, kv_len) = (256usize, 180usize);
+        let (k0, v0) = (randn(&[1, hkv, kv_len, d], &dev), randn(&[1, hkv, kv_len, d], &dev));
+        let (kr0, vr0) = (pack(&kq, &k0), pack(&vq, &v0));
+        let slab_small = PinnedKvSlab::from_packed_tensors(&kr0, &vr0, &dev).unwrap();
+        let mut eng_small =
+            OffloadedTurboKvEngine::new(&dev, 1, hkv, max_len, kq.row_words(), vq.row_words())
+                .unwrap();
+        let q = randn(&[1, hq, 1, d], &dev);
+        eng_small.prefetch_slab(0, &slab_small).unwrap();
+        assert!(!eng_small.slot_used_async_dma(0), "small slab should take sync path");
+        let out_small = eng_small.attend_slot(0, &q, &kq, &vq, &cfg).unwrap();
+        let ref_small = attention_packed(&q, &kr0, &vr0, kv_len, &kq, &vq, &cfg).unwrap();
+        assert_eq!(bits(&out_small), bits(&ref_small), "cuda offload small sync parity");
+
+        // 4b. Large slab (> 4 MiB total so PinnedKvSlab allocates pinned host memory & runs async CopyStream DMA!)
+        // hkv=4, kv_len=6000: k ~ 4*6000*20*4 = 1.92 MiB, v ~ 4*6000*34*4 = 3.26 MiB -> >5.1 MiB!
+        let (big_max, big_len) = (8192usize, 6000usize);
+        let (kb, vb) = (randn(&[1, hkv, big_len, d], &dev), randn(&[1, hkv, big_len, d], &dev));
+        let (krb, vrb) = (pack(&kq, &kb), pack(&vq, &vb));
+        let slab_big0 = PinnedKvSlab::from_packed_tensors(&krb, &vrb, &dev).unwrap();
+        let slab_big1 = PinnedKvSlab::from_packed_tensors(&krb, &vrb, &dev).unwrap();
+        assert!(slab_big0.is_pinned(), "large >4 MiB slab must use pinned host memory");
+        let mut eng_big =
+            OffloadedTurboKvEngine::new(&dev, 1, hkv, big_max, kq.row_words(), vq.row_words())
+                .unwrap();
+        let slabs = [slab_big0, slab_big1];
+        let outs = eng_big
+            .run_layers(&slabs, &kq, &vq, &cfg, |_| Ok(q.clone()))
+            .unwrap();
+        assert!(eng_big.slot_used_async_dma(0), "large slab 0 must use async DMA");
+        assert!(eng_big.slot_used_async_dma(1), "large slab 1 must use async DMA");
+        let ref_big = attention_packed(&q, &krb, &vrb, big_len, &kq, &vq, &cfg).unwrap();
+        assert_eq!(bits(&outs[0]), bits(&ref_big), "cuda offload async DMA layer 0 parity");
+        assert_eq!(bits(&outs[1]), bits(&ref_big), "cuda offload async DMA layer 1 parity");
+    }
+
+    // 5. CUDA `GuardedQuantLmHead` with adversarial REST spike, exact ties, tail tile V=97, M=1,4,12
+    {
+        use candle::quantized::{GgmlDType, QTensor};
+        use candle_nn::trimmed_head::{GuardedQuantLmHead, LmWeight};
+        use std::sync::Arc;
+        let (v_core, v_rest, k_dim) = (97usize, 64usize, 256usize);
+        let mut w_core_v: Vec<f32> = randn(&[v_core, k_dim], &Device::Cpu)
+            .flatten_all()
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap();
+        // Force an exact tie between vocab index 11 and 73 so min-index tie-breaking is tested on GPU!
+        for j in 0..k_dim {
+            w_core_v[73 * k_dim + j] = w_core_v[11 * k_dim + j];
+        }
+        let w_core_cpu = Tensor::from_vec(w_core_v, (v_core, k_dim), &Device::Cpu).unwrap();
+        let mut w_rest_v: Vec<f32> = randn(&[v_rest, k_dim], &Device::Cpu)
+            .flatten_all()
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap();
+        // Inject an adversarial spike on REST row 7 so row 0 MUST be rescued.
+        for j in 0..k_dim {
+            w_rest_v[7 * k_dim + j] = if j % 2 == 0 { 6.0 } else { -6.0 };
+        }
+        let w_rest_cpu = Tensor::from_vec(w_rest_v, (v_rest, k_dim), &Device::Cpu).unwrap();
+
+        let q_core = Arc::new(QTensor::quantize_onto(&w_core_cpu, GgmlDType::Q8_0, &dev).unwrap());
+        let q_rest = Arc::new(QTensor::quantize_onto(&w_rest_cpu, GgmlDType::Q4K, &dev).unwrap());
+        let core_ids = Tensor::arange(0u32, v_core as u32, &dev).unwrap();
+        let rest_ids = Tensor::arange(v_core as u32, (v_core + v_rest) as u32, &dev).unwrap();
+        let head = GuardedQuantLmHead::from_split_weights(
+            LmWeight::Quantized(q_core.clone()),
+            None,
+            core_ids,
+            Some((LmWeight::Quantized(q_rest.clone()), None, rest_ids)),
+            1e-2,
+            &dev,
+        )
+        .unwrap();
+
+        for m in [1usize, 4, 12] {
+            let mut h_v: Vec<f32> = randn(&[m, k_dim], &Device::Cpu)
+                .flatten_all()
+                .unwrap()
+                .to_vec1::<f32>()
+                .unwrap();
+            // Row 0 aligns strongly with REST spike row 7
+            for j in 0..k_dim {
+                h_v[j] = if j % 2 == 0 { 2.0 } else { -2.0 };
+            }
+            let h = Tensor::from_vec(h_v, (m, k_dim), &dev).unwrap();
+            let (got_ids_t, rescued) = head.forward_greedy(&h).unwrap();
+            let got_ids = got_ids_t.to_vec1::<u32>().unwrap();
+            assert!(rescued >= 1, "m={m}: adversarial REST spike must trigger rescue");
+            let full_core = q_core.forward_exact(&h).unwrap();
+            let full_rest = q_rest.forward_exact(&h).unwrap();
+            let full = Tensor::cat(&[&full_core, &full_rest], 1)
+                .unwrap()
+                .to_device(&Device::Cpu)
+                .unwrap()
+                .to_vec2::<f32>()
+                .unwrap();
+            for row in 0..m {
+                let mut best_i = 0u32;
+                let mut best_v = f32::NEG_INFINITY;
+                for (i, &v) in full[row].iter().enumerate() {
+                    if v > best_v || (v == best_v && (i as u32) < best_i) {
+                        best_v = v;
+                        best_i = i as u32;
+                    }
+                }
+                assert_eq!(got_ids[row], best_i, "cuda GuardedQuantLmHead m={m} row={row}");
+            }
+            // Verify single-D2H `download_ids_and_mask` matches individual transfers
+            let raw_out = candle::lm_head::fused_quant_argmax_cs(
+                &h,
+                &q_core,
+                None,
+                None,
+                head.cs_guard.as_ref(),
+            )
+            .unwrap();
+            let (d_ids, d_mask) = raw_out.download_ids_and_mask().unwrap();
+            assert_eq!(d_ids, raw_out.ids.to_vec1::<u32>().unwrap());
+            assert_eq!(
+                d_mask,
+                raw_out
+                    .rescue_mask
+                    .as_ref()
+                    .map(|t| t.to_vec1::<u8>().unwrap())
+            );
+        }
+    }
+}
+
+/// Multi-thread stress test on a shared `CudaDevice`: verifies RAII workspace leases
+/// (`fa_split_kv` & `lm_head_parts`) prevent cross-thread aliasing or UAF (`P0-1` / `P1-F02`).
+#[test]
+fn cuda_multithread_workspace_lease_safety() {
+    let _g = LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    let Some(dev) = gpu() else { return };
+
+    let (hq, hkv, d, lk) = (8usize, 4usize, 64usize, 512usize);
+    let q = randn(&[1, hq, 1, d], &dev);
+    let k = randn(&[1, hkv, lk, d], &dev);
+    let v = randn(&[1, hkv, lk, d], &dev);
+    let cfg = strict(1.0 / 8.0).split_kv(SplitKv::Fixed(8));
+    let golden_fa = bits(&flash_attn_bhsd(&q, &k, &v, &cfg).unwrap());
+
+    let w_lm = randn(&[97, 256], &dev);
+    let h_lm = randn(&[4, 256], &dev);
+    let golden_lm = candle::lm_head::fused_linear_argmax_cs(&h_lm, &w_lm, None, None, None)
+        .unwrap()
+        .ids
+        .to_vec1::<u32>()
+        .unwrap();
+
+    let handles: Vec<_> = (0..4)
+        .map(|tid| {
+            let (q, k, v, cfg, w_lm, h_lm) = (
+                q.clone(),
+                k.clone(),
+                v.clone(),
+                cfg.clone(),
+                w_lm.clone(),
+                h_lm.clone(),
+            );
+            let golden_fa = golden_fa.clone();
+            let golden_lm = golden_lm.clone();
+            std::thread::spawn(move || {
+                for iter in 0..8 {
+                    let out_fa = flash_attn_bhsd(&q, &k, &v, &cfg).unwrap();
+                    assert_eq!(
+                        bits(&out_fa),
+                        golden_fa,
+                        "thread {tid} iter {iter}: Split-KV fa_split_kv corrupted"
+                    );
+                    let out_lm =
+                        candle::lm_head::fused_linear_argmax_cs(&h_lm, &w_lm, None, None, None)
+                            .unwrap();
+                    assert_eq!(
+                        out_lm.ids.to_vec1::<u32>().unwrap(),
+                        golden_lm,
+                        "thread {tid} iter {iter}: lm_head_parts corrupted"
+                    );
+                }
+            })
+        })
+        .collect();
+    for h in handles {
+        h.join().unwrap();
+    }
 }
 
 // ---------------------------------------------------------------------------

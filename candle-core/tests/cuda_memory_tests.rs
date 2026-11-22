@@ -422,6 +422,160 @@ fn strided_kernel_parameter_uploads() -> Result<()> {
     Ok(())
 }
 
+/// Verifies `AsyncPrefetchSlot` on CUDA across both `< 4 MiB` direct compute-stream fallback
+/// and `>= 4 MiB` pinned CopyStream async DMA + `wait_on_compute`.
+#[test]
+fn async_prefetch_slot_small_and_large_dma() -> Result<()> {
+    use candle_core::cuda_backend::offload::{AsyncPrefetchSlot, ASYNC_DMA_MIN_BYTES};
+    let _g = serial();
+    let dev = device()?;
+    let cuda = dev.as_cuda_device()?.clone();
+    let large_bytes = ASYNC_DMA_MIN_BYTES + 256 * 1024;
+    let mut slot = AsyncPrefetchSlot::new(&cuda, large_bytes)?;
+    assert_eq!(slot.capacity_bytes(), large_bytes);
+
+    // 1. Small payload (< 4 MiB): bypasses pinned staging and copies directly on compute stream.
+    let small_elems = 16 * 1024; // 64 KiB
+    let small_data: Vec<f32> = (0..small_elems).map(|i| (i as f32) * 0.25 - 10.0).collect();
+    let dst_small = Tensor::zeros(small_elems, DType::F32, &dev)?;
+    with_cuda_storage(&dst_small, |s| {
+        slot.prefetch_bytes(&f32_bytes(&small_data), s, 0)
+    })?;
+    slot.wait_on_compute(&cuda)?;
+    assert_eq!(dst_small.to_vec1::<f32>()?, small_data);
+
+    // 2. Large payload (>= 4 MiB): pinned staging + CopyStream async DMA + event wait.
+    let large_elems = large_bytes / 4;
+    let large_data: Vec<f32> = (0..large_elems).map(|i| ((i * 7 + 3) % 1024) as f32).collect();
+    let dst_large = Tensor::zeros(large_elems, DType::F32, &dev)?;
+    with_cuda_storage(&dst_large, |s| {
+        slot.prefetch_bytes(&f32_bytes(&large_data), s, 0)
+    })?;
+    slot.wait_on_compute(&cuda)?;
+    assert_eq!(dst_large.to_vec1::<f32>()?, large_data);
+
+    // 3. Oversized payload is cleanly rejected.
+    let too_big = vec![0u8; large_bytes + 4];
+    assert!(with_cuda_storage(&dst_large, |s| slot.prefetch_bytes(&too_big, s, 0)).is_err());
+    assert_eq!(dev.take_deferred_error(), None);
+    Ok(())
+}
+
+/// GPU-less NVRTC compile-only smoke test (`P5-O04` / `P1-O12`): verifies every NVRTC kernel
+/// family compiles cleanly with `--std=c++17` (strictly no `--use_fast_math`) and emits the
+/// expected entry-point symbols.
+#[test]
+fn nvrtc_compile_all_kernels_smoke() -> Result<()> {
+    use candle_core::accel::{delta, sources};
+    use candle_core::cuda_backend::cudarc::nvrtc::{safe::compile_ptx_with_opts, CompileOptions};
+
+    let compile_check = |label: &str, src: &str, expected_syms: &[&str]| -> Result<()> {
+        let make_opts = |arch: Option<&'static str>| CompileOptions {
+            arch,
+            options: vec!["--std=c++17".into()],
+            ..Default::default()
+        };
+        let ptx = match compile_ptx_with_opts(src, make_opts(Some("compute_80"))) {
+            Ok(p) => p,
+            Err(_) => compile_ptx_with_opts(src, make_opts(None))
+                .map_err(|e| candle_core::Error::Msg(format!("NVRTC failed for {label}: {e}")))?,
+        };
+        let ptx_str = ptx.to_src();
+        for sym in expected_syms {
+            assert!(
+                ptx_str.contains(sym),
+                "NVRTC PTX for {label} missing expected entry symbol `{sym}`"
+            );
+        }
+        Ok(())
+    };
+
+    for name in [
+        "fa_row_f16_fp8",
+        "fa_rowpg4_bf16_fp8",
+        "fa2_d128_bf16_fp8",
+        "fa2p_d128_f16_f16",
+        "fa3p_d128_bf16_bf16",
+        "fa_combine_bf16",
+    ] {
+        let src = sources::flash_attn_cuda_source(name).expect("valid FA kernel name");
+        compile_check(name, &src, &[name])?;
+    }
+
+    compile_check(
+        "turbo_quant",
+        &sources::turbo_quant_cuda_source(),
+        &[
+            "tq_fwht_f32",
+            "tq_quant_prod_bf16",
+            "tq_attn_nvfp4",
+            "tq_attnp_nvfp4_fp8",
+            "tq_tile2_d128",
+            "tq_tilep3_d128",
+        ],
+    )?;
+
+    compile_check(
+        "decoder_ops",
+        &sources::decoder_ops_cuda_source(),
+        &["res_rmsnorm_bf16", "silu_mul_f16", "rope_kv_write_f32"],
+    )?;
+
+    compile_check(
+        "lm_head_argmax",
+        &sources::lm_head_argmax_cuda_source(),
+        &[
+            "lm_stage1_decode1_bf16",
+            "lm_stage1_decode8_bf16",
+            "lm_stage1_prefill_f16",
+            "lm_stage2_reduce_cs_f32",
+            "lm_logits_argmax_cs_f32_bf16",
+        ],
+    )?;
+
+    let gdn_src = delta::gdn_cuda_source("gdn_scan_f16_d128_c16x2_w8_t8").expect("valid GDN kernel");
+    compile_check(
+        "gdn_scan_f16_d128_c16x2_w8_t8",
+        &gdn_src,
+        &["gdn_scan_f16_d128_c16x2_w8_t8"],
+    )?;
+    let gdn_gnorm_src = delta::gdn_cuda_source("gdn_gnorm_bf16").expect("valid GDN gnorm kernel");
+    compile_check("gdn_gnorm_bf16", &gdn_gnorm_src, &["gdn_gnorm_bf16"])?;
+
+    let w8_base: String = sources::W8A16_IMPL_H
+        .lines()
+        .filter(|l| {
+            let t = l.trim_start();
+            !(t.starts_with("#include \"") || t.starts_with("#pragma once"))
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    let w8_smoke = format!(
+        "{w8_base}\n\
+         W8A16_MOE_KERNEL(w8a16_moe_q4k_bf16, DecQ4K, w_bf16)\n\
+         W8A16_LM_QUANT_KERNEL(w8a16_lm1_q8_0_f16, DecQ8_0, w_f16, 1)\n\
+         W8A16_LM_QUANT_KERNEL(w8a16_lm8_q6k_bf16, DecQ6K, w_bf16, 8)\n\
+         W8A16_NVFP4_MV_KERNEL(w8a16_nvfp4_mv8_bf16, w_bf16, 8)\n\
+         W8A16_NVFP4_DQ_KERNEL(w8a16_nvfp4_dq_f16, w_f16)\n\
+         W8A16_NVFP8_MV_KERNEL(w8a16_nvfp8_mv1_f32, float, 1)\n\
+         W8A16_NVFP8_DQ_KERNEL(w8a16_nvfp8_dq_bf16, w_bf16)\n"
+    );
+    compile_check(
+        "w8a16_new_kernels",
+        &w8_smoke,
+        &[
+            "w8a16_moe_q4k_bf16",
+            "w8a16_lm1_q8_0_f16",
+            "w8a16_lm8_q6k_bf16",
+            "w8a16_nvfp4_mv8_bf16",
+            "w8a16_nvfp4_dq_f16",
+            "w8a16_nvfp8_mv1_f32",
+            "w8a16_nvfp8_dq_bf16",
+        ],
+    )?;
+    Ok(())
+}
+
 /// Host-to-device bandwidth of the pinned copy stream against a pageable upload
 /// (`cargo test --test cuda_memory_tests -- --ignored --nocapture`).
 #[test]

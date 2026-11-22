@@ -266,7 +266,7 @@ impl TurboQuantizer {
     }
 
     /// `x Πᵀ` in f32 (rows of the rotated domain). Uses O(d log d) FWHT when `Hadamard`.
-    fn rotate(&self, x: &Tensor) -> Result<Tensor> {
+    pub fn rotate(&self, x: &Tensor) -> Result<Tensor> {
         if let Some(y) = self.fwht_transform(x, true)? {
             return Ok(y);
         }
@@ -278,7 +278,7 @@ impl TurboQuantizer {
     }
 
     /// `y Π`: back from the rotated domain. Uses O(d log d) FWHT when `Hadamard`.
-    fn unrotate(&self, y: &Tensor) -> Result<Tensor> {
+    pub fn unrotate(&self, y: &Tensor) -> Result<Tensor> {
         if let Some(z) = self.fwht_transform(y, false)? {
             return Ok(z);
         }

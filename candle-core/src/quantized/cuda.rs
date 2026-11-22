@@ -607,14 +607,18 @@ impl QCudaStorage {
         ids: &CudaStorage, //[batch, topk]
         ids_l: &crate::Layout,
     ) -> Result<(CudaStorage, crate::Shape)> {
-        // Exact weight-only W8A16 MoE path for F16/BF16 inputs or Q4_0 weights (previously
-        // unsupported on CUDA `indexed_moe_forward`, `P1-26` / `Q2-F05` / `Q2-O07`).
+        use crate::backend::{BackendDevice, BackendStorage};
+        // Exact weight-only W8A16 MoE path for Q8_0/Q4_0/Q4K/Q5K/Q6K × F32/F16/BF16 (`P1-26` /
+        // `Q2-F05` / `Q2-O07`): avoids activation Q8_1 quantization, per-call `input_quant`
+        // `alloc_zeros`, and upstream candle-kernels' Q8_0 `QK_K` expert-stride bug.
         let use_w8a16 = super::w8a16::mv_supported(self.dtype())
-            && (matches!(input.dtype(), crate::DType::F16 | crate::DType::BF16)
-                || self.dtype() == GgmlDType::Q4_0);
+            && matches!(
+                input.dtype(),
+                crate::DType::F32 | crate::DType::F16 | crate::DType::BF16
+            );
         if use_w8a16 {
             let (num_experts, n, k) = self_shape.dims3()?;
-            let (batch, topk) = ids_l.dims2()?;
+            let (batch, topk) = ids_l.shape().dims2()?;
             let x_dims = input_l.dims();
             let x_has_topk = match x_dims {
                 [b, kk] if *b == batch && *kk == k => false,
@@ -630,14 +634,18 @@ impl QCudaStorage {
             {
                 (input, input_l.start_offset())
             } else {
-                x_owned = input.contiguous_copy(input_l)?;
+                let mut dst = unsafe { self.device.alloc_uninit(input_l.shape(), input.dtype())? };
+                input.copy_strided_src(&mut dst, 0, input_l)?;
+                x_owned = dst;
                 (&x_owned, 0)
             };
             let ids_owned;
             let (ids_ref, ids_off) = if ids_l.is_contiguous() {
                 (ids, ids_l.start_offset())
             } else {
-                ids_owned = ids.contiguous_copy(ids_l)?;
+                let mut dst = unsafe { self.device.alloc_uninit(ids_l.shape(), ids.dtype())? };
+                ids.copy_strided_src(&mut dst, 0, ids_l)?;
+                ids_owned = dst;
                 (&ids_owned, 0)
             };
             let ids_slice = ids_ref.as_cuda_slice::<u32>()?;

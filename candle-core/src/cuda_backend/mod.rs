@@ -19,6 +19,7 @@ mod decoder_ops;
 mod delta_rule;
 mod device;
 mod error;
+mod fp8_cast;
 mod lm_head;
 pub mod offload;
 mod utils;
@@ -1584,7 +1585,29 @@ impl BackendStorage for CudaStorage {
         let inp = &inp;
 
         let kernel_name = format!("cast_{}_{}", self.dtype().as_str(), dtype.as_str());
-        let func = dev.get_or_load_func(&kernel_name, &kernels::CAST)?;
+        let involves_fp8 = self.dtype() == DType::F8E4M3 || dtype == DType::F8E4M3;
+        let func = if involves_fp8 {
+            let (major, minor) = dev.compute_cap();
+            // On pre-Ada GPUs (sm < 89) use the headerless software OCP E4M3FN NVRTC kernel
+            // directly (bit-exact with CPU `float8::F8E4M3`, works down to sm_70); on sm_89+
+            // try precompiled `candle_kernels::CAST` (which spells the dtype `f8_e4m3`) first
+            // and fall back to software for any missing dtype pairs (`Q1-F06` / `Q1-O06`).
+            if major * 10 + minor < 89 {
+                dev.fp8_cast_func(&kernel_name)?
+            } else {
+                let ck_name = |d: DType| match d {
+                    DType::F8E4M3 => "f8_e4m3",
+                    _ => d.as_str(),
+                };
+                let ck_kernel = format!("cast_{}_{}", ck_name(self.dtype()), ck_name(dtype));
+                match dev.get_or_load_func(&ck_kernel, &kernels::CAST) {
+                    Ok(f) => f,
+                    Err(_) => dev.fp8_cast_func(&kernel_name)?,
+                }
+            }
+        } else {
+            dev.get_or_load_func(&kernel_name, &kernels::CAST)?
+        };
         let slice = match dtype {
             DType::U8 => {
                 let out = unsafe { dev.alloc::<u8>(el)? };

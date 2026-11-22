@@ -642,7 +642,10 @@ impl NvfpWeight {
 
         #[cfg(feature = "cuda")]
         if let Device::Cuda(dev) = self.data.device() {
-            if m > 0 && m <= 8 && self.layout.rows > 0 && matches!(in_dtype, DType::F32 | DType::F16 | DType::BF16) {
+            if m > 0
+                && self.layout.rows > 0
+                && matches!(in_dtype, DType::F32 | DType::F16 | DType::BF16)
+            {
                 let esz = in_dtype.size_in_bytes();
                 let x_owned;
                 let x_ref = if x.is_contiguous()
@@ -656,18 +659,49 @@ impl NvfpWeight {
                 let (wst, _) = self.data.storage_and_layout();
                 let (xst, xl) = x_ref.storage_and_layout();
                 if let (crate::Storage::Cuda(ws), crate::Storage::Cuda(xs)) = (&*wst, &*xst) {
-                    let out_st = super::w8a16::nvfp_mv(
-                        dev,
-                        ws.as_cuda_slice::<u8>()?,
-                        self.layout.bscale_off,
-                        self.layout.rscale_off,
-                        self.layout.format == NvfpFormat::Nvfp4,
-                        k,
-                        self.layout.rows,
-                        xs,
-                        xl.start_offset(),
-                        m,
-                    )?;
+                    let data_slice = ws.as_cuda_slice::<u8>()?;
+                    let is_fp4 = self.layout.format == NvfpFormat::Nvfp4;
+                    let out_st = if m <= 8 {
+                        super::w8a16::nvfp_mv(
+                            dev,
+                            data_slice,
+                            self.layout.bscale_off,
+                            self.layout.rscale_off,
+                            is_fp4,
+                            k,
+                            self.layout.rows,
+                            xs,
+                            xl.start_offset(),
+                            m,
+                        )?
+                    } else {
+                        // Prefill (M > 8): 32 MiB tiled dequant + exact F32-accumulated cuBLAS GEMM
+                        // (`Q1-F03` / `Q1-O03`) so large weights never allocate a full `[N, K]` buffer.
+                        let tile_rows = (super::w8a16::dequant_tile_bytes() / (k * esz).max(1))
+                            .clamp(1, self.layout.rows);
+                        super::w8a16::gemm_tiles(
+                            dev,
+                            xs,
+                            xl.start_offset(),
+                            m,
+                            self.layout.rows,
+                            k,
+                            tile_rows,
+                            |row0, nrows| {
+                                super::w8a16::nvfp_dq_rows(
+                                    dev,
+                                    data_slice,
+                                    self.layout.bscale_off,
+                                    self.layout.rscale_off,
+                                    is_fp4,
+                                    k,
+                                    row0,
+                                    nrows,
+                                    in_dtype,
+                                )
+                            },
+                        )?
+                    };
                     return Ok(crate::tensor::from_storage(
                         crate::Storage::Cuda(out_st),
                         out_dims,
