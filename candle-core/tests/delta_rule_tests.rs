@@ -958,3 +958,103 @@ fn bench_gdn_qwen35() -> Result<()> {
     }
     Ok(())
 }
+
+/// Long-sequence GDN cumulative precision check (`PRC-11` / `S6-PP09`):
+/// 128-token prefill followed by 64 decode steps compared against the naive f64 reference on GPU.
+#[test]
+fn gdn_long_sequence_drift() -> Result<()> {
+    let Some(dev) = gpu() else {
+        eprintln!("no GPU, skipping gdn_long_sequence_drift");
+        return Ok(());
+    };
+    let (t_pre, t_dec) = (128usize, 64usize);
+    let mut full_cs = Case::new(1, t_pre + t_dec, 4, 8, 128, 128, 4);
+    full_cs.state = true;
+    full_cs.x_scale = 0.5;
+    let full_d = gen(&full_cs, 9001);
+    let want = reference(&full_cs, &full_d);
+
+    let c = full_cs.c();
+    let cfg = full_cs.cfg();
+    for (dtype, tol_out, tol_state) in [(DType::F32, 5e-4, 5e-4), (DType::F16, 4e-2, 4e-2)] {
+        let w = tensor(&full_d.conv_w, &[c, 4], DType::F32, &dev)?;
+        let na = tensor(&full_d.neg_a, &[full_cs.hv], DType::F32, &dev)?;
+        let dtb = tensor(&full_d.dt_bias, &[full_cs.hv], DType::F32, &dev)?;
+        let mut cst = tensor(full_d.conv_state.as_ref().unwrap(), &[1, c, 3], dtype, &dev)?;
+        let mut st = tensor(
+            full_d.state.as_ref().unwrap(),
+            &[1, full_cs.hv, 128, 128],
+            DType::F32,
+            &dev,
+        )?;
+
+        let mixed_pre = tensor(&full_d.mixed[..t_pre * c], &[1, t_pre, c], dtype, &dev)?;
+        let a_pre = tensor(
+            &full_d.a[..t_pre * full_cs.hv],
+            &[1, t_pre, full_cs.hv],
+            dtype,
+            &dev,
+        )?;
+        let b_pre = tensor(
+            &full_d.b[..t_pre * full_cs.hv],
+            &[1, t_pre, full_cs.hv],
+            dtype,
+            &dev,
+        )?;
+        let pre = fused_gated_delta_rule(
+            &mixed_pre,
+            &w,
+            None,
+            Some(&cst),
+            &a_pre,
+            &b_pre,
+            &na,
+            &dtb,
+            Some(&st),
+            &cfg,
+        )?;
+        cst = pre.conv_state;
+        st = pre.recurrent_state;
+        let mut all_out = host(&pre.out)?;
+
+        for step in 0..t_dec {
+            let ti = t_pre + step;
+            let m1 = tensor(&full_d.mixed[ti * c..(ti + 1) * c], &[1, 1, c], dtype, &dev)?;
+            let a1 = tensor(
+                &full_d.a[ti * full_cs.hv..(ti + 1) * full_cs.hv],
+                &[1, 1, full_cs.hv],
+                dtype,
+                &dev,
+            )?;
+            let b1 = tensor(
+                &full_d.b[ti * full_cs.hv..(ti + 1) * full_cs.hv],
+                &[1, 1, full_cs.hv],
+                dtype,
+                &dev,
+            )?;
+            let dec = fused_gated_delta_rule(
+                &m1,
+                &w,
+                None,
+                Some(&cst),
+                &a1,
+                &b1,
+                &na,
+                &dtb,
+                Some(&st),
+                &cfg,
+            )?;
+            cst = dec.conv_state;
+            st = dec.recurrent_state;
+            all_out.extend(host(&dec.out)?);
+        }
+
+        let err_out = rel(&all_out, &want.out);
+        let err_st = rel(&host(&st)?, &want.state);
+        assert!(
+            err_out <= tol_out && err_st <= tol_state,
+            "gdn long-seq {dtype:?}: err_out={err_out:.3e} (tol {tol_out}), err_st={err_st:.3e} (tol {tol_state})"
+        );
+    }
+    Ok(())
+}

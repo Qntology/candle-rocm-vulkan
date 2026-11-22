@@ -13,7 +13,20 @@ const MODULE_NAME: &str = "candle_lm_head_argmax";
 
 impl CudaDevice {
     pub(crate) fn lm_head_func(&self, fn_name: &str) -> Result<super::device::CudaFunc> {
-        self.get_or_compile_source_func(fn_name, MODULE_NAME, || Ok(lm_head_argmax_cuda_source()))
+        self.get_or_compile_internal_func(
+            fn_name,
+            || MODULE_NAME.to_string(),
+            || Ok(lm_head_argmax_cuda_source()),
+        )
+    }
+}
+
+fn stage2_name(dtype: DType) -> Result<&'static str> {
+    match dtype {
+        DType::F32 => Ok("lm_stage2_reduce_cs_f32"),
+        DType::F16 => Ok("lm_stage2_reduce_cs_f16"),
+        DType::BF16 => Ok("lm_stage2_reduce_cs_bf16"),
+        d => bail!("lm_head_argmax: unsupported dtype {d:?} on the CUDA backend"),
     }
 }
 
@@ -84,7 +97,7 @@ impl CudaStorage {
             let pi_bytes = (m * n_tiles).max(1) * 4;
 
             let f1 = dev.lm_head_func(&plan.kernel_name(sfx))?;
-            let f2 = dev.lm_head_func(&format!("lm_stage2_reduce_cs_{sfx}"))?;
+            let f2 = dev.lm_head_func(stage2_name(dtype)?)?;
             let stream = dev.cuda_stream();
 
             // Hold the workspace lock across both Stage 1 and Stage 2 queueing so another
@@ -213,7 +226,7 @@ impl CudaStorage {
     ) -> Result<(Self, Self, Self)> {
         use crate::backend::BackendStorage;
         let dtype = self.dtype();
-        let sfx = float_sfx(dtype)?;
+        let s2 = stage2_name(dtype)?;
         let dev = &self.device;
 
         let mut out_ids = unsafe { dev.alloc::<u32>(m.max(1))? };
@@ -226,7 +239,7 @@ impl CudaStorage {
             let pv_bytes = ((max_chunk * n_tiles).max(1) * 4).div_ceil(256) * 256;
             let pi_bytes = (max_chunk * n_tiles).max(1) * 4;
 
-            let f2 = dev.lm_head_func(&format!("lm_stage2_reduce_cs_{sfx}"))?;
+            let f2 = dev.lm_head_func(s2)?;
             let stream = dev.cuda_stream();
 
             let mut ws = dev.workspaces();

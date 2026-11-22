@@ -396,6 +396,15 @@ impl Device {
         matches!(self, Self::Cuda(_))
     }
 
+    /// `(major, minor)` CUDA compute capability if this is a CUDA device, otherwise `None`.
+    pub fn cuda_compute_capability(&self) -> Option<(i32, i32)> {
+        match self {
+            #[cfg(feature = "cuda")]
+            Self::Cuda(d) => Some(d.compute_capability()),
+            _ => None,
+        }
+    }
+
     pub fn is_metal(&self) -> bool {
         matches!(self, Self::Metal(_))
     }

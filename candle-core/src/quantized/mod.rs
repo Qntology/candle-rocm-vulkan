@@ -667,6 +667,64 @@ impl QTensor {
         })
     }
 
+    /// Concatenates 2D quantized weight tensors `(n_i, k)` along row dimension 0 into a single
+    /// `(sum(n_i), k)` `QTensor` on the same device and `GgmlDType`.
+    ///
+    /// Used to fuse projections sharing an input (`q|k|v`, `gate|up`, GDN `qkv|z|b|a`) into one
+    /// mat-vec kernel launch (`SPD-08` / `S5-SP03`). On CUDA this performs a direct
+    /// device-to-device copy with zero host round-trip.
+    pub fn cat_rows(tensors: &[&Self]) -> Result<Self> {
+        let Some(first) = tensors.first() else {
+            crate::bail!("QTensor::cat_rows: empty input")
+        };
+        let dtype = first.dtype();
+        let dev = first.device();
+        let bs = dtype.block_size();
+        let (_, k) = first.shape().dims2()?;
+        if !k.is_multiple_of(bs) {
+            crate::bail!("QTensor::cat_rows: k={k} is not divisible by block size {bs}")
+        }
+        let mut total_rows = 0usize;
+        for t in tensors {
+            if t.dtype() != dtype {
+                crate::bail!(
+                    "QTensor::cat_rows: dtype mismatch ({:?} vs {:?})",
+                    t.dtype(),
+                    dtype
+                )
+            }
+            if !t.device().same_device(&dev) {
+                crate::bail!("QTensor::cat_rows: device mismatch")
+            }
+            let (n_i, k_i) = t.shape().dims2()?;
+            if k_i != k {
+                crate::bail!("QTensor::cat_rows: inner dim mismatch ({k_i} vs {k})")
+            }
+            total_rows += n_i;
+        }
+        #[cfg(feature = "cuda")]
+        if matches!(&first.storage, QStorage::Cuda(_)) {
+            let mut cuda_refs = Vec::with_capacity(tensors.len());
+            for t in tensors {
+                if let QStorage::Cuda(s) = &t.storage {
+                    cuda_refs.push(s);
+                } else {
+                    crate::bail!("QTensor::cat_rows: device mismatch")
+                }
+            }
+            let merged = cuda::QCudaStorage::cat_rows(&cuda_refs)?;
+            return Self::new(QStorage::Cuda(merged), (total_rows, k));
+        }
+        let total_bytes: usize = tensors.iter().map(|t| t.storage_size_in_bytes()).sum();
+        let mut buf = Vec::with_capacity(total_bytes);
+        for t in tensors {
+            let raw = t.storage.data()?;
+            buf.extend_from_slice(&raw);
+        }
+        let storage = QStorage::from_data(Cow::Owned(buf), &dev, dtype)?;
+        Self::new(storage, (total_rows, k))
+    }
+
     pub fn quantize(src: &Tensor, dtype: GgmlDType) -> Result<Self> {
         let shape = src.shape();
         let block_size = dtype.block_size();

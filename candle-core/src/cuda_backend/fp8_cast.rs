@@ -274,8 +274,10 @@ impl CudaDevice {
     /// Software OCP E4M3FN cast kernel (`cast_<src>_f8_e4m3` / `cast_f8_e4m3_<dst>`), compiled
     /// once with NVRTC and cached on disk.
     pub(crate) fn fp8_cast_func(&self, kernel_name: &str) -> Result<CudaFunc> {
-        self.get_or_compile_source_func(kernel_name, MODULE_NAME, || {
-            Ok(FP8_CAST_CUDA_SOURCE.to_string())
-        })
+        self.get_or_compile_internal_func(
+            kernel_name,
+            || MODULE_NAME.to_string(),
+            || Ok(FP8_CAST_CUDA_SOURCE.to_string()),
+        )
     }
 }
