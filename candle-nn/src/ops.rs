@@ -846,15 +846,21 @@ impl candle::CustomOp3 for LayerNorm {
             src.par_chunks(dim_m1)
                 .zip(dst.par_chunks_mut(dim_m1))
                 .for_each(|(src, dst)| {
-                    let mut sum = 0f32;
-                    let mut sum2 = 0f32;
+                    // Two-pass centered variance in f64 eliminates catastrophic
+                    // cancellation when rows have a large non-zero mean (BUG(LN-1)).
+                    let inv_n = 1.0f64 / dim_m1 as f64;
+                    let mut sum = 0f64;
                     for v in src {
-                        let v = v.as_();
-                        sum += v;
-                        sum2 += v * v;
+                        sum += v.as_() as f64;
                     }
-                    let mean = sum / dim_m1 as f32;
-                    let var = sum2 / dim_m1 as f32 - mean * mean;
+                    let mean_f64 = sum * inv_n;
+                    let mut var_sum = 0f64;
+                    for v in src {
+                        let d = v.as_() as f64 - mean_f64;
+                        var_sum += d * d;
+                    }
+                    let mean = mean_f64 as f32;
+                    let var = (var_sum * inv_n) as f32;
                     let inv_std = (var + eps).sqrt().recip();
                     for ((d, s), (alpha, beta)) in
                         dst.iter_mut().zip(src.iter()).zip(alpha.iter().zip(beta))
