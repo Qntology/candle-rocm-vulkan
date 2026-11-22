@@ -13,19 +13,7 @@ const MODULE_NAME: &str = "candle_lm_head_argmax";
 
 impl CudaDevice {
     pub(crate) fn lm_head_func(&self, fn_name: &str) -> Result<super::device::CudaFunc> {
-        self.get_or_compile_func(fn_name, MODULE_NAME, || {
-            let src = lm_head_argmax_cuda_source();
-            let target_arch = super::delta_rule::arch(self);
-            let make_opts = |arch: Option<&'static str>| cudarc::nvrtc::CompileOptions {
-                arch,
-                options: vec!["--std=c++17".into()],
-                ..Default::default()
-            };
-            match cudarc::nvrtc::safe::compile_ptx_with_opts(&src, make_opts(Some(target_arch))) {
-                Ok(ptx) => Ok(ptx),
-                Err(_) => cudarc::nvrtc::safe::compile_ptx_with_opts(&src, make_opts(None)).w(),
-            }
-        })
+        self.get_or_compile_source_func(fn_name, MODULE_NAME, || Ok(lm_head_argmax_cuda_source()))
     }
 }
 

@@ -522,10 +522,10 @@ pub fn fused_linear_argmax_cs(
 
 /// Quantized Mode A: Fused quantized `lm_head` matmul + in-register argmax + optional CS guard.
 ///
-/// - On ROCm with `M <= 8` and `Q8_0 | Q4_0 | Q4K | Q5K | Q6K` weights, executes the single-source
-///   `w8a16_lm{1,8}_*` + `lm_stage2_reduce_cs_*` kernels with **0 bytes** of `[M, V]` logits
-///   materialization.
-/// - On other backends or `M > 8`, computes exact quantized sub-logits via `QTensor::forward_exact`
+/// - On CUDA and ROCm with `Q8_0 | Q4_0 | Q4K | Q5K | Q6K` weights, executes the single-source
+///   `w8a16_lm{1,8}_*` (tiled in 8-row strips for `M > 8`) + `lm_stage2_reduce_cs_*` kernels with
+///   **0 bytes** of `[M, V]` logits materialization.
+/// - On other backends or formats, computes exact quantized sub-logits via `QTensor::forward_exact`
 ///   and reduces them via [`logits_argmax_cs`] (Mode B, GPU-accelerated on CUDA, ROCm, and Vulkan).
 pub fn fused_quant_argmax_cs(
     hidden: &Tensor,

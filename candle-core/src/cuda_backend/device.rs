@@ -150,6 +150,111 @@ static SHARED_DEVICES: OnceLock<Mutex<HashMap<usize, CudaDevice>>> = OnceLock::n
 /// NVRTC output shared by every device: (module name, GPU architecture) -> PTX.
 static PTX_CACHE: OnceLock<Mutex<HashMap<(String, String), cudarc::nvrtc::Ptx>>> = OnceLock::new();
 
+fn fnv1a_128(data: &[u8]) -> u128 {
+    let mut h: u128 = 0x6c62_272e_07bb_0142_62b8_2175_6295_c58d;
+    const PRIME: u128 = 0x0000_0000_0100_0000_0000_0000_0000_013b;
+    for &b in data {
+        h ^= b as u128;
+        h = h.wrapping_mul(PRIME);
+    }
+    h
+}
+
+fn nvrtc_version() -> (i32, i32) {
+    static VER: OnceLock<(i32, i32)> = OnceLock::new();
+    *VER.get_or_init(|| {
+        let mut major: std::ffi::c_int = 0;
+        let mut minor: std::ffi::c_int = 0;
+        // SAFETY: valid out-pointers passed to nvrtcVersion.
+        let rc = unsafe { cudarc::nvrtc::sys::nvrtcVersion(&mut major, &mut minor) };
+        if rc == cudarc::nvrtc::sys::nvrtcResult::NVRTC_SUCCESS {
+            (major, minor)
+        } else {
+            (0, 0)
+        }
+    })
+}
+
+fn nvrtc_cache_dir() -> Option<std::path::PathBuf> {
+    if let Ok(v) = std::env::var("CANDLE_NVRTC_CACHE") {
+        let s = v.trim();
+        if s == "0" || s.eq_ignore_ascii_case("false") || s.eq_ignore_ascii_case("off") {
+            return None;
+        }
+    }
+    if let Ok(v) = std::env::var("CANDLE_NVRTC_CACHE_DIR") {
+        if !v.trim().is_empty() {
+            return Some(std::path::PathBuf::from(v));
+        }
+    }
+    if let Ok(v) = std::env::var("CANDLE_CACHE_DIR") {
+        if !v.trim().is_empty() {
+            return Some(std::path::PathBuf::from(v).join("nvrtc"));
+        }
+    }
+    #[cfg(windows)]
+    {
+        std::env::var_os("LOCALAPPDATA")
+            .or_else(|| std::env::var_os("USERPROFILE"))
+            .map(|p| std::path::PathBuf::from(p).join("candle").join("nvrtc"))
+    }
+    #[cfg(not(windows))]
+    {
+        if let Some(xdg) = std::env::var_os("XDG_CACHE_HOME") {
+            if !xdg.is_empty() {
+                return Some(std::path::PathBuf::from(xdg).join("candle").join("nvrtc"));
+            }
+        }
+        std::env::var_os("HOME").map(|p| {
+            std::path::PathBuf::from(p)
+                .join(".cache")
+                .join("candle")
+                .join("nvrtc")
+        })
+    }
+}
+
+fn nvrtc_disk_cache_path(
+    module_name: &str,
+    target_arch: &str,
+    source: &str,
+) -> Option<std::path::PathBuf> {
+    let dir = nvrtc_cache_dir()?;
+    let (maj, min) = nvrtc_version();
+    let hash = fnv1a_128(source.as_bytes());
+    let safe_mod: String = module_name
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '_' || c == '-' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    Some(dir.join(format!("{safe_mod}_{target_arch}_nvrtc{maj}_{min}_{hash:032x}.ptx")))
+}
+
+fn write_ptx_atomic(path: &std::path::Path, ptx_src: &str) {
+    if ptx_src.is_empty() {
+        return;
+    }
+    if let Some(parent) = path.parent() {
+        if std::fs::create_dir_all(parent).is_err() {
+            return;
+        }
+    }
+    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let n = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let pid = std::process::id();
+    let tmp = path.with_extension(format!("ptx.tmp.{pid}.{n}"));
+    if std::fs::write(&tmp, ptx_src).is_ok() {
+        if std::fs::rename(&tmp, path).is_err() {
+            let _ = std::fs::remove_file(&tmp);
+        }
+    }
+}
+
 const CUDA_GRAPH_HTOD_CACHE_MAX_BYTES: usize = 4096;
 /// Entries kept by the per-thread graph upload cache before it is reset.
 const CUDA_GRAPH_HTOD_CACHE_MAX_ENTRIES: usize = 4096;
@@ -530,6 +635,119 @@ impl CudaDevice {
         })
     }
 
+    /// Function `fn_name` of the run-time compiled module `module_name`; `source` produces the
+    /// CUDA C++ source the first time it is needed. Compiled with NVRTC (`--std=c++17`, strictly
+    /// no `--use_fast_math`), backed by both the process-wide memory cache and an atomic on-disk
+    /// PTX cache (`${CANDLE_CACHE_DIR:-<os_cache>/candle}/nvrtc/`, disable via `CANDLE_NVRTC_CACHE=0`).
+    pub(crate) fn get_or_compile_source_func(
+        &self,
+        fn_name: &str,
+        module_name: &str,
+        source: impl FnOnce() -> Result<String>,
+    ) -> Result<CudaFunc> {
+        {
+            let ms = self.custom_modules.read().unwrap();
+            if let Some(mdl) = ms.get(module_name) {
+                let func = mdl.load_function(fn_name).w()?;
+                return Ok(CudaFunc {
+                    func,
+                    stream: self.stream.clone(),
+                });
+            }
+        }
+        let arch_k = self.arch_key();
+        let key = (module_name.to_string(), arch_k.clone());
+        let cache = PTX_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+        if let Some(ptx) = cache
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .get(&key)
+            .cloned()
+        {
+            let mut ms = self.custom_modules.write().unwrap();
+            let mdl = match ms.get(module_name) {
+                Some(m) => m.clone(),
+                None => {
+                    let m = self.context.load_module(ptx).w()?;
+                    ms.insert(module_name.to_string(), m.clone());
+                    m
+                }
+            };
+            let func = mdl.load_function(fn_name).w()?;
+            return Ok(CudaFunc {
+                func,
+                stream: self.stream.clone(),
+            });
+        }
+
+        let src = source()?;
+        let target_arch = self.compute_arch();
+        let cache_path = nvrtc_disk_cache_path(module_name, target_arch, &src);
+
+        // Try loading from disk cache first; on corrupt/incompatible PTX, delete and recompile.
+        if let Some(ref path) = cache_path {
+            if let Ok(cached_src) = std::fs::read_to_string(path) {
+                if !cached_src.is_empty() {
+                    let ptx = cudarc::nvrtc::Ptx::from_src(cached_src);
+                    if let Ok(mdl) = self.context.load_module(ptx.clone()) {
+                        cache
+                            .lock()
+                            .unwrap_or_else(|p| p.into_inner())
+                            .entry(key.clone())
+                            .or_insert_with(|| ptx);
+                        let mut ms = self.custom_modules.write().unwrap();
+                        let mdl = ms
+                            .entry(module_name.to_string())
+                            .or_insert_with(|| mdl)
+                            .clone();
+                        let func = mdl.load_function(fn_name).w()?;
+                        return Ok(CudaFunc {
+                            func,
+                            stream: self.stream.clone(),
+                        });
+                    } else {
+                        let _ = std::fs::remove_file(path);
+                    }
+                }
+            }
+        }
+
+        let make_opts = |arch: Option<&'static str>| cudarc::nvrtc::CompileOptions {
+            arch,
+            options: vec!["--std=c++17".into()],
+            ..Default::default()
+        };
+        let ptx = match cudarc::nvrtc::safe::compile_ptx_with_opts(&src, make_opts(Some(target_arch)))
+        {
+            Ok(p) => p,
+            Err(_) => cudarc::nvrtc::safe::compile_ptx_with_opts(&src, make_opts(None)).w()?,
+        };
+
+        if let Some(ref path) = cache_path {
+            write_ptx_atomic(path, &ptx.to_src());
+        }
+
+        cache
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .entry(key)
+            .or_insert_with(|| ptx.clone());
+        let mut ms = self.custom_modules.write().unwrap();
+        let mdl = match ms.get(module_name) {
+            Some(m) => m.clone(),
+            None => {
+                let m = self.context.load_module(ptx).w()?;
+                ms.insert(module_name.to_string(), m.clone());
+                m
+            }
+        };
+        let func = mdl.load_function(fn_name).w()?;
+        Ok(CudaFunc {
+            func,
+            stream: self.stream.clone(),
+        })
+    }
+
     /// Function `fn_name` of the run-time compiled module `module_name`; `ptx` produces the
     /// module the first time it is needed in this process for this GPU architecture (the PTX is
     /// cached process-wide by `(module_name, arch)`, so other devices never recompile it).
@@ -592,15 +810,39 @@ impl CudaDevice {
         unsafe { drv::device::get_attribute(self.context.cu_device(), attr) }.w()
     }
 
-    /// `sm_<major><minor>` of this GPU, the key of the process-wide PTX cache.
-    fn arch_key(&self) -> String {
+    /// Interned NVRTC `--gpu-architecture` string (`compute_<major><minor>`) of this GPU.
+    pub(crate) fn compute_arch(&self) -> &'static str {
+        use sys::CUdevice_attribute as A;
+        static NAMES: OnceLock<Mutex<HashMap<(i32, i32), &'static str>>> = OnceLock::new();
+        let major = self
+            .device_attribute(A::CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR)
+            .unwrap_or(7);
+        let minor = self
+            .device_attribute(A::CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR)
+            .unwrap_or(5);
+        let mut g = NAMES
+            .get_or_init(|| Mutex::new(HashMap::new()))
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        *g.entry((major, minor))
+            .or_insert_with(|| Box::leak(format!("compute_{major}{minor}").into_boxed_str()))
+    }
+
+    /// `(major, minor)` compute capability of this GPU.
+    pub(crate) fn compute_cap(&self) -> (i32, i32) {
         use sys::CUdevice_attribute as A;
         let major = self
             .device_attribute(A::CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR)
-            .unwrap_or(0);
+            .unwrap_or(7);
         let minor = self
             .device_attribute(A::CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR)
-            .unwrap_or(0);
+            .unwrap_or(5);
+        (major, minor)
+    }
+
+    /// `sm_<major><minor>` of this GPU, the key of the process-wide PTX cache.
+    fn arch_key(&self) -> String {
+        let (major, minor) = self.compute_cap();
         format!("sm_{major}{minor}")
     }
 

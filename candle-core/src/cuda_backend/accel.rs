@@ -19,26 +19,6 @@ use cudarc::driver::{DevicePtr, DevicePtrMut, LaunchConfig, PushKernelArg, SyncO
 use std::collections::HashMap;
 use std::sync::{Mutex, MutexGuard};
 
-fn cc_arch(major: i32, minor: i32) -> &'static str {
-    match (major, minor) {
-        (7, 0) => "compute_70",
-        (7, 2) => "compute_72",
-        (7, 5) => "compute_75",
-        (8, 0) => "compute_80",
-        (8, 6) => "compute_86",
-        (8, 7) => "compute_87",
-        (8, 9) => "compute_89",
-        (9, 0) => "compute_90",
-        (10, 0) => "compute_100",
-        (10, 1) => "compute_101",
-        (10, 3) => "compute_103",
-        (11, 0) => "compute_110",
-        (12, 0) => "compute_120",
-        (12, 1) => "compute_121",
-        (m, n) => Box::leak(format!("compute_{m}{n}").into_boxed_str()),
-    }
-}
-
 impl CudaDevice {
     /// Fused attention / TurboQuant profile of this GPU (see `candle_core::accel::profile`).
     pub fn accel_profile(&self) -> AccelProfile {
@@ -60,43 +40,18 @@ impl CudaDevice {
         p
     }
 
-    fn accel_arch(&self) -> &'static str {
-        use cudarc::driver::sys::CUdevice_attribute as A;
-        let major = self
-            .device_attribute(A::CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR)
-            .unwrap_or(7);
-        let minor = self
-            .device_attribute(A::CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR)
-            .unwrap_or(5);
-        cc_arch(major, minor)
-    }
-
-    /// Compiles `source` with NVRTC for this GPU (retrying without `--gpu-architecture` when the
-    /// installed NVRTC does not know the GPU yet).
-    fn accel_compile(&self, source: String) -> Result<cudarc::nvrtc::Ptx> {
-        let opts = |arch: Option<&'static str>| cudarc::nvrtc::CompileOptions {
-            arch,
-            options: vec!["--std=c++17".into()],
-            ..Default::default()
-        };
-        match cudarc::nvrtc::safe::compile_ptx_with_opts(&source, opts(Some(self.accel_arch()))) {
-            Ok(p) => Ok(p),
-            Err(_) => cudarc::nvrtc::safe::compile_ptx_with_opts(&source, opts(None)).w(),
-        }
-    }
-
     fn accel_func(&self, name: &str) -> Result<super::device::CudaFunc> {
         if name.starts_with("tq_") {
-            return self.get_or_compile_func(name, "candle_accel_turbo_quant", || {
-                self.accel_compile(sources::turbo_quant_cuda_source())
+            return self.get_or_compile_source_func(name, "candle_accel_turbo_quant", || {
+                Ok(sources::turbo_quant_cuda_source())
             });
         }
         let module = format!("candle_accel_{name}");
-        self.get_or_compile_func(name, &module, || {
+        self.get_or_compile_source_func(name, &module, || {
             let Some(src) = sources::flash_attn_cuda_source(name) else {
                 bail!("flash-attn: unknown kernel {name}")
             };
-            self.accel_compile(src)
+            Ok(src)
         })
     }
 }
@@ -839,6 +794,7 @@ impl CudaStorage {
                 None
             };
             let group = tq_attn_group(a.hq, a.hkv);
+            let is_tile = tile_plan.is_some();
             let (kname, grid, smem) = if let Some((tname, br, _bc, tsmem)) = tile_plan {
                 (
                     tname,
@@ -862,7 +818,7 @@ impl CudaStorage {
             };
             let func = dev.accel_func(&kname)?;
             dev.ensure_func_max_smem(&kname, &func, smem)?;
-            let part = if tile_plan.is_some() {
+            let part = if is_tile {
                 None
             } else {
                 alloc_parts(dev, splits, rows, d)?

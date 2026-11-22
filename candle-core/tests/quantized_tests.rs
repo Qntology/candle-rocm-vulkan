@@ -2446,3 +2446,199 @@ fn w8a16_dequantize_and_forward_exact_rocm() -> Result<()> {
     assert_eq!(s_ref, s_gpu);
     Ok(())
 }
+
+/// Real-GPU CUDA verification for all newly wired CUDA NVRTC paths from `w8a16_impl.h`:
+/// - `w8a16::indexed_moe` across Q8_0/Q4_0/Q4K/Q5K/Q6K × F32/F16/BF16 × `x_has_topk` × non-multiple-of-4 `n`
+/// - Quantized Mode A `fused_quant_argmax_cs` across all 5 formats × M∈{1,3,8,11} × tail tile V=97 × bias
+/// - Planar `NvfpWeight` (NVFP4 & NVFP8): bit-exact dequantize (F32/F16/BF16), decode `M∈{1,4,8}`,
+///   and 32 MiB tiled prefill `M∈{17,40}` + `from_safetensors_tensors`.
+#[cfg(feature = "cuda")]
+#[test]
+fn w8a16_cuda_moe_lm_head_and_nvfp() -> Result<()> {
+    let dev = match Device::new_cuda(0) {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!("skipping w8a16_cuda_moe_lm_head_and_nvfp: {e}");
+            return Ok(());
+        }
+    };
+
+    // 1. Indexed MoE: all 5 W8A16 formats × F32/F16/BF16 × x_has_topk ∈ {false, true}, n=66 (non-mult-4)
+    let (e_cnt, n_moe, k_moe, batch, topk) = (4usize, 66usize, 256usize, 3usize, 2usize);
+    let moe_w_cpu = Tensor::randn(0f32, 0.3, (e_cnt, n_moe, k_moe), &Device::Cpu)?;
+    let ids_cpu = Tensor::from_vec(vec![0u32, 2, 1, 3, 2, 0], (batch, topk), &Device::Cpu)?;
+    let ids_gpu = ids_cpu.to_device(&dev)?;
+    // Also exercise non-contiguous ids (transposed view)
+    let ids_t_cpu = ids_cpu.t()?;
+    let ids_t_gpu = ids_t_cpu.to_device(&dev)?;
+    for wt in [
+        GgmlDType::Q8_0,
+        GgmlDType::Q4_0,
+        GgmlDType::Q4K,
+        GgmlDType::Q5K,
+        GgmlDType::Q6K,
+    ] {
+        let q_cpu = quantized::QTensor::quantize(&moe_w_cpu, wt)?;
+        let q_gpu = quantized::QTensor::quantize_onto(&moe_w_cpu, wt, &dev)?;
+        let w_dq = q_cpu.dequantize(&Device::Cpu)?; // [E, n, k] F32
+        for x_has_topk in [false, true] {
+            let x_shape: &[usize] = if x_has_topk {
+                &[batch, topk, k_moe]
+            } else {
+                &[batch, 1, k_moe]
+            };
+            let x_base = Tensor::randn(0f32, 0.4, x_shape, &Device::Cpu)?;
+            for dt in [DType::F32, DType::F16, DType::BF16] {
+                // On CUDA F32 only Q4_0 routes to w8a16_moe (others use Q8_1 fused kernel);
+                // F16/BF16 routes all 5 formats to exact w8a16_moe.
+                let x_dt_cpu = x_base.to_dtype(dt)?;
+                let x_dt_gpu = x_dt_cpu.to_device(&dev)?;
+                let got = q_gpu
+                    .indexed_moe_forward(&x_dt_gpu, &ids_gpu)?
+                    .to_device(&Device::Cpu)?
+                    .to_dtype(DType::F32)?;
+                let x_f32 = x_dt_cpu.to_dtype(DType::F32)?;
+                // Compute exact CPU reference from dequantized weights + rounded input.
+                let mut ref_rows = Vec::with_capacity(batch * topk);
+                let ids_v = ids_cpu.flatten_all()?.to_vec1::<u32>()?;
+                for b in 0..batch {
+                    for t in 0..topk {
+                        let slot = b * topk + t;
+                        let eid = ids_v[slot] as usize;
+                        let xr = if x_has_topk {
+                            x_f32.narrow(0, b, 1)?.narrow(1, t, 1)?.squeeze(0)?
+                        } else {
+                            x_f32.narrow(0, b, 1)?.squeeze(0)?
+                        };
+                        let we = w_dq.narrow(0, eid, 1)?.squeeze(0)?;
+                        ref_rows.push(xr.matmul(&we.t()?)?);
+                    }
+                }
+                let want = Tensor::cat(&ref_rows, 0)?.reshape((batch, topk, n_moe))?;
+                let diff = (&got - &want)?.abs()?.max_all()?.to_scalar::<f32>()?;
+                let tol = match dt {
+                    DType::F32 => 1e-4,
+                    DType::F16 => 2e-2,
+                    DType::BF16 => 1e-1,
+                    _ => 1e-3,
+                };
+                assert!(
+                    diff <= tol,
+                    "cuda moe {wt:?} dt={dt:?} x_has_topk={x_has_topk}: diff {diff} > {tol}"
+                );
+            }
+        }
+        // Non-contiguous ids & unaligned narrow x view on F16 W8A16 path:
+        if wt == GgmlDType::Q4K {
+            let x_wide = Tensor::randn(0f32, 0.4, (topk, batch + 2, k_moe), &dev)?.to_dtype(DType::F16)?;
+            let x_unaligned = x_wide.narrow(1, 1, batch)?; // [topk=2, batch=3, k]
+            let got = q_gpu
+                .indexed_moe_forward(&x_unaligned, &ids_t_gpu)?
+                .to_device(&Device::Cpu)?
+                .to_dtype(DType::F32)?;
+            assert_eq!(got.dims(), &[topk, batch, n_moe]);
+        }
+    }
+
+    // 2. Quantized Mode A lm_head on CUDA (0-byte logits): all 5 formats × M∈{1,3,8,11} × V=97 × bias
+    let w_lm = Tensor::randn(0f32, 0.5, (97, 256), &Device::Cpu)?;
+    let b_lm = Tensor::randn(0f32, 0.2, (97,), &dev)?;
+    for wt in [
+        GgmlDType::Q8_0,
+        GgmlDType::Q4_0,
+        GgmlDType::Q4K,
+        GgmlDType::Q5K,
+        GgmlDType::Q6K,
+    ] {
+        let q_lm = quantized::QTensor::quantize_onto(&w_lm, wt, &dev)?;
+        for m in [1usize, 3, 8, 11] {
+            for dt in [DType::F32, DType::F16, DType::BF16] {
+                let h_lm = Tensor::randn(0f32, 0.5, (m, 256), &dev)?.to_dtype(dt)?;
+                let out_q = candle_core::lm_head::fused_quant_argmax_cs(
+                    &h_lm,
+                    &q_lm,
+                    Some(&b_lm),
+                    None,
+                    None,
+                )?;
+                let h_f32 = h_lm.to_dtype(DType::F32)?;
+                let logits_ref = q_lm
+                    .forward_exact(&h_f32)?
+                    .broadcast_add(&b_lm.unsqueeze(0)?)?;
+                let out_b =
+                    candle_core::lm_head::logits_argmax_cs(&logits_ref, None, None, None)?;
+                assert_eq!(
+                    out_q.ids.to_vec1::<u32>()?,
+                    out_b.ids.to_vec1::<u32>()?,
+                    "cuda quant Mode A {wt:?} m={m} dt={dt:?} V=97"
+                );
+                if let (Some(vq), Some(vb)) = (&out_q.max_vals, &out_b.max_vals) {
+                    let v_diff = (vq - vb)?.abs()?.max_all()?.to_scalar::<f32>()?;
+                    assert!(
+                        v_diff <= 1e-4,
+                        "cuda quant Mode A vals {wt:?} m={m} dt={dt:?}: diff {v_diff}"
+                    );
+                }
+            }
+        }
+    }
+
+    // 3. Planar NVFP4 & NVFP8 on CUDA: bit-exact dequantize (F32/F16/BF16, n=67 non-mult-4),
+    // decode (M=1,4,8), 32 MiB tiled prefill (M=17,40), and from_safetensors_tensors.
+    let w_nv = Tensor::randn(0f32, 0.4, (67, 256), &Device::Cpu)?;
+    for fmt in [quantized::NvfpFormat::Nvfp4, quantized::NvfpFormat::Nvfp8] {
+        let nw_cpu = quantized::NvfpWeight::quantize_onto(&w_nv, fmt, &Device::Cpu)?;
+        let nw_gpu = quantized::NvfpWeight::quantize_onto(&w_nv, fmt, &dev)?;
+        for dt in [DType::F32, DType::F16, DType::BF16] {
+            let dq_cpu = nw_cpu.dequantize_to(dt)?.to_dtype(DType::F32)?.flatten_all()?.to_vec1::<f32>()?;
+            let dq_gpu = nw_gpu
+                .dequantize_to(dt)?
+                .to_device(&Device::Cpu)?
+                .to_dtype(DType::F32)?
+                .flatten_all()?
+                .to_vec1::<f32>()?;
+            assert_eq!(
+                dq_cpu.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                dq_gpu.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                "cuda {fmt:?} dequantize_to({dt:?}) must be bit-exact with CPU"
+            );
+        }
+        for m in [1usize, 4, 8, 17, 40] {
+            for dt in [DType::F32, DType::F16, DType::BF16] {
+                let x = Tensor::randn(0f32, 0.5, (m, 256), &Device::Cpu)?.to_dtype(dt)?;
+                let y_ref = nw_cpu.forward(&x)?.to_dtype(DType::F32)?;
+                let y_gpu = nw_gpu
+                    .forward(&x.to_device(&dev)?)?
+                    .to_device(&Device::Cpu)?
+                    .to_dtype(DType::F32)?;
+                let tol = match dt {
+                    DType::F32 => 1e-4,
+                    DType::F16 => 2e-2,
+                    DType::BF16 => 1e-1,
+                    _ => 1e-4,
+                };
+                let diff = (&y_gpu - &y_ref)?.abs()?.max_all()?.to_scalar::<f32>()?;
+                assert!(diff <= tol, "cuda {fmt:?} forward m={m} dt={dt:?} diff {diff}");
+            }
+        }
+    }
+    // Exercise `from_safetensors_tensors` + `NvfpWeight::forward` on CUDA
+    let qdata = Tensor::zeros((16, 32), DType::U8, &Device::Cpu)?;
+    let bscale = Tensor::full(0x38u8, (16, 4), &Device::Cpu)?; // 1.0 in E4M3
+    let rscale = Tensor::new(&[1.0f32], &Device::Cpu)?;
+    let nw_st = quantized::NvfpWeight::from_safetensors_tensors(
+        &qdata,
+        Some(&bscale),
+        &rscale,
+        quantized::NvfpFormat::Nvfp4,
+        &dev,
+    )?;
+    let x_st = Tensor::ones((2, 64), DType::F32, &dev)?;
+    let y_st = nw_st
+        .forward(&x_st)?
+        .to_device(&Device::Cpu)?
+        .flatten_all()?
+        .to_vec1::<f32>()?;
+    assert!(y_st.iter().all(|&v| v == 0.0));
+    Ok(())
+}
