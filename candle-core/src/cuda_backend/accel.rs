@@ -16,43 +16,45 @@ use crate::accel::turbo::{
 };
 use crate::{bail, DType, Result};
 use cudarc::driver::{DevicePtr, DevicePtrMut, LaunchConfig, PushKernelArg, SyncOnDrop};
-use std::collections::HashMap;
-use std::sync::{Mutex, MutexGuard};
+use std::sync::MutexGuard;
 
 impl CudaDevice {
+    /// Cached accelerator profile reference (zero lock, zero clone on hot path).
+    pub(crate) fn accel_profile_ref(&self) -> &AccelProfile {
+        self.accel_profile_slot().get_or_init(|| {
+            use cudarc::driver::sys::CUdevice_attribute as A;
+            let (major, minor) = self.compute_cap();
+            let attr = |a| self.device_attribute(a).unwrap_or(0);
+            let sms = attr(A::CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT).max(1) as usize;
+            let smem = attr(A::CU_DEVICE_ATTRIBUTE_MAX_SHARED_MEMORY_PER_BLOCK_OPTIN)
+                .max(48 * 1024) as usize;
+            AccelProfile::cuda(major.max(0) as u32, minor.max(0) as u32, smem, sms)
+        })
+    }
+
     /// Fused attention / TurboQuant profile of this GPU (see `candle_core::accel::profile`).
     pub fn accel_profile(&self) -> AccelProfile {
-        use cudarc::driver::sys::CUdevice_attribute as A;
-        static CACHE: Mutex<Option<HashMap<super::DeviceId, AccelProfile>>> = Mutex::new(None);
-        let mut g = CACHE.lock().unwrap_or_else(|p| p.into_inner());
-        let map = g.get_or_insert_with(HashMap::new);
-        if let Some(p) = map.get(&self.id()) {
-            return p.clone();
-        }
-        let attr = |a| self.device_attribute(a).unwrap_or(0);
-        let major = attr(A::CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR);
-        let minor = attr(A::CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR);
-        let sms = attr(A::CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT).max(1) as usize;
-        let smem =
-            attr(A::CU_DEVICE_ATTRIBUTE_MAX_SHARED_MEMORY_PER_BLOCK_OPTIN).max(48 * 1024) as usize;
-        let p = AccelProfile::cuda(major.max(0) as u32, minor.max(0) as u32, smem, sms);
-        map.insert(self.id(), p.clone());
-        p
+        self.accel_profile_ref().clone()
     }
 
     fn accel_func(&self, name: &str) -> Result<super::device::CudaFunc> {
         if name.starts_with("tq_") {
-            return self.get_or_compile_source_func(name, "candle_accel_turbo_quant", || {
-                Ok(sources::turbo_quant_cuda_source())
-            });
+            return self.get_or_compile_internal_func(
+                name,
+                || "candle_accel_turbo_quant".to_string(),
+                || Ok(sources::turbo_quant_cuda_source()),
+            );
         }
-        let module = format!("candle_accel_{name}");
-        self.get_or_compile_source_func(name, &module, || {
-            let Some(src) = sources::flash_attn_cuda_source(name) else {
-                bail!("flash-attn: unknown kernel {name}")
-            };
-            Ok(src)
-        })
+        self.get_or_compile_internal_func(
+            name,
+            || format!("candle_accel_{name}"),
+            || {
+                let Some(src) = sources::flash_attn_cuda_source(name) else {
+                    bail!("flash-attn: unknown kernel {name}")
+                };
+                Ok(src)
+            },
+        )
     }
 }
 
@@ -119,6 +121,15 @@ fn half_sfx(dtype: DType, op: &str) -> Result<&'static str> {
         DType::F16 => Ok("f16"),
         DType::BF16 => Ok("bf16"),
         d => bail!("{op}: unsupported dtype {d:?} on the CUDA backend"),
+    }
+}
+
+fn fa_combine_name(dtype: DType) -> Result<&'static str> {
+    match dtype {
+        DType::F32 => Ok("fa_combine_f32"),
+        DType::F16 => Ok("fa_combine_f16"),
+        DType::BF16 => Ok("fa_combine_bf16"),
+        d => bail!("flash-attn: unsupported dtype {d:?} on the CUDA backend"),
     }
 }
 
@@ -230,7 +241,7 @@ impl CudaStorage {
             )
         }
         let dev = &self.device;
-        let prof = dev.accel_profile();
+        let prof = dev.accel_profile_ref();
         let plan = att::plan(geom, p, prof.max_shared_mem, prof.compute_units);
         // row plans may pack the query heads of a kv head (fa_rowg*, same results)
         let (name, grid, smem, splits) = match plan {
@@ -328,9 +339,8 @@ impl CudaStorage {
                 // SAFETY: arguments match the kernel signature (FA_PARAMS).
                 unsafe { b.launch(cfg(grid, smem)) }.w()?;
             }
-            let sfx = half_sfx(self.dtype(), "flash-attn")?;
-            let comb = format!("fa_combine_{sfx}");
-            launch_combine(dev, &comb, part, &mut out, rows, d, splits)?;
+            let comb = fa_combine_name(self.dtype())?;
+            launch_combine(dev, comb, part, &mut out, rows, d, splits)?;
         }
         Ok(CudaStorage {
             slice: out,
@@ -363,7 +373,7 @@ impl CudaStorage {
             bail!("paged flash-attn: varlen batches are not supported")
         }
         let dev = &self.device;
-        let prof = dev.accel_profile();
+        let prof = dev.accel_profile_ref();
         let plan = att::plan(geom, p, prof.max_shared_mem, prof.compute_units);
         let (name, grid, smem, splits) = match plan {
             FaPlan::Tile { .. } => {
@@ -453,9 +463,8 @@ impl CudaStorage {
                 // SAFETY: arguments match FA_ROWP_KERNEL (FA_PARAMS + the block table).
                 unsafe { b.launch(cfg(grid, smem)) }.w()?;
             }
-            let sfx = half_sfx(self.dtype(), "flash-attn")?;
-            let comb = format!("fa_combine_{sfx}");
-            launch_combine(dev, &comb, part, &mut out, rows, d, splits)?;
+            let comb = fa_combine_name(self.dtype())?;
+            launch_combine(dev, comb, part, &mut out, rows, d, splits)?;
         }
         Ok(CudaStorage {
             slice: out,
@@ -783,7 +792,7 @@ impl CudaStorage {
         if rows > 0 && d > 0 {
             let splits = a.splits.max(1);
             let stream = dev.cuda_stream();
-            let prof = dev.accel_profile();
+            let prof = dev.accel_profile_ref();
             let tile_plan = if splits <= 1 {
                 let version = crate::accel::config()
                     .flash_attn

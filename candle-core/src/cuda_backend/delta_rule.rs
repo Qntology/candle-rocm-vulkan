@@ -12,13 +12,16 @@ use cudarc::driver::{DevicePtr, DevicePtrMut, LaunchConfig, PushKernelArg, SyncO
 impl CudaDevice {
     /// Gated DeltaNet kernel `name`, compiled with NVRTC on first use (with on-disk PTX caching).
     fn gdn_func(&self, name: &str) -> Result<super::device::CudaFunc> {
-        let module = format!("candle_gdn_{name}");
-        self.get_or_compile_source_func(name, &module, || {
-            let Some(src) = gd::gdn_cuda_source(name) else {
-                bail!("gated delta rule: unknown kernel {name}")
-            };
-            Ok(src)
-        })
+        self.get_or_compile_internal_func(
+            name,
+            || format!("candle_gdn_{name}"),
+            || {
+                let Some(src) = gd::gdn_cuda_source(name) else {
+                    bail!("gated delta rule: unknown kernel {name}")
+                };
+                Ok(src)
+            },
+        )
     }
 }
 
@@ -122,11 +125,10 @@ impl CudaStorage {
         let mut cs_out = alloc(dev, dtype, p.b * c * km1)?;
         let mut s_out = alloc(dev, DType::F32, p.b * p.hv * p.dk * p.dv)?;
         if p.b > 0 && p.hv > 0 && p.dv > 0 {
-            let func = dev.gdn_func(&tile.kernel_name(sfx))?;
+            let kname = tile.kernel_name(sfx);
+            let func = dev.gdn_func(&kname)?;
             let smem = tile.smem_bytes();
-            if smem > 48 * 1024 {
-                func.set_max_dynamic_shared_memory(smem)?;
-            }
+            dev.ensure_func_max_smem(&kname, &func, smem)?;
             let stream = dev.cuda_stream();
             let (x_p, _g0) = dptr(self, p.x[0], &stream)?;
             let (cs_p, _g1) = dptr_opt(conv_state, p.cs_off, &stream)?;
@@ -205,11 +207,16 @@ impl CudaStorage {
     ) -> Result<Self> {
         use crate::backend::BackendStorage;
         let dtype = self.dtype();
-        let sfx = sfx(dtype)?;
+        let kname = match dtype {
+            DType::F32 => "gdn_gnorm_f32",
+            DType::F16 => "gdn_gnorm_f16",
+            DType::BF16 => "gdn_gnorm_bf16",
+            d => bail!("gated delta rule: unsupported dtype {d:?} on the CUDA backend"),
+        };
         let dev = &self.device;
         let mut out = alloc(dev, dtype, rows * d)?;
         if rows > 0 && d > 0 {
-            let func = dev.gdn_func(&format!("gdn_gnorm_{sfx}"))?;
+            let func = dev.gdn_func(kname)?;
             let stream = dev.cuda_stream();
             let (x_p, _g0) = dptr(self, x_off, &stream)?;
             let (z_p, _g1) = dptr(z, z_off, &stream)?;

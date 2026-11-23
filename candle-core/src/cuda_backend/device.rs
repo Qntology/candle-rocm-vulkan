@@ -292,6 +292,12 @@ impl Drop for CudaGraphHtodCacheGuard {
 
 pub struct ModuleStore {
     mdls: [Option<Arc<cudarc::driver::CudaModule>>; kernels::ALL_IDS.len()],
+    funcs: [HashMap<String, CudaFunction>; kernels::ALL_IDS.len()],
+}
+
+struct CustomModuleEntry {
+    module: Arc<cudarc::driver::CudaModule>,
+    funcs: HashMap<String, CudaFunction>,
 }
 
 /// A CUDA device: context, stream, cuBLAS/cuRAND handles, loaded kernels and scratch buffers.
@@ -308,7 +314,18 @@ pub struct CudaDevice {
     id: DeviceId,
     context: Arc<cudarc::driver::CudaContext>,
     modules: Arc<std::sync::RwLock<ModuleStore>>,
-    custom_modules: Arc<std::sync::RwLock<HashMap<String, Arc<cudarc::driver::CudaModule>>>>,
+    custom_modules: Arc<std::sync::RwLock<HashMap<String, CustomModuleEntry>>>,
+    /// Fast-path function handle cache for internal NVRTC kernels (globally unique names across
+    /// `accel`, `gdn`, `decoder_ops`, `lm_head`, `fp8_cast`) — avoids per-launch `format!` and
+    /// `cuModuleGetFunction` driver calls.
+    internal_funcs: Arc<std::sync::RwLock<HashMap<String, CudaFunction>>>,
+    /// Integer-keyed function handle cache for `w8a16` NVRTC kernels — zero string allocations on
+    /// the hot decode path.
+    w8a16_funcs: Arc<std::sync::RwLock<HashMap<u64, CudaFunction>>>,
+    /// Cached `(major, minor)` compute capability queried once at device creation.
+    compute_cap_cached: (i32, i32),
+    /// Cached accelerator profile (avoids global mutex lock + clone on every attention launch).
+    accel_profile_cache: Arc<OnceLock<crate::accel::profile::AccelProfile>>,
     stream: Arc<cudarc::driver::CudaStream>,
     pub(crate) blas: Arc<cudarc::cublas::CudaBlas>,
     /// Created on the first random op or `set_seed`.
@@ -610,29 +627,110 @@ impl CudaDevice {
         self.id
     }
 
+    fn load_custom_func_cached(
+        &self,
+        module_name: &str,
+        fn_name: &str,
+        entry: &mut CustomModuleEntry,
+    ) -> Result<CudaFunc> {
+        let _ = module_name;
+        if let Some(func) = entry.funcs.get(fn_name) {
+            return Ok(CudaFunc {
+                func: func.clone(),
+                stream: self.stream.clone(),
+            });
+        }
+        let func = entry.module.load_function(fn_name).w()?;
+        entry.funcs.insert(fn_name.to_string(), func.clone());
+        Ok(CudaFunc {
+            func,
+            stream: self.stream.clone(),
+        })
+    }
+
     pub fn get_or_load_custom_func(
         &self,
         fn_name: &str,
         module_name: &str,
         ptx: &str,
     ) -> Result<CudaFunc> {
-        let ms = self.custom_modules.read().unwrap();
-        if let Some(mdl) = ms.get(module_name).as_ref() {
-            let func = mdl.load_function(fn_name).w()?;
-            return Ok(CudaFunc {
-                func,
-                stream: self.stream.clone(),
-            });
+        {
+            let ms = self.custom_modules.read().unwrap();
+            if let Some(entry) = ms.get(module_name) {
+                if let Some(func) = entry.funcs.get(fn_name) {
+                    return Ok(CudaFunc {
+                        func: func.clone(),
+                        stream: self.stream.clone(),
+                    });
+                }
+            }
         }
-        drop(ms);
         let mut ms = self.custom_modules.write().unwrap();
+        if let Some(entry) = ms.get_mut(module_name) {
+            return self.load_custom_func_cached(module_name, fn_name, entry);
+        }
         let cuda_module = self.context.load_module(ptx.into()).w()?;
-        ms.insert(module_name.to_string(), cuda_module.clone());
         let func = cuda_module.load_function(fn_name).w()?;
+        let mut funcs = HashMap::new();
+        funcs.insert(fn_name.to_string(), func.clone());
+        ms.insert(
+            module_name.to_string(),
+            CustomModuleEntry {
+                module: cuda_module,
+                funcs,
+            },
+        );
         Ok(CudaFunc {
             func,
             stream: self.stream.clone(),
         })
+    }
+
+    /// Fast-path lookup for internal NVRTC kernels whose `fn_name` is unique across internal
+    /// modules (`accel`, `gdn`, `decoder_ops`, `lm_head`, `fp8_cast`). On cache hit this performs
+    /// zero string formatting and zero `cuModuleGetFunction` calls.
+    pub(crate) fn get_or_compile_internal_func(
+        &self,
+        fn_name: &str,
+        module_name: impl FnOnce() -> String,
+        source: impl FnOnce() -> Result<String>,
+    ) -> Result<CudaFunc> {
+        {
+            let cache = self.internal_funcs.read().unwrap();
+            if let Some(func) = cache.get(fn_name) {
+                return Ok(CudaFunc {
+                    func: func.clone(),
+                    stream: self.stream.clone(),
+                });
+            }
+        }
+        let mod_name = module_name();
+        let cf = self.get_or_compile_source_func(fn_name, &mod_name, source)?;
+        self.internal_funcs
+            .write()
+            .unwrap()
+            .insert(fn_name.to_string(), cf.func.clone());
+        Ok(cf)
+    }
+
+    /// Integer-keyed function handle cache for `w8a16` NVRTC kernels: zero heap allocations on
+    /// hot-path decode launches.
+    pub(crate) fn get_or_compile_w8a16_func(
+        &self,
+        key: u64,
+        build: impl FnOnce() -> Result<(String, String, String)>,
+    ) -> Result<CudaFunction> {
+        {
+            let cache = self.w8a16_funcs.read().unwrap();
+            if let Some(func) = cache.get(&key) {
+                return Ok(func.clone());
+            }
+        }
+        let (fn_name, module_name, src) = build()?;
+        let cf = self.get_or_compile_source_func(&fn_name, &module_name, || Ok(src))?;
+        let func = cf.into_cuda_function();
+        self.w8a16_funcs.write().unwrap().insert(key, func.clone());
+        Ok(func)
     }
 
     /// Function `fn_name` of the run-time compiled module `module_name`; `source` produces the
@@ -647,12 +745,19 @@ impl CudaDevice {
     ) -> Result<CudaFunc> {
         {
             let ms = self.custom_modules.read().unwrap();
-            if let Some(mdl) = ms.get(module_name) {
-                let func = mdl.load_function(fn_name).w()?;
-                return Ok(CudaFunc {
-                    func,
-                    stream: self.stream.clone(),
-                });
+            if let Some(entry) = ms.get(module_name) {
+                if let Some(func) = entry.funcs.get(fn_name) {
+                    return Ok(CudaFunc {
+                        func: func.clone(),
+                        stream: self.stream.clone(),
+                    });
+                }
+            }
+        }
+        {
+            let mut ms = self.custom_modules.write().unwrap();
+            if let Some(entry) = ms.get_mut(module_name) {
+                return self.load_custom_func_cached(module_name, fn_name, entry);
             }
         }
         let arch_k = self.arch_key();
@@ -665,15 +770,17 @@ impl CudaDevice {
             .cloned()
         {
             let mut ms = self.custom_modules.write().unwrap();
-            let mdl = match ms.get(module_name) {
-                Some(m) => m.clone(),
-                None => {
-                    let m = self.context.load_module(ptx).w()?;
-                    ms.insert(module_name.to_string(), m.clone());
-                    m
-                }
-            };
-            let func = mdl.load_function(fn_name).w()?;
+            if let Some(entry) = ms.get_mut(module_name) {
+                return self.load_custom_func_cached(module_name, fn_name, entry);
+            }
+            let m = self.context.load_module(ptx).w()?;
+            let func = m.load_function(fn_name).w()?;
+            let mut funcs = HashMap::new();
+            funcs.insert(fn_name.to_string(), func.clone());
+            ms.insert(
+                module_name.to_string(),
+                CustomModuleEntry { module: m, funcs },
+            );
             return Ok(CudaFunc {
                 func,
                 stream: self.stream.clone(),
@@ -696,11 +803,16 @@ impl CudaDevice {
                             .entry(key.clone())
                             .or_insert_with(|| ptx);
                         let mut ms = self.custom_modules.write().unwrap();
-                        let mdl = ms
-                            .entry(module_name.to_string())
-                            .or_insert_with(|| mdl)
-                            .clone();
+                        if let Some(entry) = ms.get_mut(module_name) {
+                            return self.load_custom_func_cached(module_name, fn_name, entry);
+                        }
                         let func = mdl.load_function(fn_name).w()?;
+                        let mut funcs = HashMap::new();
+                        funcs.insert(fn_name.to_string(), func.clone());
+                        ms.insert(
+                            module_name.to_string(),
+                            CustomModuleEntry { module: mdl, funcs },
+                        );
                         return Ok(CudaFunc {
                             func,
                             stream: self.stream.clone(),
@@ -733,15 +845,17 @@ impl CudaDevice {
             .entry(key)
             .or_insert_with(|| ptx.clone());
         let mut ms = self.custom_modules.write().unwrap();
-        let mdl = match ms.get(module_name) {
-            Some(m) => m.clone(),
-            None => {
-                let m = self.context.load_module(ptx).w()?;
-                ms.insert(module_name.to_string(), m.clone());
-                m
-            }
-        };
-        let func = mdl.load_function(fn_name).w()?;
+        if let Some(entry) = ms.get_mut(module_name) {
+            return self.load_custom_func_cached(module_name, fn_name, entry);
+        }
+        let m = self.context.load_module(ptx).w()?;
+        let func = m.load_function(fn_name).w()?;
+        let mut funcs = HashMap::new();
+        funcs.insert(fn_name.to_string(), func.clone());
+        ms.insert(
+            module_name.to_string(),
+            CustomModuleEntry { module: m, funcs },
+        );
         Ok(CudaFunc {
             func,
             stream: self.stream.clone(),
@@ -759,12 +873,19 @@ impl CudaDevice {
     ) -> Result<CudaFunc> {
         {
             let ms = self.custom_modules.read().unwrap();
-            if let Some(mdl) = ms.get(module_name) {
-                let func = mdl.load_function(fn_name).w()?;
-                return Ok(CudaFunc {
-                    func,
-                    stream: self.stream.clone(),
-                });
+            if let Some(entry) = ms.get(module_name) {
+                if let Some(func) = entry.funcs.get(fn_name) {
+                    return Ok(CudaFunc {
+                        func: func.clone(),
+                        stream: self.stream.clone(),
+                    });
+                }
+            }
+        }
+        {
+            let mut ms = self.custom_modules.write().unwrap();
+            if let Some(entry) = ms.get_mut(module_name) {
+                return self.load_custom_func_cached(module_name, fn_name, entry);
             }
         }
         let key = (module_name.to_string(), self.arch_key());
@@ -789,15 +910,17 @@ impl CudaDevice {
             }
         };
         let mut ms = self.custom_modules.write().unwrap();
-        let mdl = match ms.get(module_name) {
-            Some(m) => m.clone(),
-            None => {
-                let m = self.context.load_module(ptx).w()?;
-                ms.insert(module_name.to_string(), m.clone());
-                m
-            }
-        };
-        let func = mdl.load_function(fn_name).w()?;
+        if let Some(entry) = ms.get_mut(module_name) {
+            return self.load_custom_func_cached(module_name, fn_name, entry);
+        }
+        let m = self.context.load_module(ptx).w()?;
+        let func = m.load_function(fn_name).w()?;
+        let mut funcs = HashMap::new();
+        funcs.insert(fn_name.to_string(), func.clone());
+        ms.insert(
+            module_name.to_string(),
+            CustomModuleEntry { module: m, funcs },
+        );
         Ok(CudaFunc {
             func,
             stream: self.stream.clone(),
@@ -812,14 +935,8 @@ impl CudaDevice {
 
     /// Interned NVRTC `--gpu-architecture` string (`compute_<major><minor>`) of this GPU.
     pub(crate) fn compute_arch(&self) -> &'static str {
-        use sys::CUdevice_attribute as A;
         static NAMES: OnceLock<Mutex<HashMap<(i32, i32), &'static str>>> = OnceLock::new();
-        let major = self
-            .device_attribute(A::CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR)
-            .unwrap_or(7);
-        let minor = self
-            .device_attribute(A::CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR)
-            .unwrap_or(5);
+        let (major, minor) = self.compute_cap_cached;
         let mut g = NAMES
             .get_or_init(|| Mutex::new(HashMap::new()))
             .lock()
@@ -828,16 +945,19 @@ impl CudaDevice {
             .or_insert_with(|| Box::leak(format!("compute_{major}{minor}").into_boxed_str()))
     }
 
+    /// `(major, minor)` compute capability of this GPU (cached once at device creation).
+    pub fn compute_capability(&self) -> (i32, i32) {
+        self.compute_cap_cached
+    }
+
     /// `(major, minor)` compute capability of this GPU.
     pub(crate) fn compute_cap(&self) -> (i32, i32) {
-        use sys::CUdevice_attribute as A;
-        let major = self
-            .device_attribute(A::CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR)
-            .unwrap_or(7);
-        let minor = self
-            .device_attribute(A::CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR)
-            .unwrap_or(5);
-        (major, minor)
+        self.compute_cap_cached
+    }
+
+    /// Cached accelerator profile slot owned by this device.
+    pub(crate) fn accel_profile_slot(&self) -> &OnceLock<crate::accel::profile::AccelProfile> {
+        &self.accel_profile_cache
     }
 
     /// `sm_<major><minor>` of this GPU, the key of the process-wide PTX cache.
@@ -847,23 +967,58 @@ impl CudaDevice {
     }
 
     pub fn get_or_load_func(&self, fn_name: &str, mdl: &kernels::Module) -> Result<CudaFunc> {
-        let ms = self.modules.read().unwrap();
-        if let Some(mdl) = ms.mdls[mdl.index()].as_ref() {
-            let func = mdl.load_function(fn_name).w()?;
+        let idx = mdl.index();
+        {
+            let ms = self.modules.read().unwrap();
+            if let Some(func) = ms.funcs[idx].get(fn_name) {
+                return Ok(CudaFunc {
+                    func: func.clone(),
+                    stream: self.stream.clone(),
+                });
+            }
+        }
+        let mut ms = self.modules.write().unwrap();
+        if let Some(func) = ms.funcs[idx].get(fn_name) {
             return Ok(CudaFunc {
-                func,
+                func: func.clone(),
                 stream: self.stream.clone(),
             });
         }
-        drop(ms);
-        let mut ms = self.modules.write().unwrap();
-        let cuda_module = self.context.load_module(mdl.ptx().into()).w()?;
-        ms.mdls[mdl.index()] = Some(cuda_module.clone());
+        let cuda_module = match ms.mdls[idx].as_ref() {
+            Some(m) => m.clone(),
+            None => {
+                let m = self.context.load_module(mdl.ptx().into()).w()?;
+                ms.mdls[idx] = Some(m.clone());
+                m
+            }
+        };
         let func = cuda_module.load_function(fn_name).w()?;
+        ms.funcs[idx].insert(fn_name.to_string(), func.clone());
         Ok(CudaFunc {
             func,
             stream: self.stream.clone(),
         })
+    }
+
+    /// Zero-allocation variant of `get_or_load_func(&kernel_name::<T>(root), mdl)` using a
+    /// stack-allocated name buffer on the hot path.
+    pub fn get_or_load_typed_func<T: crate::WithDType>(
+        &self,
+        root: &str,
+        mdl: &kernels::Module,
+    ) -> Result<CudaFunc> {
+        let dtype = T::DTYPE.as_str();
+        let len = root.len() + 1 + dtype.len();
+        let mut buf = [0u8; 96];
+        if len <= buf.len() {
+            buf[..root.len()].copy_from_slice(root.as_bytes());
+            buf[root.len()] = b'_';
+            buf[root.len() + 1..len].copy_from_slice(dtype.as_bytes());
+            // SAFETY: `root` and `dtype` are valid UTF-8 and `_` is ASCII.
+            let name = unsafe { std::str::from_utf8_unchecked(&buf[..len]) };
+            return self.get_or_load_func(name, mdl);
+        }
+        self.get_or_load_func(&format!("{root}_{dtype}"), mdl)
     }
 
     pub fn cublas_handle(&self) -> Arc<cudarc::cublas::CudaBlas> {
@@ -1136,10 +1291,26 @@ impl CudaDevice {
         context: Arc<cudarc::driver::CudaContext>,
         stream: Arc<cudarc::driver::CudaStream>,
     ) -> Result<Self> {
+        use sys::CUdevice_attribute as A;
         let blas = cudarc::cublas::CudaBlas::new(stream.clone()).w()?;
         let module_store = ModuleStore {
             mdls: [const { None }; kernels::ALL_IDS.len()],
+            funcs: std::array::from_fn(|_| HashMap::new()),
         };
+        let major = unsafe {
+            drv::device::get_attribute(
+                context.cu_device(),
+                A::CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR,
+            )
+        }
+        .unwrap_or(7);
+        let minor = unsafe {
+            drv::device::get_attribute(
+                context.cu_device(),
+                A::CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR,
+            )
+        }
+        .unwrap_or(5);
         Ok(Self {
             _binder: Arc::new(ContextBinder(context.clone())),
             id: DeviceId::new(),
@@ -1149,6 +1320,10 @@ impl CudaDevice {
             curand: Arc::new(Mutex::new(None)),
             modules: Arc::new(std::sync::RwLock::new(module_store)),
             custom_modules: Arc::new(std::sync::RwLock::new(HashMap::new())),
+            internal_funcs: Arc::new(std::sync::RwLock::new(HashMap::new())),
+            w8a16_funcs: Arc::new(std::sync::RwLock::new(HashMap::new())),
+            compute_cap_cached: (major, minor),
+            accel_profile_cache: Arc::new(OnceLock::new()),
             seed_value: Arc::new(RwLock::new(299792458)),
             workspaces: Arc::new(Mutex::new(Workspaces::default())),
             param_cache: Arc::new(Mutex::new(HashMap::new())),

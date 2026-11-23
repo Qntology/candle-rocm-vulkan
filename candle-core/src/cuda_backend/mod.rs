@@ -144,7 +144,7 @@ impl Map1 for Affine {
         let cfg = LaunchConfig::for_num_elems(el as u32);
         let ds = SlicePtrOrNull::params_from_layout(dev, layout)?;
         let src = &src.slice(layout.start_offset()..);
-        let func = dev.get_or_load_func(&kernel_name::<T>("affine"), &kernels::AFFINE)?;
+        let func = dev.get_or_load_typed_func::<T>("affine", &kernels::AFFINE)?;
         // SAFETY: Set later by running the kernel.
         let out = unsafe { dev.alloc::<T>(el)? };
         let mut builder = func.builder();
@@ -375,7 +375,7 @@ impl Map1Any for FastReduce<'_> {
         if check_empty && layout.shape().elem_count() == 0 {
             Err(crate::Error::EmptyTensor { op: "reduce" }.bt())?
         }
-        let func = dev.get_or_load_func(&kernel_name::<T>(name), &kernels::REDUCE)?;
+        let func = dev.get_or_load_typed_func::<T>(name, &kernels::REDUCE)?;
         if return_index {
             // SAFETY: filled in by the follow up kernel.
             let out = unsafe { dev.alloc::<u32>(dst_el)? };
@@ -419,7 +419,7 @@ impl<U: UnaryOpT> Map1 for U {
         let cfg = LaunchConfig::for_num_elems(el_count as u32);
         let ds = SlicePtrOrNull::params_from_layout(dev, layout)?;
         let src = &src.slice(layout.start_offset()..);
-        let func = dev.get_or_load_func(&kernel_name::<T>(U::KERNEL), &kernels::UNARY)?;
+        let func = dev.get_or_load_typed_func::<T>(U::KERNEL, &kernels::UNARY)?;
         // SAFETY: Set later by running the kernel.
         let mut out = unsafe { dev.alloc::<T>(el_count)? };
         let mut builder = func.builder();
@@ -473,7 +473,7 @@ impl Map1 for IndexSelect<'_> {
         let ids_dim_size = ids_shape.elem_count();
         let dst_el = ids_shape.elem_count() * left_size * right_size;
         let cfg = LaunchConfig::for_num_elems(dst_el as u32);
-        let func = dev.get_or_load_func(&kernel_name::<T>(name), &kernels::INDEXING)?;
+        let func = dev.get_or_load_typed_func::<T>(name, &kernels::INDEXING)?;
         // SAFETY: Set later by running the kernel.
         let out = unsafe { dev.alloc::<T>(dst_el)? };
         let mut builder = func.builder();
@@ -528,7 +528,7 @@ impl Map1 for Gather<'_> {
         let right_sz: usize = src_l.dims()[dim + 1..].iter().product();
         let src_dim_sz = src_l.dims()[dim];
         let ids_dim_sz = ids_l.dims()[dim];
-        let func = dev.get_or_load_func(&kernel_name::<T>(name), &kernels::INDEXING)?;
+        let func = dev.get_or_load_typed_func::<T>(name, &kernels::INDEXING)?;
         // SAFETY: Set later by running the kernel.
         let out = unsafe { dev.alloc::<T>(el)? };
         let mut builder = func.builder();
@@ -587,7 +587,7 @@ impl Map2InPlace for IndexAdd<'_> {
         let dst_dim_sz = dst_l.dims()[dim];
         let ids_dim_sz = ids_l.dims()[0];
         let cfg = LaunchConfig::for_num_elems((left_sz * right_sz) as u32);
-        let func = dev.get_or_load_func(&kernel_name::<T>(name), &kernels::INDEXING)?;
+        let func = dev.get_or_load_typed_func::<T>(name, &kernels::INDEXING)?;
         let mut builder = func.builder();
         barg!(builder, ids);
         barg!(builder, ids_dim_sz);
@@ -640,7 +640,7 @@ impl Map2InPlace for Scatter<'_> {
         let src_dim_sz = src_l.dims()[dim];
         let dst_dim_sz = dst_l.dims()[dim];
         let cfg = LaunchConfig::for_num_elems((left_sz * right_sz) as u32);
-        let func = dev.get_or_load_func(&kernel_name::<T>(name), &kernels::INDEXING)?;
+        let func = dev.get_or_load_typed_func::<T>(name, &kernels::INDEXING)?;
         let mut builder = func.builder();
         barg!(builder, ids);
         builder.arg(&src);
@@ -692,7 +692,7 @@ impl Map2InPlace for ScatterAdd<'_> {
         let src_dim_sz = src_l.dims()[dim];
         let dst_dim_sz = dst_l.dims()[dim];
         let cfg = LaunchConfig::for_num_elems((left_sz * right_sz) as u32);
-        let func = dev.get_or_load_func(&kernel_name::<T>(name), &kernels::INDEXING)?;
+        let func = dev.get_or_load_typed_func::<T>(name, &kernels::INDEXING)?;
         let mut builder = func.builder();
         barg!(builder, ids);
         builder.arg(&src);
@@ -1106,7 +1106,7 @@ impl Map2 for WhereCond<'_> {
         )?;
         let t = &t.slice(layout_t.start_offset()..);
         let f = &f.slice(layout_f.start_offset()..);
-        let func = dev.get_or_load_func(&kernel_name::<T>(name), &kernels::TERNARY)?;
+        let func = dev.get_or_load_typed_func::<T>(name, &kernels::TERNARY)?;
         // SAFETY: Set later by running the kernel.
         let out = unsafe { dev.alloc::<T>(el)? };
         let mut builder = func.builder();
@@ -1143,7 +1143,7 @@ impl<U: crate::op::BinaryOpT> Map2 for U {
         };
         let lhs = &lhs.slice(lhs_l.start_offset()..);
         let rhs = &rhs.slice(rhs_l.start_offset()..);
-        let func = dev.get_or_load_func(&kernel_name::<T>(U::KERNEL), &kernels::BINARY)?;
+        let func = dev.get_or_load_typed_func::<T>(U::KERNEL, &kernels::BINARY)?;
         // SAFETY: Set later by running the kernel.
         let out = unsafe { dev.alloc::<T>(elem_count)? };
         let mut builder = func.builder();
@@ -1188,7 +1188,7 @@ impl Map2Any for Cmp {
             CmpOp::Gt => "gt",
             CmpOp::Ge => "ge",
         };
-        let func = dev.get_or_load_func(&kernel_name::<T>(name), &kernels::BINARY)?;
+        let func = dev.get_or_load_typed_func::<T>(name, &kernels::BINARY)?;
         // SAFETY: Set later by running the kernel.
         let out = unsafe { dev.alloc::<u8>(elem_count)? };
         let mut builder = func.builder();
