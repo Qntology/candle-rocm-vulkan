@@ -1186,6 +1186,51 @@ impl QCudaStorage {
         let (ptr, guard) = self.data.inner.device_ptr(stream);
         Ok((ptr as *const u8, guard))
     }
+
+    /// Row-wise device-to-device concatenation of quantized 2D weights sharing dtype and device.
+    /// Zero host round-trip; preserves `MATRIX_ROW_PADDING` tail padding.
+    pub fn cat_rows(storages: &[&Self]) -> Result<Self> {
+        let Some(first) = storages.first() else {
+            crate::bail!("QCudaStorage::cat_rows: empty input")
+        };
+        let dtype = first.dtype;
+        let dev = &first.device;
+        let mut total_bytes = 0usize;
+        for s in storages {
+            if s.dtype != dtype {
+                crate::bail!(
+                    "QCudaStorage::cat_rows: dtype mismatch ({:?} vs {:?})",
+                    s.dtype,
+                    dtype
+                )
+            }
+            if !s.device.same_device(dev) {
+                crate::bail!("QCudaStorage::cat_rows: device mismatch")
+            }
+            total_bytes += s.data.len;
+        }
+        let padded_len = total_bytes + MATRIX_ROW_PADDING * dtype.type_size() / dtype.block_size();
+        let mut inner = dev.alloc_zeros::<u8>(padded_len)?;
+        let mut off = 0usize;
+        for s in storages {
+            let n = s.data.len;
+            if n > 0 {
+                dev.memcpy_dtod(
+                    &s.data.inner.slice(..n),
+                    &mut inner.slice_mut(off..off + n),
+                )?;
+                off += n;
+            }
+        }
+        Ok(Self {
+            data: PaddedCudaSlice {
+                inner,
+                len: total_bytes,
+            },
+            dtype,
+            device: dev.clone(),
+        })
+    }
 }
 
 impl QCudaStorage {

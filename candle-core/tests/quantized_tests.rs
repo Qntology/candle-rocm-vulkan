@@ -2489,8 +2489,7 @@ fn w8a16_cuda_moe_lm_head_and_nvfp() -> Result<()> {
             };
             let x_base = Tensor::randn(0f32, 0.4, x_shape, &Device::Cpu)?;
             for dt in [DType::F32, DType::F16, DType::BF16] {
-                // On CUDA F32 only Q4_0 routes to w8a16_moe (others use Q8_1 fused kernel);
-                // F16/BF16 routes all 5 formats to exact w8a16_moe.
+                // On CUDA all 5 W8A16 formats × F32/F16/BF16 route to exact `w8a16::indexed_moe`.
                 let x_dt_cpu = x_base.to_dtype(dt)?;
                 let x_dt_gpu = x_dt_cpu.to_device(&dev)?;
                 let got = q_gpu
@@ -2640,5 +2639,168 @@ fn w8a16_cuda_moe_lm_head_and_nvfp() -> Result<()> {
         .flatten_all()?
         .to_vec1::<f32>()?;
     assert!(y_st.iter().all(|&v| v == 0.0));
+    Ok(())
+}
+
+/// Verifies `QTensor::cat_rows` (row-concatenated projections `q|k|v`, `gate|up`) produces
+/// bit-identical decode mat-vec outputs vs separate `forward_exact` launches on CUDA (`SPD-08`).
+#[cfg(feature = "cuda")]
+#[test]
+fn qtensor_cat_rows_bit_exact_cuda() -> Result<()> {
+    let dev = match Device::new_cuda(0) {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!("skipping qtensor_cat_rows_bit_exact_cuda: {e}");
+            return Ok(());
+        }
+    };
+    let k = 1024usize;
+    let x_cpu = Tensor::from_vec(w8_input(2, k, 17), (2, k), &Device::Cpu)?;
+    for wt in [
+        GgmlDType::Q8_0,
+        GgmlDType::Q4_0,
+        GgmlDType::Q4K,
+        GgmlDType::Q5K,
+        GgmlDType::Q6K,
+    ] {
+        let q = w8_qtensor(&w8_weight_bytes(wt, 512, k, 1), wt, 512, k, &dev)?;
+        let kv = w8_qtensor(&w8_weight_bytes(wt, 256, k, 2), wt, 256, k, &dev)?;
+        let vv = w8_qtensor(&w8_weight_bytes(wt, 256, k, 3), wt, 256, k, &dev)?;
+        let fused = quantized::QTensor::cat_rows(&[&q, &kv, &vv])?;
+        assert_eq!(fused.shape().dims(), [1024, k]);
+        for dt in [DType::F32, DType::F16, DType::BF16] {
+            let x = x_cpu.to_dtype(dt)?.to_device(&dev)?;
+            let y_q = q.forward_exact(&x)?;
+            let y_k = kv.forward_exact(&x)?;
+            let y_v = vv.forward_exact(&x)?;
+            let y_ref = Tensor::cat(&[&y_q, &y_k, &y_v], 1)?;
+            let y_fused = fused.forward_exact(&x)?;
+            assert_eq!(
+                w8_bits(&y_fused)?,
+                w8_bits(&y_ref)?,
+                "cat_rows decode matvec must be bit-exact for {wt:?} {dt:?}"
+            );
+        }
+    }
+    Ok(())
+}
+
+/// CUDA `lm_head` precision contract test (`PRC-11` / `S6-PP08`):
+/// - Exact ties prefer smaller index across tile boundaries (`V ∈ {31, 32, 33, 63, 64, 65, 97}`)
+/// - 1-ULP near-ties pick the strictly larger logit
+/// - CS rescue guard triggers when `best_v < upper` and clears when `best_v >= upper`
+#[cfg(feature = "cuda")]
+#[test]
+fn lm_head_cuda_tie_and_cs_boundary_contract() -> Result<()> {
+    let dev = match Device::new_cuda(0) {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!("skipping lm_head_cuda_tie_and_cs_boundary_contract: {e}");
+            return Ok(());
+        }
+    };
+    let k = 256usize;
+    let h_vals: Vec<f32> = (0..k).map(|i| if i == 0 { 1.0 } else { 0.0 }).collect();
+    let h = Tensor::from_vec(h_vals, (1, k), &dev)?;
+
+    for v in [31usize, 32, 33, 63, 64, 65, 97] {
+        // Exact tie between index 3 and index v-1 (both logit = 4.0) -> must pick 3 (smaller).
+        let mut w_data = vec![0.0f32; v * k];
+        w_data[3 * k] = 4.0;
+        w_data[(v - 1) * k] = 4.0;
+        let w_cpu = Tensor::from_vec(w_data, (v, k), &Device::Cpu)?;
+        let w_gpu = w_cpu.to_device(&dev)?;
+        let q_gpu = quantized::QTensor::quantize_onto(&w_cpu, GgmlDType::Q8_0, &dev)?;
+
+        let out_dense =
+            candle_core::lm_head::fused_linear_argmax_cs(&h, &w_gpu, None, None, None)?;
+        let out_quant =
+            candle_core::lm_head::fused_quant_argmax_cs(&h, &q_gpu, None, None, None)?;
+        assert_eq!(out_dense.ids.to_vec1::<u32>()?, vec![3u32], "dense tie V={v}");
+        assert_eq!(out_quant.ids.to_vec1::<u32>()?, vec![3u32], "quant tie V={v}");
+
+        // 1-ULP near-tie: index v-1 is 1 ULP larger than 4.0 -> must pick v-1.
+        let mut w_ulp = vec![0.0f32; v * k];
+        w_ulp[3 * k] = 4.0;
+        w_ulp[(v - 1) * k] = f32::from_bits(4.0f32.to_bits() + 1);
+        let w_ulp_gpu = Tensor::from_vec(w_ulp, (v, k), &dev)?;
+        let out_ulp =
+            candle_core::lm_head::fused_linear_argmax_cs(&h, &w_ulp_gpu, None, None, None)?;
+        assert_eq!(
+            out_ulp.ids.to_vec1::<u32>()?,
+            vec![(v - 1) as u32],
+            "dense 1-ULP near-tie V={v}"
+        );
+    }
+
+    // CS rescue guard boundary: ||h|| = 1, best_v = 4.0, mu_rest = 0, b_rest_max = 0.
+    // upper = 1.0 * w_rest_bound. If w_rest_bound = 4.5 -> rescue=1; if 3.5 -> rescue=0.
+    let v = 64usize;
+    let mut w_data = vec![0.0f32; v * k];
+    w_data[5 * k] = 4.0;
+    let w_cpu = Tensor::from_vec(w_data, (v, k), &Device::Cpu)?;
+    let q_gpu = quantized::QTensor::quantize_onto(&w_cpu, GgmlDType::Q8_0, &dev)?;
+    let mu_zero = Tensor::zeros(k, DType::F32, &dev)?;
+    let guard_trigger = candle_core::lm_head::CsGuardParams {
+        mu_rest: mu_zero.clone(),
+        w_rest_bound: 4.5,
+        b_rest_max: 0.0,
+    };
+    let guard_safe = candle_core::lm_head::CsGuardParams {
+        mu_rest: mu_zero,
+        w_rest_bound: 3.5,
+        b_rest_max: 0.0,
+    };
+    let res_trig = candle_core::lm_head::fused_quant_argmax_cs(
+        &h,
+        &q_gpu,
+        None,
+        None,
+        Some(&guard_trigger),
+    )?;
+    let res_safe =
+        candle_core::lm_head::fused_quant_argmax_cs(&h, &q_gpu, None, None, Some(&guard_safe))?;
+    assert_eq!(res_trig.rescue_mask.unwrap().to_vec1::<u8>()?, vec![1u8]);
+    assert_eq!(res_safe.rescue_mask.unwrap().to_vec1::<u8>()?, vec![0u8]);
+    Ok(())
+}
+
+/// Benchmarks K-quant (`Q4_0`, `Q4K`, `Q5K`, `Q6K`, `Q8_0`) exact `forward_exact` vs approximate
+/// `QMatMul::forward` (`fast_mmvq`, Q8_1 activations) on CUDA in both latency and accuracy vs
+/// CPU F32 reference (`PRC-03` / Section 7.2).
+#[cfg(feature = "cuda")]
+#[test]
+#[ignore]
+fn w8a16_cuda_kquant_bench() -> Result<()> {
+    let dev = &Device::new_cuda(0)?;
+    let (n, k) = (2560usize, 2560usize);
+    let x_f32 = Tensor::from_vec(w8_input(1, k, 42), (1, k), dev)?;
+    let x_f16 = x_f32.to_dtype(DType::F16)?;
+    let x_bf16 = x_f32.to_dtype(DType::BF16)?;
+    for wt in [
+        GgmlDType::Q8_0,
+        GgmlDType::Q4_0,
+        GgmlDType::Q4K,
+        GgmlDType::Q5K,
+        GgmlDType::Q6K,
+    ] {
+        let bytes = w8_weight_bytes(wt, n, k, 11 + wt.type_size() as u64);
+        let q = std::sync::Arc::new(w8_qtensor(&bytes, wt, n, k, dev)?);
+        let mm = quantized::QMatMul::from_arc(q.clone())?;
+        let w_f32 = q.dequantize_to(DType::F32, dev)?;
+        let y_ref = x_f32.matmul(&w_f32.t()?)?;
+        let y_exact = q.forward_exact(&x_f32)?;
+        let y_mmvq = mm.forward(&x_f32)?;
+        let denom = y_ref.abs()?.max_all()?.to_scalar::<f32>()?.max(1e-6);
+        let err_exact = (&y_exact - &y_ref)?.abs()?.max_all()?.to_scalar::<f32>()? / denom;
+        let err_mmvq = (&y_mmvq - &y_ref)?.abs()?.max_all()?.to_scalar::<f32>()? / denom;
+        let (t_ex_f32, _) = w8_gpu_time_us(dev, 100, || q.forward_exact(&x_f32))?;
+        let (t_ex_f16, _) = w8_gpu_time_us(dev, 100, || q.forward_exact(&x_f16))?;
+        let (t_ex_bf16, _) = w8_gpu_time_us(dev, 100, || q.forward_exact(&x_bf16))?;
+        let (t_mmvq, _) = w8_gpu_time_us(dev, 100, || mm.forward(&x_f32))?;
+        println!(
+            "[KQUANT-BENCH] {wt:?} {n}x{k} m=1: exact(f32/f16/bf16) {t_ex_f32:.1}/{t_ex_f16:.1}/{t_ex_bf16:.1} us | mmvq(q8_1) {t_mmvq:.1} us | rel_err exact={err_exact:.2e} vs mmvq={err_mmvq:.2e}"
+        );
+    }
     Ok(())
 }

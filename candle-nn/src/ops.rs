@@ -93,7 +93,7 @@ impl candle::CustomOp1 for Sigmoid {
             CudaSlice, DeviceRepr, LaunchConfig, PushKernelArg, ValidAsZeroBits,
         };
         use candle::cuda_backend::SlicePtrOrNull;
-        use candle::cuda_backend::{kernel_name, kernels, Map1, WrapErr};
+        use candle::cuda_backend::{kernels, Map1, WrapErr};
         use candle::{CudaDevice, WithDType};
 
         struct S;
@@ -110,7 +110,7 @@ impl candle::CustomOp1 for Sigmoid {
                 let cfg = LaunchConfig::for_num_elems(el_count as u32);
                 let ds = SlicePtrOrNull::params_from_layout(dev, layout)?;
                 let src = &src.slice(layout.start_offset()..);
-                let func = dev.get_or_load_func(&kernel_name::<T>("usigmoid"), &kernels::UNARY)?;
+                let func = dev.get_or_load_typed_func::<T>("usigmoid", &kernels::UNARY)?;
                 // SAFETY: Set later by running the kernel.
                 let out = unsafe { dev.alloc::<T>(el_count)? };
 
@@ -386,7 +386,7 @@ impl candle::CustomOp1 for SoftmaxLastDim {
         use candle::cuda_backend::cudarc::driver::{
             CudaSlice, DeviceRepr, LaunchConfig, PushKernelArg,
         };
-        use candle::cuda_backend::{kernel_name, kernels, Map1, WrapErr};
+        use candle::cuda_backend::{kernels, Map1, WrapErr};
         use candle::{CudaDevice, WithDType};
 
         struct S;
@@ -411,7 +411,7 @@ impl candle::CustomOp1 for SoftmaxLastDim {
                     block_dim: (1, 32, 1),
                     shared_mem_bytes: 0,
                 };
-                let func = dev.get_or_load_func(&kernel_name::<T>("softmax"), &kernels::REDUCE)?;
+                let func = dev.get_or_load_typed_func::<T>("softmax", &kernels::REDUCE)?;
                 // SAFETY: Set later by running the kernel.
                 let dst = unsafe { dev.alloc::<T>(el)? };
                 let mut builder = func.builder();

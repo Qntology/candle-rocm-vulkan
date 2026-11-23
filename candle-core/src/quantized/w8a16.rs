@@ -141,17 +141,44 @@ fn ggml_float_ctype(dtype: GgmlDType) -> Option<(&'static str, &'static str, DTy
     }
 }
 
-/// Kernel `name` of the module built from `kernels/w8a16_impl.h` + `inst` (compiled on first use,
-/// backed by the process + on-disk NVRTC PTX cache).
-fn func(dev: &CudaDevice, name: &str, inst: String) -> Result<CudaFunction> {
-    let module = format!("candle_{name}");
-    let f = dev.get_or_compile_source_func(name, &module, || {
-        Ok(format!(
-            "{}\n{inst}\n",
-            crate::accel::sources::strip_includes(SOURCE)
-        ))
-    })?;
-    Ok(f.into_cuda_function())
+fn dtype_code(dtype: DType) -> Result<u8> {
+    match dtype {
+        DType::F32 => Ok(1),
+        DType::F16 => Ok(2),
+        DType::BF16 => Ok(3),
+        d => bail!("w8a16: unsupported dtype {d:?} (expected f32, f16 or bf16)"),
+    }
+}
+
+fn ggml_code(dtype: GgmlDType) -> u8 {
+    dtype as u8
+}
+
+#[inline]
+fn pack_key(tag: u8, a: u8, b: u8, c: u8, d: u8, e: u8, f: u8) -> u64 {
+    (tag as u64)
+        | ((a as u64) << 8)
+        | ((b as u64) << 16)
+        | ((c as u64) << 24)
+        | ((d as u64) << 32)
+        | ((e as u64) << 40)
+        | ((f as u64) << 48)
+}
+
+/// Cached kernel `name` of the module built from `kernels/w8a16_impl.h` + `inst` (compiled on
+/// first use, backed by the per-device integer-keyed function handle cache and the process +
+/// on-disk NVRTC PTX cache). Zero string allocations on cache hit.
+fn cached_func(
+    dev: &CudaDevice,
+    key: u64,
+    build: impl FnOnce() -> Result<(String, String)>,
+) -> Result<CudaFunction> {
+    dev.get_or_compile_w8a16_func(key, || {
+        let (name, inst) = build()?;
+        let module = format!("candle_{name}");
+        let src = format!("{}\n{inst}\n", crate::accel::sources::strip_includes(SOURCE));
+        Ok((name, module, src))
+    })
 }
 
 fn grid_1d(work: usize, threads: usize) -> u32 {
@@ -183,19 +210,31 @@ pub fn matvec(
     if k == 0 || !k.is_multiple_of(d.qk) || n == 0 || n > i32::MAX as usize {
         bail!("w8a16 matvec: unsupported shape n={n} k={k} for {wtype:?}")
     }
-    let (xs, xc) = elem_ctype(x.dtype())?;
+    let x_dt_code = dtype_code(x.dtype())?;
     if (x_off * x.dtype().size_in_bytes()) % 16 != 0 {
         bail!("w8a16 matvec: input offset {x_off} is not 16 byte aligned")
     }
     let row_bytes = (k / d.qk * wtype.type_size()) as i64;
     let cfg = mv_config(wtype, k, n);
     let (wpr, rpb, unr) = (cfg.warps_per_row, cfg.rows_per_block, cfg.unroll);
-    let name = format!("w8a16_mv_{}_{xs}_m{rows}_w{wpr}_r{rpb}_u{unr}", d.sfx);
-    let inst = format!(
-        "W8A16_MV_KERNEL({name}, {}, {xc}, {rows}, {wpr}, {rpb}, {unr})",
-        d.ty
+    let key = pack_key(
+        1,
+        ggml_code(wtype),
+        x_dt_code,
+        rows as u8,
+        wpr as u8,
+        rpb as u8,
+        unr as u8,
     );
-    let f = func(dev, &name, inst)?;
+    let f = cached_func(dev, key, || {
+        let (xs, xc) = elem_ctype(x.dtype())?;
+        let name = format!("w8a16_mv_{}_{xs}_m{rows}_w{wpr}_r{rpb}_u{unr}", d.sfx);
+        let inst = format!(
+            "W8A16_MV_KERNEL({name}, {}, {xc}, {rows}, {wpr}, {rpb}, {unr})",
+            d.ty
+        );
+        Ok((name, inst))
+    })?;
     let lc = LaunchConfig {
         grid_dim: (n.div_ceil(rpb) as u32, 1, 1),
         block_dim: (32, wpr as u32, rpb as u32),
@@ -393,9 +432,13 @@ pub fn dequantize(
                 w.len()
             )
         }
-        let name = format!("w8a16_dq_{}_{osfx}", d.sfx);
-        let inst = format!("W8A16_DQ_KERNEL({name}, {}, {octype})", d.ty);
-        let f = func(dev, &name, inst)?;
+        let out_code = dtype_code(out)?;
+        let key = pack_key(2, ggml_code(wtype), out_code, 0, 0, 0, 0);
+        let f = cached_func(dev, key, || {
+            let name = format!("w8a16_dq_{}_{osfx}", d.sfx);
+            let inst = format!("W8A16_DQ_KERNEL({name}, {}, {octype})", d.ty);
+            Ok((name, inst))
+        })?;
         let threads = 256;
         let lc = LaunchConfig {
             grid_dim: (grid_1d(nblocks * d.tasks, threads), 1, 1),
@@ -444,9 +487,13 @@ pub fn dequantize(
         }
         return alloc_out!(copy);
     }
-    let name = format!("w8a16_cvt_{isfx}_{osfx}");
-    let inst = format!("W8A16_CVT_KERNEL({name}, {ictype}, {octype})");
-    let f = func(dev, &name, inst)?;
+    let out_code = dtype_code(out)?;
+    let key = pack_key(3, ggml_code(wtype), out_code, 0, 0, 0, 0);
+    let f = cached_func(dev, key, || {
+        let name = format!("w8a16_cvt_{isfx}_{osfx}");
+        let inst = format!("W8A16_CVT_KERNEL({name}, {ictype}, {octype})");
+        Ok((name, inst))
+    })?;
     let threads = 256;
     let lc = LaunchConfig {
         grid_dim: (grid_1d(elems, threads), 1, 1),
@@ -574,13 +621,14 @@ pub fn gemm_tiles(
         tile_rows
     };
     let cvt = if kind == GemmKind::F32Out {
-        let (osfx, octype) = elem_ctype(dtype)?;
-        let name = format!("w8a16_cvt2d_f32_{osfx}");
-        Some(func(
-            dev,
-            &name,
-            format!("W8A16_CVT2D_KERNEL({name}, {octype})"),
-        )?)
+        let dt_code = dtype_code(dtype)?;
+        let key = pack_key(4, dt_code, 0, 0, 0, 0, 0);
+        Some(cached_func(dev, key, || {
+            let (osfx, octype) = elem_ctype(dtype)?;
+            let name = format!("w8a16_cvt2d_f32_{osfx}");
+            let inst = format!("W8A16_CVT2D_KERNEL({name}, {octype})");
+            Ok((name, inst))
+        })?)
     } else {
         None
     };
@@ -797,15 +845,19 @@ pub fn indexed_moe(
     if k == 0 || !k.is_multiple_of(d.qk) || n == 0 || num_experts == 0 {
         bail!("w8a16 indexed_moe: unsupported shape ({num_experts}, {n}, {k}) for {wtype:?}")
     }
-    let (xs, xc) = elem_ctype(x.dtype())?;
+    let x_dt_code = dtype_code(x.dtype())?;
     if (x_off * x.dtype().size_in_bytes()) % 16 != 0 {
         bail!("w8a16 indexed_moe: input offset {x_off} is not 16 byte aligned")
     }
     let row_bytes = (k / d.qk * wtype.type_size()) as i64;
     let expert_bytes = row_bytes * (n as i64);
-    let name = format!("w8a16_moe_{}_{xs}", d.sfx);
-    let inst = format!("W8A16_MOE_KERNEL({name}, {}, {xc})", d.ty);
-    let f = func(dev, &name, inst)?;
+    let key = pack_key(5, ggml_code(wtype), x_dt_code, 0, 0, 0, 0);
+    let f = cached_func(dev, key, || {
+        let (xs, xc) = elem_ctype(x.dtype())?;
+        let name = format!("w8a16_moe_{}_{xs}", d.sfx);
+        let inst = format!("W8A16_MOE_KERNEL({name}, {}, {xc})", d.ty);
+        Ok((name, inst))
+    })?;
     let total_slots = batch * topk;
     let lc = LaunchConfig {
         grid_dim: (n.div_ceil(4) as u32, total_slots as u32, 1),
@@ -854,11 +906,15 @@ pub fn lm_stage1_quant_func(
     let Some(d) = decoder(wtype) else {
         bail!("w8a16 lm_stage1_quant: unsupported weight type {wtype:?}")
     };
-    let (xs, xc) = elem_ctype(dtype)?;
+    let dt_code = dtype_code(dtype)?;
     let max_m = if m <= 1 { 1 } else { 8 };
-    let name = format!("w8a16_lm{max_m}_{}_{xs}", d.sfx);
-    let inst = format!("W8A16_LM_QUANT_KERNEL({name}, {}, {xc}, {max_m})", d.ty);
-    func(dev, &name, inst)
+    let key = pack_key(6, ggml_code(wtype), dt_code, max_m as u8, 0, 0, 0);
+    cached_func(dev, key, || {
+        let (xs, xc) = elem_ctype(dtype)?;
+        let name = format!("w8a16_lm{max_m}_{}_{xs}", d.sfx);
+        let inst = format!("W8A16_LM_QUANT_KERNEL({name}, {}, {xc}, {max_m})", d.ty);
+        Ok((name, inst))
+    })
 }
 
 /// Planar NVFP4 / NVFP8 exact matvec (`M <= 8`) on CUDA via `kernels/w8a16_impl.h`.
@@ -880,18 +936,21 @@ pub fn nvfp_mv(
     if rows == 0 || rows > MV_MAX_ROWS {
         bail!("w8a16 nvfp_mv: {rows} rows (expected 1..={MV_MAX_ROWS})")
     }
-    let (xs, xc) = elem_ctype(x.dtype())?;
+    let dt_code = dtype_code(x.dtype())?;
     let max_m = if rows == 1 { 1 } else { 8 };
-    let (name, inst) = if is_fp4 {
-        let name = format!("w8a16_nvfp4_mv{max_m}_{xs}");
-        let inst = format!("W8A16_NVFP4_MV_KERNEL({name}, {xc}, {max_m})");
-        (name, inst)
-    } else {
-        let name = format!("w8a16_nvfp8_mv{max_m}_{xs}");
-        let inst = format!("W8A16_NVFP8_MV_KERNEL({name}, {xc}, {max_m})");
-        (name, inst)
-    };
-    let f = func(dev, &name, inst)?;
+    let key = pack_key(7, u8::from(is_fp4), dt_code, max_m as u8, 0, 0, 0);
+    let f = cached_func(dev, key, || {
+        let (xs, xc) = elem_ctype(x.dtype())?;
+        if is_fp4 {
+            let name = format!("w8a16_nvfp4_mv{max_m}_{xs}");
+            let inst = format!("W8A16_NVFP4_MV_KERNEL({name}, {xc}, {max_m})");
+            Ok((name, inst))
+        } else {
+            let name = format!("w8a16_nvfp8_mv{max_m}_{xs}");
+            let inst = format!("W8A16_NVFP8_MV_KERNEL({name}, {xc}, {max_m})");
+            Ok((name, inst))
+        }
+    })?;
     let lc = LaunchConfig {
         grid_dim: (n.div_ceil(4) as u32, 1, 1),
         block_dim: (32, 4, 1),
@@ -944,17 +1003,25 @@ pub fn nvfp_dq_rows(
     out_dtype: DType,
 ) -> Result<CudaStorage> {
     use cudarc::driver::DevicePtr;
-    let (osfx, octype) = elem_ctype(out_dtype)?;
-    let (name, inst, total_work) = if is_fp4 {
-        let name = format!("w8a16_nvfp4_dq_{osfx}");
-        let inst = format!("W8A16_NVFP4_DQ_KERNEL({name}, {octype})");
-        (name, inst, nrows * (k / 16))
+    let dt_code = dtype_code(out_dtype)?;
+    let total_work = if is_fp4 {
+        nrows * (k / 16)
     } else {
-        let name = format!("w8a16_nvfp8_dq_{osfx}");
-        let inst = format!("W8A16_NVFP8_DQ_KERNEL({name}, {octype})");
-        (name, inst, nrows * (k / 8))
+        nrows * (k / 8)
     };
-    let f = func(dev, &name, inst)?;
+    let key = pack_key(8, u8::from(is_fp4), dt_code, 0, 0, 0, 0);
+    let f = cached_func(dev, key, || {
+        let (osfx, octype) = elem_ctype(out_dtype)?;
+        if is_fp4 {
+            let name = format!("w8a16_nvfp4_dq_{osfx}");
+            let inst = format!("W8A16_NVFP4_DQ_KERNEL({name}, {octype})");
+            Ok((name, inst))
+        } else {
+            let name = format!("w8a16_nvfp8_dq_{osfx}");
+            let inst = format!("W8A16_NVFP8_DQ_KERNEL({name}, {octype})");
+            Ok((name, inst))
+        }
+    })?;
     let lc = LaunchConfig {
         grid_dim: (grid_1d(total_work, 256), 1, 1),
         block_dim: (256, 1, 1),

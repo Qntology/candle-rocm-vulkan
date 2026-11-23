@@ -16,15 +16,37 @@ const MODULE_NAME: &str = "candle_decoder_ops";
 
 impl CudaDevice {
     pub(crate) fn decoder_op_func(&self, fn_name: &str) -> Result<super::device::CudaFunc> {
-        self.get_or_compile_source_func(fn_name, MODULE_NAME, || Ok(decoder_ops_cuda_source()))
+        self.get_or_compile_internal_func(
+            fn_name,
+            || MODULE_NAME.to_string(),
+            || Ok(decoder_ops_cuda_source()),
+        )
     }
 }
 
-fn dtype_suffix(dtype: DType) -> Result<&'static str> {
+fn res_rmsnorm_name(dtype: DType) -> Result<&'static str> {
     match dtype {
-        DType::F32 => Ok("f32"),
-        DType::F16 => Ok("f16"),
-        DType::BF16 => Ok("bf16"),
+        DType::F32 => Ok("res_rmsnorm_f32"),
+        DType::F16 => Ok("res_rmsnorm_f16"),
+        DType::BF16 => Ok("res_rmsnorm_bf16"),
+        d => bail!("decoder_ops: unsupported dtype {d:?} on the CUDA backend"),
+    }
+}
+
+fn silu_mul_name(dtype: DType) -> Result<&'static str> {
+    match dtype {
+        DType::F32 => Ok("silu_mul_f32"),
+        DType::F16 => Ok("silu_mul_f16"),
+        DType::BF16 => Ok("silu_mul_bf16"),
+        d => bail!("decoder_ops: unsupported dtype {d:?} on the CUDA backend"),
+    }
+}
+
+fn rope_kv_write_name(dtype: DType) -> Result<&'static str> {
+    match dtype {
+        DType::F32 => Ok("rope_kv_write_f32"),
+        DType::F16 => Ok("rope_kv_write_f16"),
+        DType::BF16 => Ok("rope_kv_write_bf16"),
         d => bail!("decoder_ops: unsupported dtype {d:?} on the CUDA backend"),
     }
 }
@@ -102,7 +124,7 @@ impl CudaStorage {
     ) -> Result<(Option<Self>, Self)> {
         use crate::backend::BackendStorage;
         let dtype = self.dtype();
-        let sfx = dtype_suffix(dtype)?;
+        let _ = res_rmsnorm_name(dtype)?; // dtype check; the kernel name below also picks the multi-row variant
         let dev = &self.device;
         let mut r_slice = if write_residual {
             Some(alloc(dev, dtype, rows * d)?)
@@ -193,7 +215,7 @@ impl CudaStorage {
     ) -> Result<Self> {
         use crate::backend::BackendStorage;
         let dtype = self.dtype();
-        let sfx = dtype_suffix(dtype)?;
+        let _ = res_rmsnorm_name(dtype)?; // dtype check; the kernel name below also picks the multi-row variant
         let dev = self.device.clone();
         let mut y_slice = alloc(&dev, dtype, rows * d)?;
         if rows > 0 && d > 0 {
@@ -264,11 +286,11 @@ impl CudaStorage {
     ) -> Result<Self> {
         use crate::backend::BackendStorage;
         let dtype = self.dtype();
-        let sfx = dtype_suffix(dtype)?;
+        let kname = silu_mul_name(dtype)?;
         let dev = &self.device;
         let mut out_slice = alloc(dev, dtype, rows * inter_dim)?;
         if rows > 0 && inter_dim > 0 {
-            let func = dev.decoder_op_func(&format!("silu_mul_{sfx}"))?;
+            let func = dev.decoder_op_func(kname)?;
             let stream = dev.cuda_stream();
             let (g_p, _g0) = dptr(self, gate_off, &stream)?;
             let (u_p, _g1) = dptr(up, up_off, &stream)?;
@@ -317,16 +339,14 @@ impl CudaStorage {
     ) -> Result<Self> {
         use crate::backend::BackendStorage;
         let dtype = self.dtype();
-        let sfx = dtype_suffix(dtype)?;
+        let kname = rope_kv_write_name(dtype)?;
         let dev = &self.device;
         let q_elems = (args.b as usize) * (args.t as usize) * (args.hq as usize) * (args.d as usize);
         let mut q_out = alloc(dev, dtype, q_elems)?;
         if args.b > 0 && args.t > 0 && (args.hq + args.hkv) > 0 && args.d > 0 {
-            let func = dev.decoder_op_func(&format!("rope_kv_write_{sfx}"))?;
+            let func = dev.decoder_op_func(kname)?;
             let smem = args.smem_bytes();
-            if smem > 48 * 1024 {
-                func.set_max_dynamic_shared_memory(smem as usize)?;
-            }
+            dev.ensure_func_max_smem(kname, &func, smem as usize)?;
             let stream = dev.cuda_stream();
             let (q_p, _g0) = dptr(self, args.q_off, &stream)?;
             let (qo_p, _g1) = dptr_mut(&mut q_out, 0, &stream)?;
