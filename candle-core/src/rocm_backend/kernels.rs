@@ -26,6 +26,8 @@ pub enum Module {
     W8A16,
     /// Native GPU bitonic arg_sort_last_dim (`sort.hip`).
     Sort,
+    /// Dedicated Vision Encoder fused ops (`vis_ops.hip`).
+    VisOps,
 }
 
 pub const UNARY: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/unary.co"));
@@ -45,6 +47,7 @@ pub const DECODER_OPS: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/decoder
 pub const LM_HEAD_ARGMAX: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/lm_head_argmax.co"));
 pub const W8A16: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/w8a16.co"));
 pub const SORT: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/sort.co"));
+pub const VIS_OPS: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/vis_ops.co"));
 
 /// GPU architectures the embedded code objects were built for.
 pub const COMPILED_ARCHS: &str = env!("CANDLE_ROCM_ARCHS");
@@ -63,7 +66,7 @@ pub fn compiled_for(arch: &str) -> bool {
 }
 
 impl Module {
-    pub const ALL: [Module; 17] = [
+    pub const ALL: [Module; 18] = [
         Module::Unary,
         Module::Binary,
         Module::Cast,
@@ -81,6 +84,7 @@ impl Module {
         Module::LmHeadArgmax,
         Module::W8A16,
         Module::Sort,
+        Module::VisOps,
     ];
 
     pub fn index(self) -> usize {
@@ -106,6 +110,7 @@ impl Module {
             Module::LmHeadArgmax => "lm_head_argmax",
             Module::W8A16 => "w8a16",
             Module::Sort => "sort",
+            Module::VisOps => "vis_ops",
         }
     }
 
@@ -128,6 +133,7 @@ impl Module {
             Module::LmHeadArgmax => LM_HEAD_ARGMAX,
             Module::W8A16 => W8A16,
             Module::Sort => SORT,
+            Module::VisOps => VIS_OPS,
         }
     }
 }

@@ -25,7 +25,16 @@
     W8A16_LM_QUANT_KERNEL(w8a16_lm1_##SFX##_bf16, DEC, w_bf16, 1)                                  \
     W8A16_LM_QUANT_KERNEL(w8a16_lm8_##SFX##_f32, DEC, float, 8)                                    \
     W8A16_LM_QUANT_KERNEL(w8a16_lm8_##SFX##_f16, DEC, w_f16, 8)                                    \
-    W8A16_LM_QUANT_KERNEL(w8a16_lm8_##SFX##_bf16, DEC, w_bf16, 8)
+    W8A16_LM_QUANT_KERNEL(w8a16_lm8_##SFX##_bf16, DEC, w_bf16, 8)                                  \
+    W8A16_TILE16_KERNEL(w8a16_tile16_##SFX##_f32, DEC, float)                                      \
+    W8A16_TILE16_KERNEL(w8a16_tile16_##SFX##_f16, DEC, w_f16)                                      \
+    W8A16_TILE16_KERNEL(w8a16_tile16_##SFX##_bf16, DEC, w_bf16)                                    \
+    W8A16_GATE_UP_SILU_KERNEL(w8a16_gus1_##SFX##_f32, DEC, float, 1)                               \
+    W8A16_GATE_UP_SILU_KERNEL(w8a16_gus1_##SFX##_f16, DEC, w_f16, 1)                               \
+    W8A16_GATE_UP_SILU_KERNEL(w8a16_gus1_##SFX##_bf16, DEC, w_bf16, 1)                             \
+    W8A16_GATE_UP_SILU_KERNEL(w8a16_gus8_##SFX##_f32, DEC, float, 8)                               \
+    W8A16_GATE_UP_SILU_KERNEL(w8a16_gus8_##SFX##_f16, DEC, w_f16, 8)                               \
+    W8A16_GATE_UP_SILU_KERNEL(w8a16_gus8_##SFX##_bf16, DEC, w_bf16, 8)
 
 W8A16_HIP_ALL_FOR(q8_0, DecQ8_0)
 W8A16_HIP_ALL_FOR(q4_0, DecQ4_0)

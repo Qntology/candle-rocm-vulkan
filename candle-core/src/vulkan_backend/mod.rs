@@ -23,6 +23,7 @@ mod accel;
 pub(crate) mod decoder_ops;
 pub(crate) mod delta_rule;
 mod lm_head;
+pub(crate) mod nvfp;
 pub(crate) mod qgpu;
 pub mod shaders;
 
@@ -53,6 +54,9 @@ pub(crate) struct Limits {
     pub max_shared_memory: u32,
     pub max_invocations: u32,
     pub max_storage_bindings: u32,
+    pub subgroup_size: u32,
+    pub subgroup_arithmetic: bool,
+    pub compute_units_est: usize,
 }
 
 /// One Vulkan logical device with its queue, kernel cache and allocator state.
@@ -84,6 +88,8 @@ pub(crate) struct VulkanContext {
     /// recycled into `pool` (or released).
     deferred_returns: Mutex<Vec<(u64, PooledBuffer)>>,
     kernels: Mutex<HashMap<String, Arc<shaders::Kernel>>>,
+    pipeline_cache: vk::PipelineCache,
+    pipeline_cache_path: Option<std::path::PathBuf>,
     memory_properties: vk::PhysicalDeviceMemoryProperties,
     /// HOST_VISIBLE | HOST_COHERENT memory types, best first.
     memory_types: Vec<u32>,
@@ -321,10 +327,18 @@ impl Drop for VulkanContext {
         }
         unsafe {
             let _ = self.device.device_wait_idle();
+            if self.pipeline_cache != vk::PipelineCache::null() {
+                if let Some(path) = &self.pipeline_cache_path {
+                    shaders::save_pipeline_cache(&self.device, self.pipeline_cache, path);
+                }
+            }
             if let Ok(mut kernels) = self.kernels.lock() {
                 for (_, k) in kernels.drain() {
                     k.destroy(&self.device);
                 }
+            }
+            if self.pipeline_cache != vk::PipelineCache::null() {
+                self.device.destroy_pipeline_cache(self.pipeline_cache, None);
             }
             if let Ok(mut exec) = self.exec.lock() {
                 exec.destroy(&self.device);
@@ -664,6 +678,47 @@ fn init_vulkan(gpu_id: usize) -> Result<VulkanContext> {
         }
     };
 
+    let mut subgroup_props = vk::PhysicalDeviceSubgroupProperties::default();
+    let mut props2 = vk::PhysicalDeviceProperties2::default().push_next(&mut subgroup_props);
+    unsafe {
+        instance.get_physical_device_properties2(physical, &mut props2);
+    }
+    let subgroup_size = subgroup_props.subgroup_size.max(1);
+    let subgroup_arithmetic = subgroup_props
+        .supported_stages
+        .contains(vk::ShaderStageFlags::COMPUTE)
+        && subgroup_props
+            .supported_operations
+            .contains(vk::SubgroupFeatureFlags::ARITHMETIC);
+    let vram_bytes = (0..memory_properties.memory_heap_count as usize)
+        .filter(|&h| {
+            memory_properties.memory_heaps[h]
+                .flags
+                .contains(vk::MemoryHeapFlags::DEVICE_LOCAL)
+        })
+        .map(|h| memory_properties.memory_heaps[h].size)
+        .max()
+        .unwrap_or(0);
+    let compute_units_est = match props.device_type {
+        vk::PhysicalDeviceType::DISCRETE_GPU => {
+            if vram_bytes >= (12u64 << 30) {
+                32
+            } else {
+                16
+            }
+        }
+        vk::PhysicalDeviceType::INTEGRATED_GPU => 8,
+        vk::PhysicalDeviceType::CPU => num_cpus::get().max(1),
+        _ => 16,
+    };
+
+    let (pipeline_cache, pipeline_cache_path) = shaders::load_pipeline_cache(
+        &device,
+        props.vendor_id,
+        props.device_id,
+        &props.pipeline_cache_uuid,
+    );
+
     let limits = Limits {
         max_storage_buffer_range: props.limits.max_storage_buffer_range as u64,
         max_workgroup_count: props.limits.max_compute_work_group_count,
@@ -671,6 +726,9 @@ fn init_vulkan(gpu_id: usize) -> Result<VulkanContext> {
         max_shared_memory: props.limits.max_compute_shared_memory_size,
         max_invocations: props.limits.max_compute_work_group_invocations,
         max_storage_bindings,
+        subgroup_size,
+        subgroup_arithmetic,
+        compute_units_est,
     };
 
     let unified = props.device_type == vk::PhysicalDeviceType::INTEGRATED_GPU
@@ -710,6 +768,8 @@ fn init_vulkan(gpu_id: usize) -> Result<VulkanContext> {
         batch_error: Mutex::new(None),
         deferred_returns: Mutex::new(Vec::new()),
         kernels: Mutex::new(HashMap::new()),
+        pipeline_cache,
+        pipeline_cache_path,
         memory_properties,
         memory_types,
         memory_budget_ext,
@@ -881,6 +941,11 @@ impl VulkanDevice {
 
     pub(crate) fn limits(&self) -> Limits {
         self.inner.limits
+    }
+
+    /// Hardware subgroup / wave width reported by `VkPhysicalDeviceSubgroupProperties`.
+    pub fn subgroup_size(&self) -> u32 {
+        self.inner.limits.subgroup_size
     }
 
     /// Allocates a mapped host visible buffer of `numel` elements of `dtype`.

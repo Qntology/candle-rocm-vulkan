@@ -5,7 +5,8 @@
 //! reference implementations on CPU / Vulkan / Metal.
 
 use crate::accel::decoder_ops::{
-    self as dop, HeadLayout, RopeKvLaunchArgs, RopeMode, ROPE_NORM_PLUS_ONE,
+    self as dop, HeadLayout, RopeKvIndirectLaunchArgs, RopeKvLaunchArgs, RopeMode,
+    ROPE_CODY_WAITE_ONTHEFLY, ROPE_NORM_PLUS_ONE,
 };
 #[cfg(any(feature = "cuda", feature = "rocm", feature = "vulkan"))]
 use crate::op::BackpropOp;
@@ -983,6 +984,638 @@ pub fn rope_kv_write(
 
             // Special-case pure CPU CpuStorage direct write is already handled cleanly via slice_set above.
             let _ = CpuStorage::F32(Vec::new());
+            Tensor::from_vec(q_out_v, q_out_dims.as_slice(), &Device::Cpu)?
+                .to_dtype(dtype)?
+                .to_device(&dev)
+        }
+    }
+}
+
+/// Outlier-free Residual + RMSNorm + Online Hadamard-32 + OCP E4M3FN dynamic quantization.
+///
+/// Applies orthonormal `H_32 / sqrt(32)` per 32-element channel block in registers after
+/// RMSNorm and quantizes to `F8E4M3` with per-block `F32` scales `[..., D / 32]` (`amax / 448`).
+/// Returns `(optional residual, fp8_tensor, scales_f32)`.
+pub fn residual_rmsnorm_hadamard_fp8(
+    x: &Tensor,
+    delta: Option<&Tensor>,
+    weight: &Tensor,
+    eps: f32,
+    plus_one: bool,
+    write_residual: bool,
+) -> Result<(Option<Tensor>, Tensor, Tensor)> {
+    let dev = x.device().clone();
+    let dtype = x.dtype();
+    check_float_dtype(dtype, "residual_rmsnorm_hadamard_fp8")?;
+    let dims = x.dims().to_vec();
+    if dims.is_empty() {
+        bail!("residual_rmsnorm_hadamard_fp8: expected rank >= 1");
+    }
+    let d = *dims.last().unwrap();
+    if d == 0 || d % 32 != 0 {
+        bail!("residual_rmsnorm_hadamard_fp8: last dim D={d} must be a non-zero multiple of 32");
+    }
+    let rows = x.elem_count() / d;
+    if weight.dims() != [d] {
+        bail!(
+            "residual_rmsnorm_hadamard_fp8: weight shape {:?} != [{d}]",
+            weight.dims()
+        );
+    }
+    let mut scale_dims = dims.clone();
+    *scale_dims.last_mut().unwrap() = d / 32;
+
+    let x_c = x.contiguous()?;
+    let dl_c = match delta {
+        Some(dl) => {
+            if dl.dims() != dims.as_slice() {
+                bail!("residual_rmsnorm_hadamard_fp8: delta shape mismatch");
+            }
+            Some(dl.to_device(&dev)?.to_dtype(dtype)?.contiguous()?)
+        }
+        None => None,
+    };
+    let w_f32 = weight.to_device(&dev)?.to_dtype(DType::F32)?.contiguous()?;
+
+    match &dev {
+        #[cfg(feature = "cuda")]
+        Device::Cuda(_) => {
+            let (xs, xl) = x_c.storage_and_layout();
+            let (ws, wl) = w_f32.storage_and_layout();
+            let dl_g = dl_c.as_ref().map(|t| t.storage_and_layout());
+            let (Storage::Cuda(xc), Storage::Cuda(wc)) = (&*xs, &*ws) else {
+                unreachable!()
+            };
+            let dl_arg = dl_g.as_ref().map(|(s, l)| match &**s {
+                Storage::Cuda(c) => (c, l.start_offset()),
+                _ => unreachable!(),
+            });
+            let (r_opt, fp8_s, sc_s) = xc.res_rmsnorm_hadamard_fp8(
+                xl.start_offset(),
+                dl_arg,
+                wc,
+                wl.start_offset(),
+                rows,
+                d,
+                eps,
+                plus_one,
+                write_residual,
+            )?;
+            Ok((
+                r_opt.map(|s| from_storage(Storage::Cuda(s), dims.clone(), BackpropOp::none(), false)),
+                from_storage(Storage::Cuda(fp8_s), dims, BackpropOp::none(), false),
+                from_storage(Storage::Cuda(sc_s), scale_dims, BackpropOp::none(), false),
+            ))
+        }
+        #[cfg(feature = "rocm")]
+        Device::Rocm(_) => {
+            let (xs, xl) = x_c.storage_and_layout();
+            let (ws, wl) = w_f32.storage_and_layout();
+            let dl_g = dl_c.as_ref().map(|t| t.storage_and_layout());
+            let (Storage::Rocm(xr), Storage::Rocm(wr)) = (&*xs, &*ws) else {
+                unreachable!()
+            };
+            let dl_arg = dl_g.as_ref().map(|(s, l)| match &**s {
+                Storage::Rocm(r) => (r, l.start_offset()),
+                _ => unreachable!(),
+            });
+            let (r_opt, fp8_s, sc_s) = xr.res_rmsnorm_hadamard_fp8(
+                xl.start_offset(),
+                dl_arg,
+                wr,
+                wl.start_offset(),
+                rows,
+                d,
+                eps,
+                plus_one,
+                write_residual,
+            )?;
+            Ok((
+                r_opt.map(|s| from_storage(Storage::Rocm(s), dims.clone(), BackpropOp::none(), false)),
+                from_storage(Storage::Rocm(fp8_s), dims, BackpropOp::none(), false),
+                from_storage(Storage::Rocm(sc_s), scale_dims, BackpropOp::none(), false),
+            ))
+        }
+        _ => {
+            let xv = x_c
+                .to_device(&Device::Cpu)?
+                .to_dtype(DType::F32)?
+                .flatten_all()?
+                .to_vec1::<f32>()?;
+            let dv = match &dl_c {
+                Some(dl) => Some(
+                    dl.to_device(&Device::Cpu)?
+                        .to_dtype(DType::F32)?
+                        .flatten_all()?
+                        .to_vec1::<f32>()?,
+                ),
+                None => None,
+            };
+            let wv = w_f32.to_device(&Device::Cpu)?.to_vec1::<f32>()?;
+            let (r_vec, y_vec) =
+                dop::cpu_res_rmsnorm_f32(&xv, dv.as_deref(), &wv, rows, d, eps, plus_one);
+            let (codes, scales) = dop::hadamard32_quant_fp8_cpu(&y_vec);
+            let fp8_vals: Vec<float8::F8E4M3> = codes
+                .into_iter()
+                .map(float8::F8E4M3::from_bits)
+                .collect();
+            let r_t = if write_residual {
+                Some(
+                    Tensor::from_vec(r_vec, dims.as_slice(), &Device::Cpu)?
+                        .to_dtype(dtype)?
+                        .to_device(&dev)?,
+                )
+            } else {
+                None
+            };
+            let fp8_t = Tensor::from_vec(fp8_vals, dims.as_slice(), &Device::Cpu)?.to_device(&dev)?;
+            let sc_t = Tensor::from_vec(scales, scale_dims.as_slice(), &Device::Cpu)?.to_device(&dev)?;
+            Ok((r_t, fp8_t, sc_t))
+        }
+    }
+}
+
+/// Outlier-free SwiGLU `silu(gate) * up` + Online Hadamard-32 + OCP E4M3FN dynamic quantization.
+/// Returns `(fp8_tensor [..., inter_dim], scales_f32 [..., inter_dim / 32])`.
+pub fn silu_mul_hadamard_fp8(gate: &Tensor, up: &Tensor) -> Result<(Tensor, Tensor)> {
+    let dev = gate.device().clone();
+    let dtype = gate.dtype();
+    check_float_dtype(dtype, "silu_mul_hadamard_fp8")?;
+    let dims = gate.dims().to_vec();
+    if dims.is_empty() || up.dims() != dims.as_slice() {
+        bail!("silu_mul_hadamard_fp8: shape mismatch");
+    }
+    let inter_dim = *dims.last().unwrap();
+    if inter_dim == 0 || inter_dim % 32 != 0 {
+        bail!("silu_mul_hadamard_fp8: inter_dim={inter_dim} must be a non-zero multiple of 32");
+    }
+    let rows = gate.elem_count() / inter_dim;
+    let mut scale_dims = dims.clone();
+    *scale_dims.last_mut().unwrap() = inter_dim / 32;
+
+    let g_c = if uniform_row_stride(gate.layout()).is_some() {
+        gate.clone()
+    } else {
+        gate.contiguous()?
+    };
+    let u_c = if up.dtype() == dtype
+        && up.device().location() == dev.location()
+        && uniform_row_stride(up.layout()).is_some()
+    {
+        up.clone()
+    } else {
+        up.to_device(&dev)?.to_dtype(dtype)?.contiguous()?
+    };
+    #[allow(unused_variables)]
+    let g_stride = uniform_row_stride(g_c.layout()).unwrap();
+    #[allow(unused_variables)]
+    let u_stride = uniform_row_stride(u_c.layout()).unwrap();
+
+    match &dev {
+        #[cfg(feature = "cuda")]
+        Device::Cuda(_) => {
+            let (gs, gl) = g_c.storage_and_layout();
+            let (us, ul) = u_c.storage_and_layout();
+            let (Storage::Cuda(gc), Storage::Cuda(uc)) = (&*gs, &*us) else {
+                unreachable!()
+            };
+            let (fp8_s, sc_s) = gc.silu_mul_hadamard_fp8(
+                gl.start_offset(),
+                g_stride,
+                uc,
+                ul.start_offset(),
+                u_stride,
+                rows,
+                inter_dim,
+            )?;
+            Ok((
+                from_storage(Storage::Cuda(fp8_s), dims, BackpropOp::none(), false),
+                from_storage(Storage::Cuda(sc_s), scale_dims, BackpropOp::none(), false),
+            ))
+        }
+        #[cfg(feature = "rocm")]
+        Device::Rocm(_) => {
+            let (gs, gl) = g_c.storage_and_layout();
+            let (us, ul) = u_c.storage_and_layout();
+            let (Storage::Rocm(gr), Storage::Rocm(ur)) = (&*gs, &*us) else {
+                unreachable!()
+            };
+            let (fp8_s, sc_s) = gr.silu_mul_hadamard_fp8(
+                gl.start_offset(),
+                g_stride,
+                ur,
+                ul.start_offset(),
+                u_stride,
+                rows,
+                inter_dim,
+            )?;
+            Ok((
+                from_storage(Storage::Rocm(fp8_s), dims, BackpropOp::none(), false),
+                from_storage(Storage::Rocm(sc_s), scale_dims, BackpropOp::none(), false),
+            ))
+        }
+        _ => {
+            let gv = g_c
+                .contiguous()?
+                .to_device(&Device::Cpu)?
+                .to_dtype(DType::F32)?
+                .flatten_all()?
+                .to_vec1::<f32>()?;
+            let uv = u_c
+                .contiguous()?
+                .to_device(&Device::Cpu)?
+                .to_dtype(DType::F32)?
+                .flatten_all()?
+                .to_vec1::<f32>()?;
+            let y_vec = dop::cpu_silu_mul_f32(&gv, inter_dim, &uv, inter_dim, rows, inter_dim);
+            let (codes, scales) = dop::hadamard32_quant_fp8_cpu(&y_vec);
+            let fp8_vals: Vec<float8::F8E4M3> = codes
+                .into_iter()
+                .map(float8::F8E4M3::from_bits)
+                .collect();
+            let fp8_t = Tensor::from_vec(fp8_vals, dims.as_slice(), &Device::Cpu)?.to_device(&dev)?;
+            let sc_t = Tensor::from_vec(scales, scale_dims.as_slice(), &Device::Cpu)?.to_device(&dev)?;
+            Ok((fp8_t, sc_t))
+        }
+    }
+}
+
+/// Graph-safe Indirect QK Head RMSNorm + RoPE (table or Cody-Waite TwoProd on-the-fly) +
+/// YaRN `mscale` + KV Cache Direct Write.
+///
+/// - `d_kv_pos`: `U32` tensor of shape `[1]` or `[B]` holding the physical cache write offset.
+/// - `d_rope_pos`: optional `U32` tensor of shape `[1]` or `[B]` holding the RoPE phase offset
+///   (e.g. `past_len + delta_mrope` for 1D-collapsed 3D M-RoPE or Delta-RoPE shift). Defaults to `d_kv_pos`.
+/// - When `sin_tab` is `None`, `cos_tab` is interpreted as `inv_freq` (`[half_rot]`, F32) and
+///   exact FP32 TwoProd Cody-Waite range-reduced `(cos, sin)` are computed on-the-fly (`<= 3e-7`
+///   error vs FP64 up to `pos = 1,000,000+`).
+/// - `mscale`: YaRN attention scale fused into `q_out` store (`1.0` = no scaling).
+#[allow(clippy::too_many_arguments)]
+pub fn rope_kv_write_indirect(
+    q: &Tensor,
+    k: &Tensor,
+    v: &Tensor,
+    q_norm_w: Option<&Tensor>,
+    k_norm_w: Option<&Tensor>,
+    cos_or_inv_freq: &Tensor,
+    sin_tab: Option<&Tensor>,
+    k_cache: &mut Tensor,
+    v_cache: &mut Tensor,
+    d_kv_pos: &Tensor,
+    d_rope_pos: Option<&Tensor>,
+    in_layout: HeadLayout,
+    out_layout: HeadLayout,
+    mode: RopeMode,
+    eps: f32,
+    norm_plus_one: bool,
+    mscale: f32,
+) -> Result<Tensor> {
+    let dev = q.device().clone();
+    let dtype = q.dtype();
+    check_float_dtype(dtype, "rope_kv_write_indirect")?;
+    let q_c = q.contiguous()?;
+    let k_c = k.to_device(&dev)?.to_dtype(dtype)?.contiguous()?;
+    let v_c = v.to_device(&dev)?.to_dtype(dtype)?.contiguous()?;
+
+    let (b, t, hq, d, q_strides) = validate_head_4d(&q_c, in_layout, "q")?;
+    let (bk, tk, hkv, dk, k_strides) = validate_head_4d(&k_c, in_layout, "k")?;
+    let (bv, tv, hv, dv, v_strides) = validate_head_4d(&v_c, in_layout, "v")?;
+    if bk != b || tk != t || dk != d || bv != b || tv != t || hv != hkv || dv != d {
+        bail!("rope_kv_write_indirect: Q/K/V shape mismatch");
+    }
+
+    let kv_pos_c = d_kv_pos.to_device(&dev)?.to_dtype(DType::U32)?.contiguous()?;
+    let kv_pos_len = kv_pos_c.elem_count();
+    if kv_pos_len != 1 && kv_pos_len != b {
+        bail!("rope_kv_write_indirect: d_kv_pos len {kv_pos_len} must be 1 or B={b}");
+    }
+    let pos_stride = if kv_pos_len == 1 { 0u32 } else { 1u32 };
+    let rope_pos_c = match d_rope_pos {
+        Some(rp) => {
+            let c = rp.to_device(&dev)?.to_dtype(DType::U32)?.contiguous()?;
+            if c.elem_count() != kv_pos_len {
+                bail!("rope_kv_write_indirect: d_rope_pos len must match d_kv_pos");
+            }
+            Some(c)
+        }
+        None => None,
+    };
+
+    let cos_f32 = cos_or_inv_freq
+        .to_device(&dev)?
+        .to_dtype(DType::F32)?
+        .contiguous()?;
+    let sin_f32 = match sin_tab {
+        Some(s) => Some(s.to_device(&dev)?.to_dtype(DType::F32)?.contiguous()?),
+        None => None,
+    };
+    let onthefly_cw = sin_f32.is_none();
+    let half_rot = *cos_f32.dims().last().unwrap_or(&0);
+    let rotary_dim = half_rot * 2;
+    if rotary_dim == 0 || rotary_dim > d {
+        bail!("rope_kv_write_indirect: invalid rotary_dim {rotary_dim} for D={d}");
+    }
+    let cos_st = if onthefly_cw { 0u64 } else { half_rot as u64 };
+
+    let kc_dims = k_cache.dims().to_vec();
+    if kc_dims.len() != 4 || kc_dims != v_cache.dims() {
+        bail!("rope_kv_write_indirect: k_cache/v_cache must be matching 4D tensors");
+    }
+    let (kc_strides, s_axis) = if kc_dims[1] == hkv {
+        let s_cap = kc_dims[2];
+        ([(hkv * s_cap * d) as u64, (s_cap * d) as u64, d as u64], 2usize)
+    } else if kc_dims[2] == hkv {
+        let s_cap = kc_dims[1];
+        ([(s_cap * hkv * d) as u64, d as u64, (hkv * d) as u64], 1usize)
+    } else {
+        bail!("rope_kv_write_indirect: k_cache shape {kc_dims:?} does not match hkv={hkv}");
+    };
+    let _ = s_axis;
+
+    let (q_out_dims, qo_strides) = match out_layout {
+        HeadLayout::Bshd => (
+            vec![b, t, hq, d],
+            [(t * hq * d) as u64, d as u64, (hq * d) as u64],
+        ),
+        HeadLayout::Bhsd => (
+            vec![b, hq, t, d],
+            [(hq * t * d) as u64, (t * d) as u64, d as u64],
+        ),
+    };
+
+    let qnw_f32 = match q_norm_w {
+        Some(w) => Some(w.to_device(&dev)?.to_dtype(DType::F32)?.contiguous()?),
+        None => None,
+    };
+    let knw_f32 = match k_norm_w {
+        Some(w) => Some(w.to_device(&dev)?.to_dtype(DType::F32)?.contiguous()?),
+        None => None,
+    };
+
+    let mut flags = mode.flag();
+    if norm_plus_one {
+        flags |= ROPE_NORM_PLUS_ONE;
+    }
+    if onthefly_cw {
+        flags |= ROPE_CODY_WAITE_ONTHEFLY;
+    }
+
+    #[allow(unused_variables)]
+    let args = RopeKvIndirectLaunchArgs {
+        b: b as u32,
+        t: t as u32,
+        hq: hq as u32,
+        hkv: hkv as u32,
+        d: d as u32,
+        rotary_dim: rotary_dim as u32,
+        pos_stride,
+        q_off: q_c.layout().start_offset(),
+        k_off: k_c.layout().start_offset(),
+        v_off: v_c.layout().start_offset(),
+        qnw_off: qnw_f32.as_ref().map_or(0, |w| w.layout().start_offset()),
+        knw_off: knw_f32.as_ref().map_or(0, |w| w.layout().start_offset()),
+        cos_off: cos_f32.layout().start_offset(),
+        sin_off: sin_f32.as_ref().map_or(0, |s| s.layout().start_offset()),
+        kc_off: k_cache.layout().start_offset(),
+        vc_off: v_cache.layout().start_offset(),
+        kv_pos_off: kv_pos_c.layout().start_offset(),
+        rope_pos_off: rope_pos_c.as_ref().map_or(0, |p| p.layout().start_offset()),
+        q_strides,
+        qo_strides,
+        k_strides,
+        v_strides,
+        kc_strides,
+        cos_st,
+        eps,
+        mscale,
+        flags,
+    };
+
+    match &dev {
+        #[cfg(feature = "cuda")]
+        Device::Cuda(_) => {
+            let (qs, _) = q_c.storage_and_layout();
+            let (ks, _) = k_c.storage_and_layout();
+            let (vs, _) = v_c.storage_and_layout();
+            let (cs, _) = cos_f32.storage_and_layout();
+            let ss_g = sin_f32.as_ref().map(|t| t.storage_and_layout());
+            let qnw_g = qnw_f32.as_ref().map(|t| t.storage_and_layout());
+            let knw_g = knw_f32.as_ref().map(|t| t.storage_and_layout());
+            let (kp_s, _) = kv_pos_c.storage_and_layout();
+            let rp_g = rope_pos_c.as_ref().map(|t| t.storage_and_layout());
+            let mut kc_s = k_cache.storage_mut();
+            let mut vc_s = v_cache.storage_mut();
+            let (
+                Storage::Cuda(qc),
+                Storage::Cuda(kc_in),
+                Storage::Cuda(vc_in),
+                Storage::Cuda(cos_c),
+                Storage::Cuda(kvp_c),
+                Storage::Cuda(kc_mut),
+                Storage::Cuda(vc_mut),
+            ) = (&*qs, &*ks, &*vs, &*cs, &*kp_s, &mut *kc_s, &mut *vc_s)
+            else {
+                unreachable!()
+            };
+            let sin_c = ss_g.as_ref().map(|(s, _)| match &**s {
+                Storage::Cuda(c) => c,
+                _ => unreachable!(),
+            });
+            let qnw_c = qnw_g.as_ref().map(|(s, _)| match &**s {
+                Storage::Cuda(c) => c,
+                _ => unreachable!(),
+            });
+            let knw_c = knw_g.as_ref().map(|(s, _)| match &**s {
+                Storage::Cuda(c) => c,
+                _ => unreachable!(),
+            });
+            let rp_c = rp_g.as_ref().map(|(s, _)| match &**s {
+                Storage::Cuda(c) => c,
+                _ => unreachable!(),
+            });
+            let qo = qc.rope_kv_write_indirect(
+                kc_in, vc_in, qnw_c, knw_c, cos_c, sin_c, kc_mut, vc_mut, kvp_c, rp_c, &args,
+            )?;
+            Ok(from_storage(
+                Storage::Cuda(qo),
+                q_out_dims,
+                BackpropOp::none(),
+                false,
+            ))
+        }
+        #[cfg(feature = "rocm")]
+        Device::Rocm(_) => {
+            let (qs, _) = q_c.storage_and_layout();
+            let (ks, _) = k_c.storage_and_layout();
+            let (vs, _) = v_c.storage_and_layout();
+            let (cs, _) = cos_f32.storage_and_layout();
+            let ss_g = sin_f32.as_ref().map(|t| t.storage_and_layout());
+            let qnw_g = qnw_f32.as_ref().map(|t| t.storage_and_layout());
+            let knw_g = knw_f32.as_ref().map(|t| t.storage_and_layout());
+            let (kp_s, _) = kv_pos_c.storage_and_layout();
+            let rp_g = rope_pos_c.as_ref().map(|t| t.storage_and_layout());
+            let mut kc_s = k_cache.storage_mut();
+            let mut vc_s = v_cache.storage_mut();
+            let (
+                Storage::Rocm(qr),
+                Storage::Rocm(kr_in),
+                Storage::Rocm(vr_in),
+                Storage::Rocm(cos_r),
+                Storage::Rocm(kvp_r),
+                Storage::Rocm(kc_mut),
+                Storage::Rocm(vc_mut),
+            ) = (&*qs, &*ks, &*vs, &*cs, &*kp_s, &mut *kc_s, &mut *vc_s)
+            else {
+                unreachable!()
+            };
+            let sin_r = ss_g.as_ref().map(|(s, _)| match &**s {
+                Storage::Rocm(r) => r,
+                _ => unreachable!(),
+            });
+            let qnw_r = qnw_g.as_ref().map(|(s, _)| match &**s {
+                Storage::Rocm(r) => r,
+                _ => unreachable!(),
+            });
+            let knw_r = knw_g.as_ref().map(|(s, _)| match &**s {
+                Storage::Rocm(r) => r,
+                _ => unreachable!(),
+            });
+            let rp_r = rp_g.as_ref().map(|(s, _)| match &**s {
+                Storage::Rocm(r) => r,
+                _ => unreachable!(),
+            });
+            let qo = qr.rope_kv_write_indirect(
+                kr_in, vr_in, qnw_r, knw_r, cos_r, sin_r, kc_mut, vc_mut, kvp_r, rp_r, &args,
+            )?;
+            Ok(from_storage(
+                Storage::Rocm(qo),
+                q_out_dims,
+                BackpropOp::none(),
+                false,
+            ))
+        }
+        _ => {
+            // Exact CPU fallback (also handles Vulkan/Metal cleanly).
+            let kv_pos_v = kv_pos_c.to_device(&Device::Cpu)?.to_vec1::<u32>()?;
+            let rope_pos_v = match &rope_pos_c {
+                Some(rp) => rp.to_device(&Device::Cpu)?.to_vec1::<u32>()?,
+                None => kv_pos_v.clone(),
+            };
+            let cos_v = cos_f32.to_device(&Device::Cpu)?.flatten_all()?.to_vec1::<f32>()?;
+            let sin_v = match &sin_f32 {
+                Some(s) => Some(s.to_device(&Device::Cpu)?.flatten_all()?.to_vec1::<f32>()?),
+                None => None,
+            };
+            let q_vec = q_c.to_device(&Device::Cpu)?.to_dtype(DType::F32)?.flatten_all()?.to_vec1::<f32>()?;
+            let k_vec = k_c.to_device(&Device::Cpu)?.to_dtype(DType::F32)?.flatten_all()?.to_vec1::<f32>()?;
+            let v_vec = v_c.to_device(&Device::Cpu)?.to_dtype(DType::F32)?.flatten_all()?.to_vec1::<f32>()?;
+            let qnw_v = match &qnw_f32 {
+                Some(w) => Some(w.to_device(&Device::Cpu)?.to_vec1::<f32>()?),
+                None => None,
+            };
+            let knw_v = match &knw_f32 {
+                Some(w) => Some(w.to_device(&Device::Cpu)?.to_vec1::<f32>()?),
+                None => None,
+            };
+
+            let adjacent = mode == RopeMode::Adjacent;
+            let mut q_out_v = vec![0f32; b * t * hq * d];
+            let mut hbuf = vec![0f32; d];
+            let mut cos_row = vec![0f32; half_rot];
+            let mut sin_row = vec![0f32; half_rot];
+
+            for bi in 0..b {
+                let kv_p = kv_pos_v[bi * (pos_stride as usize)] as usize;
+                let rope_p = rope_pos_v[bi * (pos_stride as usize)];
+                let mut k_b = vec![0f32; hkv * t * d];
+                let mut v_b = vec![0f32; hkv * t * d];
+                for ti in 0..t {
+                    let cur_pos = rope_p + ti as u32;
+                    if onthefly_cw {
+                        for i in 0..half_rot {
+                            let (c, s) = dop::cody_waite_sincos_f32(cur_pos, cos_v[i]);
+                            cos_row[i] = c;
+                            sin_row[i] = s;
+                        }
+                    } else {
+                        let off = (cur_pos as usize) * half_rot;
+                        cos_row.copy_from_slice(&cos_v[off..off + half_rot]);
+                        sin_row.copy_from_slice(&sin_v.as_ref().unwrap()[off..off + half_rot]);
+                    }
+                    for h in 0..hq {
+                        let s_off = bi * q_strides[0] as usize + h * q_strides[1] as usize + ti * q_strides[2] as usize;
+                        let d_off = bi * qo_strides[0] as usize + h * qo_strides[1] as usize + ti * qo_strides[2] as usize;
+                        hbuf.copy_from_slice(&q_vec[s_off..s_off + d]);
+                        if let Some(nw) = &qnw_v {
+                            let sq: f64 = hbuf.iter().map(|&x| (x as f64) * (x as f64)).sum();
+                            let inv = (1.0 / (sq / d as f64 + eps as f64).sqrt()) as f32;
+                            for i in 0..d {
+                                let wf = if norm_plus_one { 1.0 + nw[i] } else { nw[i] };
+                                hbuf[i] = (hbuf[i] * inv) * wf;
+                            }
+                        }
+                        for i in 0..half_rot {
+                            let (c, s) = (cos_row[i], sin_row[i]);
+                            if !adjacent {
+                                let (x0, x1) = (hbuf[i], hbuf[i + half_rot]);
+                                q_out_v[d_off + i] = (x0 * c - x1 * s) * mscale;
+                                q_out_v[d_off + i + half_rot] = (x1 * c + x0 * s) * mscale;
+                            } else {
+                                let (x0, x1) = (hbuf[2 * i], hbuf[2 * i + 1]);
+                                q_out_v[d_off + 2 * i] = (x0 * c - x1 * s) * mscale;
+                                q_out_v[d_off + 2 * i + 1] = (x1 * c + x0 * s) * mscale;
+                            }
+                        }
+                        for i in rotary_dim..d {
+                            q_out_v[d_off + i] = hbuf[i] * mscale;
+                        }
+                    }
+                    for h in 0..hkv {
+                        let ks_off = bi * k_strides[0] as usize + h * k_strides[1] as usize + ti * k_strides[2] as usize;
+                        let vs_off = bi * v_strides[0] as usize + h * v_strides[1] as usize + ti * v_strides[2] as usize;
+                        let dst = h * t * d + ti * d;
+                        hbuf.copy_from_slice(&k_vec[ks_off..ks_off + d]);
+                        if let Some(nw) = &knw_v {
+                            let sq: f64 = hbuf.iter().map(|&x| (x as f64) * (x as f64)).sum();
+                            let inv = (1.0 / (sq / d as f64 + eps as f64).sqrt()) as f32;
+                            for i in 0..d {
+                                let wf = if norm_plus_one { 1.0 + nw[i] } else { nw[i] };
+                                hbuf[i] = (hbuf[i] * inv) * wf;
+                            }
+                        }
+                        for i in 0..half_rot {
+                            let (c, s) = (cos_row[i], sin_row[i]);
+                            if !adjacent {
+                                let (x0, x1) = (hbuf[i], hbuf[i + half_rot]);
+                                k_b[dst + i] = x0 * c - x1 * s;
+                                k_b[dst + i + half_rot] = x1 * c + x0 * s;
+                            } else {
+                                let (x0, x1) = (hbuf[2 * i], hbuf[2 * i + 1]);
+                                k_b[dst + 2 * i] = x0 * c - x1 * s;
+                                k_b[dst + 2 * i + 1] = x1 * c + x0 * s;
+                            }
+                        }
+                        if rotary_dim < d {
+                            k_b[dst + rotary_dim..dst + d].copy_from_slice(&hbuf[rotary_dim..d]);
+                        }
+                        v_b[dst..dst + d].copy_from_slice(&v_vec[vs_off..vs_off + d]);
+                    }
+                }
+                let mut ks_t = Tensor::from_vec(k_b, (1, hkv, t, d), &Device::Cpu)?
+                    .to_dtype(dtype)?
+                    .to_device(&dev)?;
+                let mut vs_t = Tensor::from_vec(v_b, (1, hkv, t, d), &Device::Cpu)?
+                    .to_dtype(dtype)?
+                    .to_device(&dev)?;
+                if s_axis == 1 {
+                    ks_t = ks_t.transpose(1, 2)?.contiguous()?;
+                    vs_t = vs_t.transpose(1, 2)?.contiguous()?;
+                }
+                let kc_b = k_cache.narrow(0, bi, 1)?;
+                let vc_b = v_cache.narrow(0, bi, 1)?;
+                kc_b.slice_set(&ks_t, s_axis, kv_p)?;
+                vc_b.slice_set(&vs_t, s_axis, kv_p)?;
+            }
             Tensor::from_vec(q_out_v, q_out_dims.as_slice(), &Device::Cpu)?
                 .to_dtype(dtype)?
                 .to_device(&dev)

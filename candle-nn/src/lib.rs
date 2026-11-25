@@ -42,6 +42,7 @@ pub mod trimmed_head;
 pub mod turbo_quant;
 pub mod var_builder;
 pub mod var_map;
+pub mod vision_decode;
 /// Re-export of [`attention::varlen`] for backward compatibility.
 pub mod varlen_attention {
     pub use crate::attention::varlen::*;
@@ -51,8 +52,9 @@ pub use activation::{prelu, Activation, PReLU};
 pub use batch_norm::{batch_norm, BatchNorm, BatchNormConfig};
 pub use conv::{
     conv1d, conv1d_no_bias, conv2d, conv2d_no_bias, conv_transpose1d, conv_transpose1d_no_bias,
-    conv_transpose2d, conv_transpose2d_no_bias, Conv1d, Conv1dConfig, Conv2d, Conv2dConfig,
-    ConvTranspose1d, ConvTranspose1dConfig, ConvTranspose2d, ConvTranspose2dConfig,
+    conv_transpose2d, conv_transpose2d_no_bias, fold_conv3d_patch_linear_weight,
+    fold_conv3d_temporal_weight, Conv1d, Conv1dConfig, Conv2d, Conv2dConfig, ConvTranspose1d,
+    ConvTranspose1dConfig, ConvTranspose2d, ConvTranspose2dConfig,
 };
 pub use embedding::{embedding, Embedding};
 pub use func::{func, func_t, Func, FuncT};

@@ -136,13 +136,33 @@ impl AccelProfile {
         }
     }
 
-    /// Profile of a Vulkan device.
+    /// Profile of a Vulkan device (promotes modern >= 64 KiB shared-memory GPUs to V3).
     pub fn vulkan(name: &str, max_shared_mem: usize, max_invocations: usize) -> Self {
-        let version = if max_shared_mem >= 32 * 1024 && max_invocations >= 128 {
-            FlashAttnVersion::V2
-        } else {
-            FlashAttnVersion::V1
-        };
+        Self::vulkan_with_caps(
+            name,
+            max_shared_mem,
+            max_invocations,
+            max_shared_mem >= 64 * 1024 && max_invocations >= 256,
+            16,
+        )
+    }
+
+    /// Profile of a Vulkan device with probed subgroup & compute-unit capabilities.
+    pub fn vulkan_with_caps(
+        name: &str,
+        max_shared_mem: usize,
+        max_invocations: usize,
+        subgroup_arithmetic: bool,
+        compute_units: usize,
+    ) -> Self {
+        let version =
+            if max_shared_mem >= 64 * 1024 && max_invocations >= 256 && subgroup_arithmetic {
+                FlashAttnVersion::V3
+            } else if max_shared_mem >= 32 * 1024 && max_invocations >= 128 {
+                FlashAttnVersion::V2
+            } else {
+                FlashAttnVersion::V1
+            };
         Self {
             backend: AccelBackend::Vulkan,
             arch: format!("vulkan:{name}"),
@@ -153,7 +173,7 @@ impl AccelProfile {
             fp4_format: QuantFormat::Mxfp4,
             fp8_format: QuantFormat::Fp8,
             max_shared_mem,
-            compute_units: 16,
+            compute_units: compute_units.max(1),
         }
     }
 

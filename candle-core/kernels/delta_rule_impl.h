@@ -414,6 +414,231 @@ AX_DEV void gdn_scan_body(GDN_SCAN_PARAMS(TX)) {
                                                      a_st, b_sb, b_st);                            \
     }
 
+// Single-token decode fastpath (seq == 1): drops double-buffered TC=8 shared memory down to a
+// single-token scratchpad (~1.6 KiB vs ~24 KiB), boosting occupancy during autoregressive decode
+// and supporting safe in-place recurrent state update when s_out == s_in.
+#define GDN_DECODE1_SMEM_FLOATS(DK, TV, NT) (2 * (DK) + (TV) + 8 + (NT))
+
+template <typename TX, int DK, int CW, int CPL, int NW, int KMAX>
+AX_DEV void gdn_decode1_body(GDN_SCAN_PARAMS(TX)) {
+    constexpr int NT = 32 * NW;
+    constexpr int TV = CW * NW;
+    constexpr int LC = CW / CPL;
+    constexpr int NG = 32 / LC;
+    constexpr int RP = DK / NG;
+    constexpr int NCH = 2 * DK + TV;
+    constexpr int CPT = (NCH + NT - 1) / NT;
+    static_assert(CW % CPL == 0 && 32 % LC == 0 && RP % 4 == 0 && DK % 32 == 0,
+                  "gdn_decode1: bad tile");
+    float *sm = ax_smem();
+    float *s_q = sm;
+    float *s_k = s_q + DK;
+    float *s_v = s_k + DK;
+    float *s_sc = s_v + TV;
+    float *scratch = s_sc + 8;
+
+    const ax_u32 tid = AX_TID;
+    const ax_u32 lane = tid & 31u;
+    const ax_u32 warp = tid >> 5;
+    const ax_u32 rg = lane / LC;
+    const ax_u32 tile = AX_BID_X;
+    const ax_u32 h = AX_BID_Y;
+    const ax_u64 b = AX_BID_Z;
+    const ax_u32 hg = hv / hk;
+    const bool tiled = (flags & GDN_FLAG_TILED) != 0;
+    const ax_u32 kh = tiled ? h % hk : h / hg;
+    const ax_u32 col0 = warp * CW + lane % LC;
+    const ax_u32 vcol0 = tile * TV + col0;
+    const ax_u64 key_dim = (ax_u64)hk * dk;
+    const ax_u64 C = 2 * key_dim + (ax_u64)hv * dv;
+    const ax_u64 km1 = kc - 1;
+    const ax_u64 q_c0 = (ax_u64)kh * dk;
+    const ax_u64 k_c0 = key_dim + (ax_u64)kh * dk;
+    const ax_u64 v_c0 = 2 * key_dim + (ax_u64)h * dv + (ax_u64)tile * TV;
+    const ax_u32 v_n = dv - tile * TV < (ax_u32)TV ? dv - tile * TV : (ax_u32)TV;
+
+    // 1. Update conv state for the single new token (seq == 1).
+    if (km1 > 0) {
+        const bool writes_qk = tile == 0 && (tiled ? h < hk : h % hg == 0);
+        const ax_u64 n_qk = writes_qk ? 2ull * dk : 0ull;
+        const ax_u64 n = (n_qk + v_n) * km1;
+        for (ax_u64 e = tid; e < n; e += NT) {
+            const ax_u64 ci = e / km1, m = e % km1;
+            ax_u64 c;
+            if (ci < n_qk) c = ci < dk ? q_c0 + ci : k_c0 + (ci - dk);
+            else c = v_c0 + (ci - n_qk);
+            const float v = gdn_xe(x, cs_in, b, c, 1ull + m, kc, C, x_sb, x_st);
+            ax_store(cs_out, (b * C + c) * km1 + m, v);
+        }
+    }
+
+    // 2. Depthwise conv + SiLU for token 0 and gate scalars.
+    const bool reg_conv = kc <= (ax_u32)KMAX;
+    const bool l2 = (flags & GDN_FLAG_L2NORM) != 0;
+    const bool ab32 = (flags & GDN_FLAG_AB_F32) != 0;
+    AX_UNROLL
+    for (int m = 0; m < CPT; ++m) {
+        const ax_u32 ch = tid + m * NT;
+        if (ch >= (ax_u32)NCH) continue;
+        bool ok;
+        ax_u64 c;
+        float *dst;
+        if (ch < (ax_u32)DK) {
+            ok = ch < dk;
+            c = q_c0 + ch;
+            dst = s_q + ch;
+        } else if (ch < (ax_u32)(2 * DK)) {
+            ok = ch - DK < dk;
+            c = k_c0 + (ch - DK);
+            dst = s_k + (ch - DK);
+        } else {
+            ok = ch - 2 * DK < v_n;
+            c = v_c0 + (ch - 2 * DK);
+            dst = s_v + (ch - 2 * DK);
+        }
+        if (!ok) {
+            *dst = 0.0f;
+            continue;
+        }
+        float acc = cb ? cb[c] : 0.0f;
+        if (reg_conv) {
+            AX_UNROLL
+            for (int j = 0; j < KMAX; ++j) {
+                if ((ax_u32)j < kc) {
+                    const float xv = gdn_xe(x, cs_in, b, c, (ax_u64)j, kc, C, x_sb, x_st);
+                    acc = fmaf(cw[c * kc + j], xv, acc);
+                }
+            }
+        } else {
+            for (ax_u32 j = 0; j < kc; ++j) {
+                const float xv = gdn_xe(x, cs_in, b, c, (ax_u64)j, kc, C, x_sb, x_st);
+                acc = fmaf(cw[c * kc + j], xv, acc);
+            }
+        }
+        *dst = gdn_silu(acc);
+    }
+    if (tid == (ax_u32)(NT - 1)) {
+        const float av = gdn_gate<TX>(a, b * a_sb + h, ab32);
+        const float bv = gdn_gate<TX>(bb, b * b_sb + h, ab32);
+        s_sc[0] = expf(neg_a[h] * gdn_softplus(av + dt_bias[h]));
+        s_sc[1] = gdn_sigmoid(bv);
+    }
+    AX_SYNC();
+
+    // 3. L2 norms and q.k (uniformly execute warp xor shuffle across all warps for host compat).
+    float pq_n = 0.0f, pk_n = 0.0f, pqk_n = 0.0f;
+    if (warp == 0) {
+        AX_UNROLL
+        for (int i = 0; i < DK / 32; ++i) {
+            const float qv = s_q[i * 32 + lane];
+            const float kv = s_k[i * 32 + lane];
+            pq_n = fmaf(qv, qv, pq_n);
+            pk_n = fmaf(kv, kv, pk_n);
+            pqk_n = fmaf(qv, kv, pqk_n);
+        }
+    }
+    AX_UNROLL
+    for (int msk = 16; msk >= 1; msk >>= 1) {
+        pq_n = gdn_xor_add(pq_n, msk, scratch);
+        pk_n = gdn_xor_add(pk_n, msk, scratch);
+        pqk_n = gdn_xor_add(pqk_n, msk, scratch);
+    }
+    if (warp == 0 && lane == 0) {
+        const float iq = l2 ? 1.0f / sqrtf(pq_n + eps) : 1.0f;
+        const float ik = l2 ? 1.0f / sqrtf(pk_n + eps) : 1.0f;
+        const float qs = iq * scale;
+        s_sc[2] = qs;
+        s_sc[3] = ik;
+        s_sc[4] = pqk_n * qs * ik;
+    }
+    AX_SYNC();
+
+    // 4. Single-step recurrent state read, delta update, and write (safe when s_out == s_in).
+    const ax_u64 s_base = ((b * hv + h) * (ax_u64)dk) * dv;
+    float S[RP][CPL];
+    const float *qq = s_q + rg * 4;
+    const float *kk = s_k + rg * 4;
+    float pk[2][CPL], pq[2][CPL];
+    AX_UNROLL
+    for (int c = 0; c < CPL; ++c) pk[0][c] = pk[1][c] = pq[0][c] = pq[1][c] = 0.0f;
+
+    AX_UNROLL
+    for (int j = 0; j < RP / 4; ++j) {
+        const gdn_f4 kv = *reinterpret_cast<const gdn_f4 *>(kk + j * 4 * NG);
+        const gdn_f4 qv = *reinterpret_cast<const gdn_f4 *>(qq + j * 4 * NG);
+        AX_UNROLL
+        for (int e = 0; e < 4; ++e) {
+            const ax_u32 row = j * 4 * NG + rg * 4 + e;
+            const float ke = (e == 0) ? kv.x : (e == 1) ? kv.y : (e == 2) ? kv.z : kv.w;
+            const float qe = (e == 0) ? qv.x : (e == 1) ? qv.y : (e == 2) ? qv.z : qv.w;
+            const int p_idx = e & 1;
+            AX_UNROLL
+            for (int c = 0; c < CPL; ++c) {
+                const ax_u32 vcol = vcol0 + c * LC;
+                const float sv = (s_in && vcol < dv && row < dk)
+                                     ? s_in[s_base + (ax_u64)row * dv + vcol]
+                                     : 0.0f;
+                S[j * 4 + e][c] = sv;
+                pk[p_idx][c] = fmaf(sv, ke, pk[p_idx][c]);
+                pq[p_idx][c] = fmaf(sv, qe, pq[p_idx][c]);
+            }
+        }
+    }
+
+    float sk[CPL], sq[CPL];
+    AX_UNROLL
+    for (int c = 0; c < CPL; ++c) {
+        sk[c] = pk[0][c] + pk[1][c];
+        sq[c] = pq[0][c] + pq[1][c];
+    }
+    AX_UNROLL
+    for (int msk = LC; msk < 32; msk <<= 1) {
+        AX_UNROLL
+        for (int c = 0; c < CPL; ++c) {
+            sk[c] = gdn_xor_add(sk[c], msk, scratch);
+            sq[c] = gdn_xor_add(sq[c], msk, scratch);
+        }
+    }
+    const float eg = s_sc[0], beta = s_sc[1];
+    const float qs = s_sc[2], ks = s_sc[3], kq = s_sc[4];
+    float dks[CPL];
+    AX_UNROLL
+    for (int c = 0; c < CPL; ++c) {
+        const ax_u32 col = col0 + c * LC;
+        const float delta = (s_v[col] - eg * (sk[c] * ks)) * beta;
+        if (rg == 0 && tile * TV + col < dv) {
+            const float o = fmaf(delta, kq, eg * (sq[c] * qs));
+            ax_store(out, (b * hv + h) * (ax_u64)dv + tile * TV + col, o);
+        }
+        dks[c] = delta * ks;
+    }
+    AX_UNROLL
+    for (int j = 0; j < RP / 4; ++j) {
+        const gdn_f4 kv = *reinterpret_cast<const gdn_f4 *>(kk + j * 4 * NG);
+        AX_UNROLL
+        for (int e = 0; e < 4; ++e) {
+            const ax_u32 row = j * 4 * NG + rg * 4 + e;
+            const float ke = (e == 0) ? kv.x : (e == 1) ? kv.y : (e == 2) ? kv.z : kv.w;
+            AX_UNROLL
+            for (int c = 0; c < CPL; ++c) {
+                const ax_u32 vcol = vcol0 + c * LC;
+                if (row < dk && vcol < dv) {
+                    s_out[s_base + (ax_u64)row * dv + vcol] =
+                        fmaf(ke, dks[c], S[j * 4 + e][c] * eg);
+                }
+            }
+        }
+    }
+}
+
+#define GDN_DECODE1_KERNEL(NAME, TX, DK, CW, CPL, NW, KMAX, MINB)                                  \
+    AX_KERNEL void GDN_BOUNDS(32 * (NW), MINB) NAME(GDN_SCAN_PARAMS(TX)) {                         \
+        gdn_decode1_body<TX, DK, CW, CPL, NW, KMAX>(x, cs_in, cw, cb, a, bb, neg_a, dt_bias,       \
+                                                    s_in, out, cs_out, s_out, seq, hk, hv, dk, dv, \
+                                                    kc, flags, eps, scale, x_sb, x_st, a_sb, a_st, \
+                                                    b_sb, b_st);                                   \
+    }
+
 // ---------------------------------------------------------------------------
 // Gated RMS norm: y[r, :] = x[r, :] * rsqrt(mean(x[r, :]^2) + eps) * w * silu(z[r, :])
 // Arguments: x, z, w (f32), y, rows, d, eps. One warp per row (rows of up to 32 * GDN_GNORM_VPL

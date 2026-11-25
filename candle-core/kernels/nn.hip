@@ -85,16 +85,20 @@ DEVFN void layernorm_impl(const T *src, T *dst, const T *alpha, const T *beta, c
         const T *x = src + row * ncols;
         T *y = dst + row * ncols;
         A s = (A)0;
-        A s2 = (A)0;
         for (size_t c = threadIdx.x; c < ncols; c += blockDim.x) {
-            const A v = Ty<T>::to(x[c]);
-            s += v;
-            s2 += v * v;
+            s += Ty<T>::to(x[c]);
         }
         s = block_reduce_sum<A>(s, shr);
-        s2 = block_reduce_sum<A>(s2, shr);
         const A mean = s / (A)ncols;
-        const A var = s2 / (A)ncols - mean * mean;
+        // Two-pass centered variance avoids catastrophic cancellation when rows
+        // have a large mean (BUG(LN-1) in SigLIP2 / Qwen3-VL activations).
+        A s2 = (A)0;
+        for (size_t c = threadIdx.x; c < ncols; c += blockDim.x) {
+            const A d = Ty<T>::to(x[c]) - mean;
+            s2 += d * d;
+        }
+        s2 = block_reduce_sum<A>(s2, shr);
+        const A var = s2 / (A)ncols;
         const A inv_std = (A)1 / sqrtg(var + (A)eps);
         for (size_t c = threadIdx.x; c < ncols; c += blockDim.x) {
             const A v = (Ty<T>::to(x[c]) - mean) * inv_std * Ty<T>::to(alpha[c]) + Ty<T>::to(beta[c]);

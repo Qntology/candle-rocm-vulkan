@@ -17,6 +17,8 @@ pub const W8A16_IMPL_H: &str = include_str!("../../kernels/w8a16_impl.h");
 pub const LM_HEAD_ARGMAX_IMPL_H: &str = include_str!("../../kernels/lm_head_argmax_impl.h");
 pub const DECODER_OPS_IMPL_H: &str = include_str!("../../kernels/decoder_ops_impl.h");
 pub const DELTA_RULE_IMPL_H: &str = include_str!("../../kernels/delta_rule_impl.h");
+pub const ACCEL_MMA_H: &str = include_str!("../../kernels/accel_mma.h");
+pub const ACCEL_ASYNC_H: &str = include_str!("../../kernels/accel_async.h");
 
 pub(crate) fn strip_includes(src: &str) -> String {
     strip(src)
@@ -46,8 +48,21 @@ fn ctype(sfx: &str) -> Option<&'static str> {
 /// `fa_rowp_f32_f16`, `fa_rowg4_f32_f16`, `fa_rowpg2_bf16_fp8`, `fa2_d128_f16_f16`,
 /// `fa_combine_f32`, ...).
 pub fn flash_attn_instantiation(name: &str) -> Option<String> {
+    if let Some(o) = name.strip_prefix("fa_combine_tree_") {
+        return Some(format!("FA_COMBINE_TREE_KERNEL({name}, {})", ctype(o)?));
+    }
     if let Some(o) = name.strip_prefix("fa_combine_") {
         return Some(format!("FA_COMBINE_KERNEL({name}, {})", ctype(o)?));
+    }
+    if let Some(rest) = name.strip_prefix("fa_bt_d") {
+        let (d_str, dt) = rest.split_once('_')?;
+        let dmax: usize = d_str.parse().ok()?;
+        let t = ctype(dt)?;
+        let (dm, br, bc) = tile_config(FlashAttnVersion::V2, dmax);
+        if dm != dmax {
+            return None;
+        }
+        return Some(format!("FA_TILE_BT_KERNEL({name}, {t}, {t}, {br}, {bc}, {dmax})"));
     }
     for (prefix, mac) in [("fa_rowpg", "FA_ROWPG_KERNEL"), ("fa_rowg", "FA_ROWG_KERNEL")] {
         if let Some(rest) = name.strip_prefix(prefix) {
