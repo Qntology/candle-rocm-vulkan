@@ -882,3 +882,511 @@ pub fn chunk_tril_recurrence(attn: &Tensor) -> Result<Tensor> {
         out.to_dtype(dtype)
     }
 }
+
+/// Chunkwise Parallel WY Gated DeltaNet forward (`BT = 64` default) with strict log-space
+/// cumulative decay guarding (`Gamma_i - Gamma_j <= 0`, preventing `inf * 0 = NaN` overflow on
+/// large negative decay steps) and GEMM-based intra-chunk / inter-chunk projection.
+///
+/// Inputs have the exact same shapes and semantics as [`fused_gated_delta_rule`]. For short
+/// sequences (`T < 16`), delegates directly to [`fused_gated_delta_rule`].
+#[allow(clippy::too_many_arguments)]
+pub fn chunked_wy_gated_delta_rule(
+    mixed_qkv: &Tensor,
+    conv_weight: &Tensor,
+    conv_bias: Option<&Tensor>,
+    conv_state: Option<&Tensor>,
+    a: &Tensor,
+    b: &Tensor,
+    neg_a: &Tensor,
+    dt_bias: &Tensor,
+    recurrent_state: Option<&Tensor>,
+    cfg: &GdnConfig,
+    chunk_size: usize,
+) -> Result<GdnOutput> {
+    cfg.validate()?;
+    let (bsz, t_len, c) = mixed_qkv.dims3()?;
+    let bt = chunk_size.clamp(16, 128);
+    if t_len < 16 {
+        return fused_gated_delta_rule(
+            mixed_qkv,
+            conv_weight,
+            conv_bias,
+            conv_state,
+            a,
+            b,
+            neg_a,
+            dt_bias,
+            recurrent_state,
+            cfg,
+        );
+    }
+    if c != cfg.conv_dim() {
+        bail!(
+            "chunked_wy_gated_delta_rule: mixed_qkv has {c} channels, expected {}",
+            cfg.conv_dim()
+        )
+    }
+    let dtype = mixed_qkv.dtype();
+    let dev = mixed_qkv.device().clone();
+    let (hv, dk, dv, k) = (
+        cfg.num_v_heads,
+        cfg.head_k_dim,
+        cfg.head_v_dim,
+        cfg.conv_kernel,
+    );
+    let km1 = k - 1;
+    let key_dim = cfg.key_dim();
+    let conv_weight = match conv_weight.rank() {
+        2 => conv_weight.clone(),
+        3 if conv_weight.dim(1)? == 1 => conv_weight.squeeze(1)?,
+        _ => bail!(
+            "chunked_wy_gated_delta_rule: conv_weight must be [C, K] or [C, 1, K], got {:?}",
+            conv_weight.dims()
+        ),
+    };
+
+    let to_f32_vec = |t: &Tensor| -> Result<Vec<f32>> {
+        t.to_device(&Device::Cpu)?
+            .to_dtype(DType::F32)?
+            .flatten_all()?
+            .to_vec1::<f32>()
+    };
+    let x = to_f32_vec(mixed_qkv)?;
+    let w = to_f32_vec(&conv_weight)?;
+    let bias = match conv_bias {
+        Some(cb) => to_f32_vec(cb)?,
+        None => vec![0f32; c],
+    };
+    let cs = match conv_state {
+        Some(s) if s.elem_count() > 0 => to_f32_vec(s)?,
+        _ => vec![0f32; bsz * c * km1],
+    };
+    let av = to_f32_vec(a)?;
+    let bv = to_f32_vec(b)?;
+    let na = to_f32_vec(neg_a)?;
+    let dtb = to_f32_vec(dt_bias)?;
+    let s0 = match recurrent_state {
+        Some(s) => to_f32_vec(s)?,
+        None => vec![0f32; bsz * hv * dk * dv],
+    };
+
+    let xe = |bi: usize, ch: usize, i: usize| -> f32 {
+        if i < km1 {
+            cs[(bi * c + ch) * km1 + i]
+        } else {
+            x[(bi * t_len + (i - km1)) * c + ch]
+        }
+    };
+    let mut cs_out = vec![0f32; bsz * c * km1];
+    for bi in 0..bsz {
+        for ch in 0..c {
+            for m in 0..km1 {
+                cs_out[(bi * c + ch) * km1 + m] = xe(bi, ch, t_len + m);
+            }
+        }
+    }
+
+    let scale = (1.0 / (dk as f64).sqrt()) as f32;
+    let eps = cfg.l2norm_eps;
+    let silu = |v: f32| v / (1.0 + (-v).exp());
+    let sigmoid = |v: f32| 1.0 / (1.0 + (-v).exp());
+    let softplus = |v: f32| if v > 20.0 { v } else { v.exp().ln_1p() };
+
+    // Parallelize across (batch, v_head) with WY representation per chunk of length `bt`.
+    let heads: Vec<(Vec<f32>, Vec<f32>)> = (0..bsz * hv)
+        .into_par_iter()
+        .map(|bh| {
+            let (bi, h) = (bh / hv, bh % hv);
+            let kh = cfg.k_head(h);
+            let conv = |ch: usize, tt: usize| -> f32 {
+                let mut acc = bias[ch];
+                for j in 0..k {
+                    acc += w[ch * k + j] * xe(bi, ch, tt + j);
+                }
+                silu(acc)
+            };
+
+            let mut s = s0[bh * dk * dv..(bh + 1) * dk * dv].to_vec(); // [dk, dv]
+            let mut out = vec![0f32; t_len * dv];
+            let mut q_blk = vec![0f32; bt * dk];
+            let mut k_blk = vec![0f32; bt * dk];
+            let mut v_blk = vec![0f32; bt * dv];
+            let mut gamma = vec![0f32; bt];
+            let mut beta = vec![0f32; bt];
+            let mut a_mat = vec![0f32; bt * bt];
+            let mut w_wy = vec![0f32; bt * dk];
+            let mut u_wy = vec![0f32; bt * dv];
+            let mut v_new = vec![0f32; bt * dv];
+            let mut qk_mat = vec![0f32; bt * bt];
+
+            let mut t0 = 0usize;
+            while t0 < t_len {
+                let blen = bt.min(t_len - t0);
+                // 1. Materialize Q, K, V, cumulative log-decay Gamma[i] <= 0, and beta for chunk.
+                let mut g_cum = 0.0f32;
+                for i in 0..blen {
+                    let tt = t0 + i;
+                    let qr = &mut q_blk[i * dk..(i + 1) * dk];
+                    let kr = &mut k_blk[i * dk..(i + 1) * dk];
+                    for d in 0..dk {
+                        qr[d] = conv(kh * dk + d, tt);
+                        kr[d] = conv(key_dim + kh * dk + d, tt);
+                    }
+                    if cfg.use_qk_l2norm {
+                        let qs: f32 = qr.iter().map(|e| e * e).sum();
+                        let ks: f32 = kr.iter().map(|e| e * e).sum();
+                        let qi = 1.0 / (qs + eps).sqrt();
+                        let ki = 1.0 / (ks + eps).sqrt();
+                        qr.iter_mut().for_each(|e| *e *= qi * scale);
+                        kr.iter_mut().for_each(|e| *e *= ki);
+                    } else {
+                        qr.iter_mut().for_each(|e| *e *= scale);
+                    }
+                    let vr = &mut v_blk[i * dv..(i + 1) * dv];
+                    for j in 0..dv {
+                        vr[j] = conv(2 * key_dim + h * dv + j, tt);
+                    }
+                    let ab = (bi * t_len + tt) * hv + h;
+                    // Guard g_step <= 0 so Gamma is monotonically non-increasing.
+                    let g_step = (na[h] * softplus(av[ab] + dtb[h])).min(0.0);
+                    g_cum += g_step;
+                    gamma[i] = g_cum;
+                    beta[i] = sigmoid(bv[ab]);
+                }
+
+                // 2. Build strictly lower-triangular WY matrix L[i,j] = beta_i * (k_i . k_j) * exp(Gamma_i - Gamma_j)
+                //    with strict log-space decay guard `(Gamma_i - Gamma_j).min(0.0)` (zero NaN/Inf).
+                for i in 0..blen {
+                    a_mat[i * blen + i] = 1.0;
+                    for j in 0..i {
+                        let decay = (gamma[i] - gamma[j]).min(0.0).exp();
+                        let mut dot = 0.0f32;
+                        let ki = &k_blk[i * dk..(i + 1) * dk];
+                        let kj = &k_blk[j * dk..(j + 1) * dk];
+                        for d in 0..dk {
+                            dot += ki[d] * kj[d];
+                        }
+                        a_mat[i * blen + j] = beta[i] * dot * decay;
+                    }
+                    for j in (i + 1)..blen {
+                        a_mat[i * blen + j] = 0.0;
+                    }
+                }
+
+                // 3. Forward substitution: solve (I + L) * W = diag(beta * exp(Gamma)) * K
+                //    and (I + L) * U = diag(beta) * V directly in place.
+                for i in 0..blen {
+                    let b_i = beta[i];
+                    let bg_i = b_i * gamma[i].min(0.0).exp();
+                    for d in 0..dk {
+                        let mut acc = bg_i * k_blk[i * dk + d];
+                        for j in 0..i {
+                            acc -= a_mat[i * blen + j] * w_wy[j * dk + d];
+                        }
+                        w_wy[i * dk + d] = acc;
+                    }
+                    for jv in 0..dv {
+                        let mut acc = b_i * v_blk[i * dv + jv];
+                        for j in 0..i {
+                            acc -= a_mat[i * blen + j] * u_wy[j * dv + jv];
+                        }
+                        u_wy[i * dv + jv] = acc;
+                    }
+                }
+
+                // 4. Corrected chunk values: V_new = U - W @ S_prev   ([blen, dv])
+                for i in 0..blen {
+                    let wr = &w_wy[i * dk..(i + 1) * dk];
+                    let ur = &u_wy[i * dv..(i + 1) * dv];
+                    let vnr = &mut v_new[i * dv..(i + 1) * dv];
+                    vnr.copy_from_slice(ur);
+                    for d in 0..dk {
+                        let wd = wr[d];
+                        let srow = &s[d * dv..(d + 1) * dv];
+                        for jv in 0..dv {
+                            vnr[jv] -= wd * srow[jv];
+                        }
+                    }
+                }
+
+                // 5. Intra-chunk causal attention QK[i,j] = (q_i . k_j) * exp(Gamma_i - Gamma_j) (j <= i)
+                for i in 0..blen {
+                    let qi = &q_blk[i * dk..(i + 1) * dk];
+                    for j in 0..=i {
+                        let decay = (gamma[i] - gamma[j]).min(0.0).exp();
+                        let kj = &k_blk[j * dk..(j + 1) * dk];
+                        let mut dot = 0.0f32;
+                        for d in 0..dk {
+                            dot += qi[d] * kj[d];
+                        }
+                        qk_mat[i * blen + j] = dot * decay;
+                    }
+                }
+
+                // 6. Output: O[i] = exp(Gamma_i) * (q_i @ S_prev) + sum_{j<=i} QK[i,j] * V_new[j]
+                for i in 0..blen {
+                    let o_row = &mut out[(t0 + i) * dv..(t0 + i + 1) * dv];
+                    let eg_i = gamma[i].min(0.0).exp();
+                    let qi = &q_blk[i * dk..(i + 1) * dk];
+                    for d in 0..dk {
+                        let qd = qi[d] * eg_i;
+                        let srow = &s[d * dv..(d + 1) * dv];
+                        for jv in 0..dv {
+                            o_row[jv] += qd * srow[jv];
+                        }
+                    }
+                    for j in 0..=i {
+                        let a_ij = qk_mat[i * blen + j];
+                        let vnj = &v_new[j * dv..(j + 1) * dv];
+                        for jv in 0..dv {
+                            o_row[jv] += a_ij * vnj[jv];
+                        }
+                    }
+                }
+
+                // 7. Inter-chunk recurrent state update:
+                //    S_next = exp(Gamma_last) * S_prev + sum_i (exp(Gamma_last - Gamma_i) * k_i) outer V_new[i]
+                let g_last = gamma[blen - 1].min(0.0);
+                let eg_last = g_last.exp();
+                s.iter_mut().for_each(|e| *e *= eg_last);
+                for i in 0..blen {
+                    let decay = (g_last - gamma[i]).min(0.0).exp();
+                    let ki = &k_blk[i * dk..(i + 1) * dk];
+                    let vni = &v_new[i * dv..(i + 1) * dv];
+                    for d in 0..dk {
+                        let kd = ki[d] * decay;
+                        let srow = &mut s[d * dv..(d + 1) * dv];
+                        for jv in 0..dv {
+                            srow[jv] += kd * vni[jv];
+                        }
+                    }
+                }
+
+                t0 += blen;
+            }
+            (out, s)
+        })
+        .collect();
+
+    let mut out = vec![0f32; bsz * t_len * hv * dv];
+    let mut state = Vec::with_capacity(bsz * hv * dk * dv);
+    for (bh, (o, s)) in heads.into_iter().enumerate() {
+        let (bi, h) = (bh / hv, bh % hv);
+        for tt in 0..t_len {
+            let dst = ((bi * t_len + tt) * hv + h) * dv;
+            out[dst..dst + dv].copy_from_slice(&o[tt * dv..(tt + 1) * dv]);
+        }
+        state.extend_from_slice(&s);
+    }
+    Ok(GdnOutput {
+        out: Tensor::from_vec(out, (bsz, t_len, hv, dv), &dev)?.to_dtype(dtype)?,
+        conv_state: Tensor::from_vec(cs_out, (bsz, c, km1), &dev)?.to_dtype(dtype)?,
+        recurrent_state: Tensor::from_vec(state, (bsz, hv, dk, dv), &dev)?,
+    })
+}
+
+/// Zero-copy speculative decoding ring buffer for Gated DeltaNet recurrent + conv states.
+///
+/// Maintains `max_draft + 1` state slots so speculative verification of up to `max_draft` draft
+/// tokens can roll back to any accepted prefix (`0..=draft_len`) in O(1) via an index update —
+/// **zero bytes copied** on rejection or partial acceptance.
+#[derive(Debug, Clone)]
+pub struct GdnSpeculativeRing {
+    capacity: usize,
+    conv_slots: Vec<Option<Tensor>>,
+    state_slots: Vec<Option<Tensor>>,
+    committed: usize,
+    draft_len: usize,
+}
+
+impl GdnSpeculativeRing {
+    pub fn new(max_draft: usize) -> Self {
+        let capacity = max_draft.max(1) + 1;
+        Self {
+            capacity,
+            conv_slots: vec![None; capacity],
+            state_slots: vec![None; capacity],
+            committed: 0,
+            draft_len: 0,
+        }
+    }
+
+    pub fn max_draft(&self) -> usize {
+        self.capacity - 1
+    }
+
+    pub fn draft_len(&self) -> usize {
+        self.draft_len
+    }
+
+    /// Initializes or overwrites the committed slot (resets pending drafts).
+    pub fn seed(&mut self, conv_state: Tensor, recurrent_state: Tensor) {
+        self.conv_slots[self.committed] = Some(conv_state);
+        self.state_slots[self.committed] = Some(recurrent_state);
+        self.draft_len = 0;
+    }
+
+    /// Returns the currently committed `(conv_state, recurrent_state)`.
+    pub fn committed_state(&self) -> Option<(&Tensor, &Tensor)> {
+        match (
+            self.conv_slots[self.committed].as_ref(),
+            self.state_slots[self.committed].as_ref(),
+        ) {
+            (Some(c), Some(s)) => Some((c, s)),
+            _ => None,
+        }
+    }
+
+    /// Returns the latest speculative (or committed if `draft_len == 0`) state.
+    pub fn head_state(&self) -> Option<(&Tensor, &Tensor)> {
+        let idx = (self.committed + self.draft_len) % self.capacity;
+        match (
+            self.conv_slots[idx].as_ref(),
+            self.state_slots[idx].as_ref(),
+        ) {
+            (Some(c), Some(s)) => Some((c, s)),
+            _ => None,
+        }
+    }
+
+    /// Records the post-step state of the next speculative draft token in O(1).
+    pub fn push_speculative_step(
+        &mut self,
+        conv_state: Tensor,
+        recurrent_state: Tensor,
+    ) -> Result<usize> {
+        if self.draft_len >= self.max_draft() {
+            bail!(
+                "GdnSpeculativeRing: draft_len {} reached max_draft {}",
+                self.draft_len,
+                self.max_draft()
+            );
+        }
+        self.draft_len += 1;
+        let idx = (self.committed + self.draft_len) % self.capacity;
+        self.conv_slots[idx] = Some(conv_state);
+        self.state_slots[idx] = Some(recurrent_state);
+        Ok(self.draft_len)
+    }
+
+    /// Commits `accepted` speculative steps (`0..=draft_len`) and discards rejected tail slots
+    /// with O(1) pointer advance (zero tensor copies).
+    pub fn commit_accepted(&mut self, accepted: usize) -> Result<()> {
+        if accepted > self.draft_len {
+            bail!(
+                "GdnSpeculativeRing: accepted {accepted} exceeds pending draft_len {}",
+                self.draft_len
+            );
+        }
+        // Release rejected tail references so VRAM is immediately reclaimable.
+        for drop_off in (accepted + 1)..=self.draft_len {
+            let idx = (self.committed + drop_off) % self.capacity;
+            self.conv_slots[idx] = None;
+            self.state_slots[idx] = None;
+        }
+        // Release superseded slots behind the newly committed slot.
+        for old_off in 0..accepted {
+            let idx = (self.committed + old_off) % self.capacity;
+            self.conv_slots[idx] = None;
+            self.state_slots[idx] = None;
+        }
+        self.committed = (self.committed + accepted) % self.capacity;
+        self.draft_len = 0;
+        Ok(())
+    }
+
+    /// Rolls back all pending speculative states in O(1).
+    pub fn rollback_all(&mut self) {
+        let _ = self.commit_accepted(0);
+    }
+}
+
+#[cfg(test)]
+mod wy_and_ring_tests {
+    use super::*;
+
+    #[test]
+    fn chunked_wy_matches_sequential_even_under_extreme_decay() -> Result<()> {
+        let dev = Device::Cpu;
+        let cfg = GdnConfig::new(2, 4, 16, 16);
+        let (bsz, t, c) = (1usize, 40usize, cfg.conv_dim());
+        let x: Vec<f32> = (0..bsz * t * c)
+            .map(|i| (((i * 37 + 11) % 97) as f32 - 48.0) * 0.03)
+            .collect();
+        let cw: Vec<f32> = (0..c * cfg.conv_kernel)
+            .map(|i| (((i * 19 + 5) % 41) as f32 - 20.0) * 0.02)
+            .collect();
+        // Mix normal and extreme decay (a = 60 => softplus ~ 60 => g ~ -60 => exp(g) ~ 8e-27).
+        let a: Vec<f32> = (0..bsz * t * cfg.num_v_heads)
+            .map(|i| if i % 7 == 0 { 60.0 } else { 0.5 })
+            .collect();
+        let b: Vec<f32> = (0..bsz * t * cfg.num_v_heads)
+            .map(|i| (((i * 13) % 23) as f32 - 11.0) * 0.1)
+            .collect();
+        let neg_a = Tensor::from_vec(vec![-1.0f32; cfg.num_v_heads], cfg.num_v_heads, &dev)?;
+        let dt_bias = Tensor::from_vec(vec![0.1f32; cfg.num_v_heads], cfg.num_v_heads, &dev)?;
+        let mixed = Tensor::from_vec(x, (bsz, t, c), &dev)?;
+        let conv_w = Tensor::from_vec(cw, (c, cfg.conv_kernel), &dev)?;
+        let ta = Tensor::from_vec(a, (bsz, t, cfg.num_v_heads), &dev)?;
+        let tb = Tensor::from_vec(b, (bsz, t, cfg.num_v_heads), &dev)?;
+
+        let seq = fused_gated_delta_rule(
+            &mixed, &conv_w, None, None, &ta, &tb, &neg_a, &dt_bias, None, &cfg,
+        )?;
+        let wy = chunked_wy_gated_delta_rule(
+            &mixed, &conv_w, None, None, &ta, &tb, &neg_a, &dt_bias, None, &cfg, 16,
+        )?;
+
+        let s_out = seq.out.flatten_all()?.to_vec1::<f32>()?;
+        let w_out = wy.out.flatten_all()?.to_vec1::<f32>()?;
+        for (i, (sv, wv)) in s_out.iter().zip(w_out.iter()).enumerate() {
+            assert!(wv.is_finite(), "NaN/Inf in WY output at {i}");
+            assert!(
+                (sv - wv).abs() < 1e-4,
+                "WY output mismatch at {i}: seq={sv}, wy={wv}"
+            );
+        }
+        let s_st = seq.recurrent_state.flatten_all()?.to_vec1::<f32>()?;
+        let w_st = wy.recurrent_state.flatten_all()?.to_vec1::<f32>()?;
+        for (i, (sv, wv)) in s_st.iter().zip(w_st.iter()).enumerate() {
+            assert!(wv.is_finite(), "NaN/Inf in WY state at {i}");
+            assert!(
+                (sv - wv).abs() < 1e-4,
+                "WY state mismatch at {i}: seq={sv}, wy={wv}"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn speculative_ring_partial_commit_and_rollback_exact() -> Result<()> {
+        let dev = Device::Cpu;
+        let mut ring = GdnSpeculativeRing::new(4);
+        let c0 = Tensor::from_vec(vec![0.0f32; 4], (1, 4), &dev)?;
+        let s0 = Tensor::from_vec(vec![10.0f32; 4], (1, 4), &dev)?;
+        ring.seed(c0, s0);
+
+        for step in 1..=3 {
+            let cs = Tensor::from_vec(vec![step as f32; 4], (1, 4), &dev)?;
+            let st = Tensor::from_vec(vec![10.0 + step as f32; 4], (1, 4), &dev)?;
+            assert_eq!(ring.push_speculative_step(cs, st)?, step);
+        }
+        // Accept first 2 draft tokens, reject the 3rd with zero copies.
+        ring.commit_accepted(2)?;
+        assert_eq!(ring.draft_len(), 0);
+        let (cc, ss) = ring.committed_state().unwrap();
+        assert_eq!(cc.flatten_all()?.to_vec1::<f32>()?, vec![2.0; 4]);
+        assert_eq!(ss.flatten_all()?.to_vec1::<f32>()?, vec![12.0; 4]);
+
+        // Push 1 speculative step then roll it back completely.
+        ring.push_speculative_step(
+            Tensor::from_vec(vec![99.0f32; 4], (1, 4), &dev)?,
+            Tensor::from_vec(vec![199.0f32; 4], (1, 4), &dev)?,
+        )?;
+        ring.rollback_all();
+        let (cc2, ss2) = ring.committed_state().unwrap();
+        assert_eq!(cc2.flatten_all()?.to_vec1::<f32>()?, vec![2.0; 4]);
+        assert_eq!(ss2.flatten_all()?.to_vec1::<f32>()?, vec![12.0; 4]);
+        Ok(())
+    }
+}

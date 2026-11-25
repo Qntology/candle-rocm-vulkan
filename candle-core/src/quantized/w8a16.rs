@@ -24,6 +24,10 @@ const SOURCE: &str = include_str!("../../kernels/w8a16_impl.h");
 /// Largest number of input rows (product of the leading dims) handled by [`matvec`].
 pub const MV_MAX_ROWS: usize = 8;
 
+/// Largest number of input rows handled by the Tier-2 on-chip fused tile GEMM [`tile16`]
+/// (`8 < rows <= 64`, avoiding temporary HBM dequantization staging buffers).
+pub const TILE16_MAX_ROWS: usize = 64;
+
 /// Launch shape of the mat-vec kernel: `warps_per_row` warps split the k range of one weight
 /// row, a thread block covers `rows_per_block` weight rows, every lane unrolls its task loop
 /// `unroll` times.
@@ -263,6 +267,138 @@ pub fn matvec(
     }
 }
 
+/// Tier-2 on-chip fused tile GEMM (`8 < rows <= 64`, `BM = 16`, `BN = 4/block`) avoiding the
+/// transient HBM dequantization staging buffer while keeping exact F32 accumulation.
+#[allow(clippy::too_many_arguments)]
+pub fn tile16(
+    dev: &CudaDevice,
+    w: &CudaSlice<u8>,
+    wtype: GgmlDType,
+    n: usize,
+    k: usize,
+    x: &CudaStorage,
+    x_off: usize,
+    rows: usize,
+) -> Result<CudaStorage> {
+    use crate::backend::BackendStorage;
+    let Some(d) = decoder(wtype) else {
+        bail!("w8a16 tile16: unsupported weight type {wtype:?}")
+    };
+    if rows == 0 || rows > TILE16_MAX_ROWS {
+        bail!("w8a16 tile16: {rows} rows (expected 1..={TILE16_MAX_ROWS})")
+    }
+    if k == 0 || !k.is_multiple_of(d.qk) || n == 0 || n > i32::MAX as usize {
+        bail!("w8a16 tile16: unsupported shape n={n} k={k} for {wtype:?}")
+    }
+    let (xs, xc) = elem_ctype(x.dtype())?;
+    if (x_off * x.dtype().size_in_bytes()) % 16 != 0 {
+        bail!("w8a16 tile16: input offset {x_off} is not 16 byte aligned")
+    }
+    let row_bytes = (k / d.qk * wtype.type_size()) as i64;
+    let name = format!("w8a16_tile16_{}_{xs}", d.sfx);
+    let inst = format!("W8A16_TILE16_KERNEL({name}, {}, {xc})", d.ty);
+    let f = func(dev, &name, inst)?;
+    let lc = LaunchConfig {
+        grid_dim: (n.div_ceil(4) as u32, rows.div_ceil(16) as u32, 1),
+        block_dim: (32, 4, 1),
+        shared_mem_bytes: 0,
+    };
+    let (k_i, n_i, rows_i) = (k as i32, n as i32, rows as i32);
+    macro_rules! launch {
+        ($s:expr, $t:ty) => {{
+            let xv = $s.slice(x_off..x_off + rows * k);
+            let mut out = unsafe { dev.alloc::<$t>(rows * n)? };
+            let stream = dev.cuda_stream();
+            let mut b = stream.launch_builder(&f);
+            b.arg(w)
+                .arg(&xv)
+                .arg(&mut out)
+                .arg(&k_i)
+                .arg(&n_i)
+                .arg(&rows_i)
+                .arg(&row_bytes);
+            unsafe { b.launch(lc) }.w()?;
+            Ok(CudaStorage::wrap_cuda_slice(out, dev.clone()))
+        }};
+    }
+    match &x.slice {
+        CudaStorageSlice::F32(s) => launch!(s, f32),
+        CudaStorageSlice::F16(s) => launch!(s, half::f16),
+        CudaStorageSlice::BF16(s) => launch!(s, half::bf16),
+        _ => bail!("w8a16 tile16: unsupported input dtype {:?}", x.dtype()),
+    }
+}
+
+/// Single-rounding dual-projection SwiGLU `y = silu(x @ W_gate^T) * (x @ W_up^T)` for `rows <= 8`.
+#[allow(clippy::too_many_arguments)]
+pub fn gate_up_silu_mv(
+    dev: &CudaDevice,
+    w_gate: &CudaSlice<u8>,
+    w_up: &CudaSlice<u8>,
+    wtype: GgmlDType,
+    n: usize,
+    k: usize,
+    x: &CudaStorage,
+    x_off: usize,
+    rows: usize,
+) -> Result<CudaStorage> {
+    use crate::backend::BackendStorage;
+    let Some(d) = decoder(wtype) else {
+        bail!("w8a16 gate_up_silu_mv: unsupported weight type {wtype:?}")
+    };
+    if rows == 0 || rows > MV_MAX_ROWS {
+        bail!("w8a16 gate_up_silu_mv: {rows} rows (expected 1..={MV_MAX_ROWS})")
+    }
+    if k == 0 || !k.is_multiple_of(d.qk) || n == 0 || n > i32::MAX as usize {
+        bail!("w8a16 gate_up_silu_mv: unsupported shape n={n} k={k} for {wtype:?}")
+    }
+    let (xs, xc) = elem_ctype(x.dtype())?;
+    if (x_off * x.dtype().size_in_bytes()) % 16 != 0 {
+        bail!("w8a16 gate_up_silu_mv: input offset {x_off} is not 16 byte aligned")
+    }
+    let row_bytes = (k / d.qk * wtype.type_size()) as i64;
+    let max_m = if rows == 1 { 1 } else { 8 };
+    let name = format!("w8a16_gus{max_m}_{}_{xs}", d.sfx);
+    let inst = format!(
+        "W8A16_GATE_UP_SILU_KERNEL({name}, {}, {xc}, {max_m})",
+        d.ty
+    );
+    let f = func(dev, &name, inst)?;
+    let lc = LaunchConfig {
+        grid_dim: (n.div_ceil(4) as u32, 1, 1),
+        block_dim: (32, 4, 1),
+        shared_mem_bytes: 0,
+    };
+    let (k_i, n_i, rows_i) = (k as i32, n as i32, rows as i32);
+    macro_rules! launch {
+        ($s:expr, $t:ty) => {{
+            let xv = $s.slice(x_off..x_off + rows * k);
+            let mut out = unsafe { dev.alloc::<$t>(rows * n)? };
+            let stream = dev.cuda_stream();
+            let mut b = stream.launch_builder(&f);
+            b.arg(w_gate)
+                .arg(w_up)
+                .arg(&xv)
+                .arg(&mut out)
+                .arg(&k_i)
+                .arg(&n_i)
+                .arg(&rows_i)
+                .arg(&row_bytes);
+            unsafe { b.launch(lc) }.w()?;
+            Ok(CudaStorage::wrap_cuda_slice(out, dev.clone()))
+        }};
+    }
+    match &x.slice {
+        CudaStorageSlice::F32(s) => launch!(s, f32),
+        CudaStorageSlice::F16(s) => launch!(s, half::f16),
+        CudaStorageSlice::BF16(s) => launch!(s, half::bf16),
+        _ => bail!(
+            "w8a16 gate_up_silu_mv: unsupported input dtype {:?}",
+            x.dtype()
+        ),
+    }
+}
+
 /// Dequantizes `elems` weights of type `wtype` starting at the (block aligned) start of `w`
 /// into a fresh buffer of `out` dtype (f32 / f16 / bf16), on the device.
 pub fn dequantize(
@@ -434,59 +570,6 @@ pub fn prefill_gemm_mode() -> PrefillGemm {
     })
 }
 
-/// Runs `f` (which issues cuBLAS calls on the device's handle) with
-/// `CUBLAS_MATH_DISALLOW_REDUCED_PRECISION_REDUCTION` set on the handle, then restores the
-/// previous math mode. candle never changes the math mode itself (it is `CUBLAS_DEFAULT_MATH`);
-/// a mode that already forbids reduced precision reductions (the flag, or pedantic math) or an
-/// unknown value is left untouched. Calls of other threads that land in the window only get
-/// the more precise reduction.
-fn with_f32_reductions<R>(dev: &CudaDevice, f: impl FnOnce() -> Result<R>) -> Result<R> {
-    use cudarc::cublas::sys::{self, cublasMath_t as M};
-    use std::collections::HashMap;
-    use std::sync::{Arc, Mutex, OnceLock};
-    // Per-device lock avoids serializing cuBLAS handles across independent GPUs (`P1-O05`).
-    static DEV_LOCKS: OnceLock<Mutex<HashMap<crate::cuda_backend::DeviceId, Arc<Mutex<()>>>>> =
-        OnceLock::new();
-    let dev_lock = {
-        let mut map = DEV_LOCKS
-            .get_or_init(|| Mutex::new(HashMap::new()))
-            .lock()
-            .unwrap_or_else(|p| p.into_inner());
-        map.entry(dev.id())
-            .or_insert_with(|| Arc::new(Mutex::new(())))
-            .clone()
-    };
-    let _guard = dev_lock.lock().unwrap_or_else(|p| p.into_inner());
-    let handle = *dev.blas.handle();
-    let mut prev = 0u32;
-    // SAFETY: valid handle; the mode is written as a C int into `prev` (read as u32, never
-    // materialized as a possibly invalid enum value).
-    unsafe { sys::cublasGetMathMode(handle, &mut prev as *mut u32 as *mut M) }
-        .result()
-        .w()?;
-    let restore = match prev {
-        0 => Some(M::CUBLAS_DEFAULT_MATH),
-        1 => Some(M::CUBLAS_TENSOR_OP_MATH),
-        // TF32 only concerns f32 data, not the f16 / bf16 GEMMs issued here.
-        3 => Some(M::CUBLAS_TF32_TENSOR_OP_MATH),
-        _ => None,
-    };
-    if restore.is_some() {
-        // SAFETY: valid handle and mode.
-        unsafe {
-            sys::cublasSetMathMode(handle, M::CUBLAS_MATH_DISALLOW_REDUCED_PRECISION_REDUCTION)
-        }
-        .result()
-        .w()?;
-    }
-    let r = f();
-    if let Some(mode) = restore {
-        // SAFETY: valid handle; `mode` is the mode read above.
-        let _ = unsafe { sys::cublasSetMathMode(handle, mode) };
-    }
-    r
-}
-
 /// `y = x · Wᵀ` for the `rows × k` contiguous input `x` starting at element `x_off` and an
 /// `n × k` weight produced by `tile(row0, nrows)` as dense row tiles of at most `tile_rows`
 /// rows in the dtype of `x` (f32 / f16 / bf16). A tile is freed (stream ordered) as soon as its
@@ -601,12 +684,10 @@ pub fn gemm_tiles(
                     let c = c + (n0 * std::mem::size_of::<$t>()) as u64;
                     // SAFETY: a = tn × k weight tile, b = rows × k input, c = column n0 of the
                     // rows × n output (ldc = n); all three live until the call is queued.
-                    let call = || unsafe { gemm_ex(dev, dtype, kind, tn, rows, k, a, b, c, n) };
-                    if kind == GemmKind::Exact && dtype != DType::F32 {
-                        with_f32_reductions(dev, call)?;
-                    } else {
-                        call()?;
-                    }
+                    // Exact F16/BF16 calls dispatch through `dev.exact_blas()` (immutable handle
+                    // with `CUBLAS_MATH_DISALLOW_REDUCED_PRECISION_REDUCTION` set once), zeroing
+                    // per-GEMM mutex locking and math-mode toggle overhead.
+                    unsafe { gemm_ex(dev, dtype, kind, tn, rows, k, a, b, c, n) }?;
                 }
                 drop(w);
                 n0 += tn;
@@ -704,8 +785,15 @@ unsafe fn gemm_ex(
         data_type
     };
     let (tn_i, rows_i, k_i) = (tn as i32, rows as i32, k as i32);
+    let exact_handle_guard;
+    let blas_handle = if kind == GemmKind::Exact && dtype != DType::F32 {
+        exact_handle_guard = dev.exact_blas()?;
+        *exact_handle_guard.handle()
+    } else {
+        *dev.blas.handle()
+    };
     cudarc::cublas::result::gemm_strided_batched_ex(
-        *dev.blas.handle(),
+        blas_handle,
         sys::cublasOperation_t::CUBLAS_OP_T,
         sys::cublasOperation_t::CUBLAS_OP_N,
         tn_i,
@@ -1006,6 +1094,8 @@ mod tests {
             "W8A16_NVFP4_DQ_KERNEL(",
             "W8A16_NVFP8_MV_KERNEL(",
             "W8A16_NVFP8_DQ_KERNEL(",
+            "W8A16_TILE16_KERNEL(",
+            "W8A16_GATE_UP_SILU_KERNEL(",
         ] {
             assert!(SOURCE.contains(&format!("#define {m}")), "{m}");
         }

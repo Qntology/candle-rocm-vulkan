@@ -5,7 +5,8 @@
 
 use super::{CudaDevice, CudaStorage, CudaStorageSlice, WrapErr};
 use crate::accel::decoder_ops::{
-    self as dop, RopeKvLaunchArgs, DEC_NT, RES_RMS_PLUS_ONE_WEIGHT, RES_RMS_WRITE_RESIDUAL,
+    self as dop, RopeKvIndirectLaunchArgs, RopeKvLaunchArgs, DEC_MR_NT, DEC_NT,
+    RES_RMS_PLUS_ONE_WEIGHT, RES_RMS_WRITE_RESIDUAL,
 };
 use crate::accel::sources::decoder_ops_cuda_source;
 use crate::{bail, DType, Result};
@@ -65,6 +66,8 @@ fn dptr<'a>(
         CudaStorageSlice::F32(x) => p!(x, f32),
         CudaStorageSlice::F16(x) => p!(x, half::f16),
         CudaStorageSlice::BF16(x) => p!(x, half::bf16),
+        CudaStorageSlice::U32(x) => p!(x, u32),
+        CudaStorageSlice::F8E4M3(x) => p!(x, float8::F8E4M3),
         _ => bail!("decoder_ops: unsupported dtype on the CUDA backend"),
     })
 }
@@ -84,6 +87,8 @@ fn dptr_mut<'a>(
         CudaStorageSlice::F32(x) => p!(x, f32),
         CudaStorageSlice::F16(x) => p!(x, half::f16),
         CudaStorageSlice::BF16(x) => p!(x, half::bf16),
+        CudaStorageSlice::U32(x) => p!(x, u32),
+        CudaStorageSlice::F8E4M3(x) => p!(x, float8::F8E4M3),
         _ => bail!("decoder_ops: unsupported output dtype on the CUDA backend"),
     })
 }
@@ -96,6 +101,7 @@ fn alloc(dev: &CudaDevice, dtype: DType, n: usize) -> Result<CudaStorageSlice> {
             DType::F32 => CudaStorageSlice::F32(dev.alloc::<f32>(n)?),
             DType::F16 => CudaStorageSlice::F16(dev.alloc::<half::f16>(n)?),
             DType::BF16 => CudaStorageSlice::BF16(dev.alloc::<half::bf16>(n)?),
+            DType::F8E4M3 => CudaStorageSlice::F8E4M3(dev.alloc::<float8::F8E4M3>(n)?),
             d => bail!("decoder_ops: unsupported dtype {d:?} on the CUDA backend"),
         })
     }
@@ -118,7 +124,7 @@ impl CudaStorage {
     ) -> Result<(Option<Self>, Self)> {
         use crate::backend::BackendStorage;
         let dtype = self.dtype();
-        let kname = res_rmsnorm_name(dtype)?;
+        let _ = res_rmsnorm_name(dtype)?; // dtype check; the kernel name below also picks the multi-row variant
         let dev = &self.device;
         let mut r_slice = if write_residual {
             Some(alloc(dev, dtype, rows * d)?)
@@ -127,7 +133,13 @@ impl CudaStorage {
         };
         let mut y_slice = alloc(dev, dtype, rows * d)?;
         if rows > 0 && d > 0 {
-            let func = dev.decoder_op_func(kname)?;
+            let use_mr = dop::res_rmsnorm_use_mr(rows);
+            let kname = if use_mr {
+                format!("res_rmsnorm_mr_{sfx}")
+            } else {
+                format!("res_rmsnorm_{sfx}")
+            };
+            let func = dev.decoder_op_func(&kname)?;
             let stream = dev.cuda_stream();
             let (x_p, _g0) = dptr(self, x_off, &stream)?;
             let (dl_p, _g1) = match delta {
@@ -165,12 +177,20 @@ impl CudaStorage {
                 .arg(&d32)
                 .arg(&eps)
                 .arg(&flags);
-            let cfg = LaunchConfig {
-                grid_dim: dop::res_rmsnorm_grid(rows),
-                block_dim: (DEC_NT, 1, 1),
-                shared_mem_bytes: dop::res_rmsnorm_smem_bytes(),
+            let cfg = if use_mr {
+                LaunchConfig {
+                    grid_dim: dop::res_rmsnorm_mr_grid(rows),
+                    block_dim: (DEC_MR_NT, 1, 1),
+                    shared_mem_bytes: dop::res_rmsnorm_mr_smem_bytes(),
+                }
+            } else {
+                LaunchConfig {
+                    grid_dim: dop::res_rmsnorm_grid(rows),
+                    block_dim: (DEC_NT, 1, 1),
+                    shared_mem_bytes: dop::res_rmsnorm_smem_bytes(),
+                }
             };
-            // SAFETY: arguments match res_rmsnorm_{sfx}.
+            // SAFETY: arguments match res_rmsnorm[_mr]_{sfx}.
             unsafe { bld.launch(cfg) }.w()?;
         }
         let mk = |slice| CudaStorage {
@@ -195,11 +215,17 @@ impl CudaStorage {
     ) -> Result<Self> {
         use crate::backend::BackendStorage;
         let dtype = self.dtype();
-        let kname = res_rmsnorm_name(dtype)?;
+        let _ = res_rmsnorm_name(dtype)?; // dtype check; the kernel name below also picks the multi-row variant
         let dev = self.device.clone();
         let mut y_slice = alloc(&dev, dtype, rows * d)?;
         if rows > 0 && d > 0 {
-            let func = dev.decoder_op_func(kname)?;
+            let use_mr = dop::res_rmsnorm_use_mr(rows);
+            let kname = if use_mr {
+                format!("res_rmsnorm_mr_{sfx}")
+            } else {
+                format!("res_rmsnorm_{sfx}")
+            };
+            let func = dev.decoder_op_func(&kname)?;
             let stream = dev.cuda_stream();
             let (x_p, _g0) = dptr_mut(&mut self.slice, 0, &stream)?;
             let (dl_p, _g1) = match delta {
@@ -224,12 +250,20 @@ impl CudaStorage {
                 .arg(&d32)
                 .arg(&eps)
                 .arg(&flags);
-            let cfg = LaunchConfig {
-                grid_dim: dop::res_rmsnorm_grid(rows),
-                block_dim: (DEC_NT, 1, 1),
-                shared_mem_bytes: dop::res_rmsnorm_smem_bytes(),
+            let cfg = if use_mr {
+                LaunchConfig {
+                    grid_dim: dop::res_rmsnorm_mr_grid(rows),
+                    block_dim: (DEC_MR_NT, 1, 1),
+                    shared_mem_bytes: dop::res_rmsnorm_mr_smem_bytes(),
+                }
+            } else {
+                LaunchConfig {
+                    grid_dim: dop::res_rmsnorm_grid(rows),
+                    block_dim: (DEC_NT, 1, 1),
+                    shared_mem_bytes: dop::res_rmsnorm_smem_bytes(),
+                }
             };
-            // SAFETY: x_p == r_p is safe in res_rmsnorm_impl (load before store, barrier before pass 2).
+            // SAFETY: x_p == r_p is safe in res_rmsnorm[_mr]_impl (load before store, warp/block sync before pass 2).
             unsafe { bld.launch(cfg) }.w()?;
         }
         Ok(CudaStorage {
@@ -380,6 +414,270 @@ impl CudaStorage {
                 shared_mem_bytes: smem,
             };
             // SAFETY: arguments match rope_kv_write_{sfx}.
+            unsafe { bld.launch(cfg) }.w()?;
+        }
+        Ok(CudaStorage {
+            slice: q_out,
+            device: dev.clone(),
+        })
+    }
+
+    /// Outlier-free Residual + RMSNorm + Online Hadamard-32 + OCP FP8 quantization on CUDA.
+    #[allow(clippy::too_many_arguments)]
+    pub fn res_rmsnorm_hadamard_fp8(
+        &self,
+        x_off: usize,
+        delta: Option<(&Self, usize)>,
+        w: &Self,
+        w_off: usize,
+        rows: usize,
+        d: usize,
+        eps: f32,
+        plus_one: bool,
+        write_residual: bool,
+    ) -> Result<(Option<Self>, Self, Self)> {
+        use crate::backend::BackendStorage;
+        if d % 32 != 0 {
+            bail!("res_rmsnorm_hadamard_fp8: D={d} must be a multiple of 32");
+        }
+        let dtype = self.dtype();
+        let sfx = dtype_suffix(dtype)?;
+        let dev = &self.device;
+        let mut r_slice = if write_residual {
+            Some(alloc(dev, dtype, rows * d)?)
+        } else {
+            None
+        };
+        let mut fp8_slice = alloc(dev, DType::F8E4M3, rows * d)?;
+        let mut scale_slice = alloc(dev, DType::F32, rows * (d / 32))?;
+        if rows > 0 && d > 0 {
+            let func = dev.decoder_op_func(&format!("res_rmsnorm_hadamard_fp8_{sfx}"))?;
+            let stream = dev.cuda_stream();
+            let (x_p, _g0) = dptr(self, x_off, &stream)?;
+            let (dl_p, _g1) = match delta {
+                Some((ds, off)) => {
+                    let (p, g) = dptr(ds, off, &stream)?;
+                    (p, Some(g))
+                }
+                None => (0u64, None),
+            };
+            let (w_p, _g2) = dptr(w, w_off, &stream)?;
+            let (r_p, _g3) = match r_slice.as_mut() {
+                Some(rs) => {
+                    let (p, g) = dptr_mut(rs, 0, &stream)?;
+                    (p, Some(g))
+                }
+                None => (0u64, None),
+            };
+            let (fp8_p, _g4) = dptr_mut(&mut fp8_slice, 0, &stream)?;
+            let (sc_p, _g5) = dptr_mut(&mut scale_slice, 0, &stream)?;
+            let rows32 = rows as u32;
+            let d32 = d as u32;
+            let mut flags = 0u32;
+            if plus_one {
+                flags |= RES_RMS_PLUS_ONE_WEIGHT;
+            }
+            if write_residual {
+                flags |= RES_RMS_WRITE_RESIDUAL;
+            }
+            let mut bld = func.builder();
+            bld.arg(&x_p)
+                .arg(&dl_p)
+                .arg(&w_p)
+                .arg(&r_p)
+                .arg(&fp8_p)
+                .arg(&sc_p)
+                .arg(&rows32)
+                .arg(&d32)
+                .arg(&eps)
+                .arg(&flags);
+            let cfg = LaunchConfig {
+                grid_dim: dop::res_rmsnorm_grid(rows),
+                block_dim: (DEC_NT, 1, 1),
+                shared_mem_bytes: dop::res_rmsnorm_smem_bytes(),
+            };
+            // SAFETY: arguments match res_rmsnorm_hadamard_fp8_{sfx}.
+            unsafe { bld.launch(cfg) }.w()?;
+        }
+        let mk = |slice| CudaStorage {
+            slice,
+            device: dev.clone(),
+        };
+        Ok((r_slice.map(mk), mk(fp8_slice), mk(scale_slice)))
+    }
+
+    /// Outlier-free SiLU * Mul + Online Hadamard-32 + OCP FP8 quantization on CUDA.
+    #[allow(clippy::too_many_arguments)]
+    pub fn silu_mul_hadamard_fp8(
+        &self,
+        gate_off: usize,
+        gate_row_stride: usize,
+        up: &Self,
+        up_off: usize,
+        up_row_stride: usize,
+        rows: usize,
+        inter_dim: usize,
+    ) -> Result<(Self, Self)> {
+        use crate::backend::BackendStorage;
+        if inter_dim % 32 != 0 {
+            bail!("silu_mul_hadamard_fp8: inter_dim={inter_dim} must be a multiple of 32");
+        }
+        let dtype = self.dtype();
+        let sfx = dtype_suffix(dtype)?;
+        let dev = &self.device;
+        let mut fp8_slice = alloc(dev, DType::F8E4M3, rows * inter_dim)?;
+        let mut scale_slice = alloc(dev, DType::F32, rows * (inter_dim / 32))?;
+        if rows > 0 && inter_dim > 0 {
+            let func = dev.decoder_op_func(&format!("silu_mul_hadamard_fp8_{sfx}"))?;
+            let stream = dev.cuda_stream();
+            let (g_p, _g0) = dptr(self, gate_off, &stream)?;
+            let (u_p, _g1) = dptr(up, up_off, &stream)?;
+            let (fp8_p, _g2) = dptr_mut(&mut fp8_slice, 0, &stream)?;
+            let (sc_p, _g3) = dptr_mut(&mut scale_slice, 0, &stream)?;
+            let gs = gate_row_stride as u64;
+            let us = up_row_stride as u64;
+            let rows32 = rows as u32;
+            let inter32 = inter_dim as u32;
+            let mut bld = func.builder();
+            bld.arg(&g_p)
+                .arg(&gs)
+                .arg(&u_p)
+                .arg(&us)
+                .arg(&fp8_p)
+                .arg(&sc_p)
+                .arg(&rows32)
+                .arg(&inter32);
+            let cfg = LaunchConfig {
+                grid_dim: dop::res_rmsnorm_grid(rows),
+                block_dim: (DEC_NT, 1, 1),
+                shared_mem_bytes: dop::res_rmsnorm_smem_bytes(),
+            };
+            // SAFETY: arguments match silu_mul_hadamard_fp8_{sfx}.
+            unsafe { bld.launch(cfg) }.w()?;
+        }
+        Ok((
+            CudaStorage {
+                slice: fp8_slice,
+                device: dev.clone(),
+            },
+            CudaStorage {
+                slice: scale_slice,
+                device: dev.clone(),
+            },
+        ))
+    }
+
+    /// Graph-safe Indirect RoPE + Cody-Waite + YaRN mscale + KV Cache Direct Write on CUDA.
+    #[allow(clippy::too_many_arguments)]
+    pub fn rope_kv_write_indirect(
+        &self,
+        k_in: &Self,
+        v_in: &Self,
+        q_norm_w: Option<&Self>,
+        k_norm_w: Option<&Self>,
+        cos_tab: &Self,
+        sin_tab: Option<&Self>,
+        k_cache: &mut Self,
+        v_cache: &mut Self,
+        d_kv_pos: &Self,
+        d_rope_pos: Option<&Self>,
+        args: &RopeKvIndirectLaunchArgs,
+    ) -> Result<Self> {
+        use crate::backend::BackendStorage;
+        let dtype = self.dtype();
+        let sfx = dtype_suffix(dtype)?;
+        let dev = &self.device;
+        let q_elems = (args.b as usize) * (args.t as usize) * (args.hq as usize) * (args.d as usize);
+        let mut q_out = alloc(dev, dtype, q_elems)?;
+        if args.b > 0 && args.t > 0 && (args.hq + args.hkv) > 0 && args.d > 0 {
+            let func = dev.decoder_op_func(&format!("rope_kv_write_indirect_{sfx}"))?;
+            let smem = args.smem_bytes();
+            if smem > 48 * 1024 {
+                func.set_max_dynamic_shared_memory(smem as usize)?;
+            }
+            let stream = dev.cuda_stream();
+            let (q_p, _g0) = dptr(self, args.q_off, &stream)?;
+            let (qo_p, _g1) = dptr_mut(&mut q_out, 0, &stream)?;
+            let (k_p, _g2) = dptr(k_in, args.k_off, &stream)?;
+            let (v_p, _g3) = dptr(v_in, args.v_off, &stream)?;
+            let (qnw_p, _g4) = match q_norm_w {
+                Some(w) => {
+                    let (p, g) = dptr(w, args.qnw_off, &stream)?;
+                    (p, Some(g))
+                }
+                None => (0u64, None),
+            };
+            let (knw_p, _g5) = match k_norm_w {
+                Some(w) => {
+                    let (p, g) = dptr(w, args.knw_off, &stream)?;
+                    (p, Some(g))
+                }
+                None => (0u64, None),
+            };
+            let (cos_p, _g6) = dptr(cos_tab, args.cos_off, &stream)?;
+            let (sin_p, _g7) = match sin_tab {
+                Some(s) => {
+                    let (p, g) = dptr(s, args.sin_off, &stream)?;
+                    (p, Some(g))
+                }
+                None => (0u64, None),
+            };
+            let (kc_p, _g8) = dptr_mut(&mut k_cache.slice, args.kc_off, &stream)?;
+            let (vc_p, _g9) = dptr_mut(&mut v_cache.slice, args.vc_off, &stream)?;
+            let (kv_pos_p, _g10) = dptr(d_kv_pos, args.kv_pos_off, &stream)?;
+            let (rope_pos_p, _g11) = match d_rope_pos {
+                Some(rp) => {
+                    let (p, g) = dptr(rp, args.rope_pos_off, &stream)?;
+                    (p, Some(g))
+                }
+                None => (0u64, None),
+            };
+
+            let mut bld = func.builder();
+            bld.arg(&q_p)
+                .arg(&qo_p)
+                .arg(&k_p)
+                .arg(&v_p)
+                .arg(&qnw_p)
+                .arg(&knw_p)
+                .arg(&cos_p)
+                .arg(&sin_p)
+                .arg(&kc_p)
+                .arg(&vc_p)
+                .arg(&kv_pos_p)
+                .arg(&rope_pos_p)
+                .arg(&args.pos_stride)
+                .arg(&args.b)
+                .arg(&args.t)
+                .arg(&args.hq)
+                .arg(&args.hkv)
+                .arg(&args.d)
+                .arg(&args.rotary_dim)
+                .arg(&args.q_strides[0])
+                .arg(&args.q_strides[1])
+                .arg(&args.q_strides[2])
+                .arg(&args.qo_strides[0])
+                .arg(&args.qo_strides[1])
+                .arg(&args.qo_strides[2])
+                .arg(&args.k_strides[0])
+                .arg(&args.k_strides[1])
+                .arg(&args.k_strides[2])
+                .arg(&args.v_strides[0])
+                .arg(&args.v_strides[1])
+                .arg(&args.v_strides[2])
+                .arg(&args.kc_strides[0])
+                .arg(&args.kc_strides[1])
+                .arg(&args.kc_strides[2])
+                .arg(&args.cos_st)
+                .arg(&args.eps)
+                .arg(&args.mscale)
+                .arg(&args.flags);
+            let cfg = LaunchConfig {
+                grid_dim: args.grid(),
+                block_dim: args.block(),
+                shared_mem_bytes: smem,
+            };
+            // SAFETY: arguments match rope_kv_write_indirect_{sfx}.
             unsafe { bld.launch(cfg) }.w()?;
         }
         Ok(CudaStorage {

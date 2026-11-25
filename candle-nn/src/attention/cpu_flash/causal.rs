@@ -395,6 +395,9 @@ pub fn causal_decode_f32_interleaved(
     if rk == 2 {
         return causal_decode_f32_interleaved_gqa2(q_data, kv_data, h_kv, d, kv_len, scale);
     }
+    if (3..=16).contains(&rk) {
+        return causal_decode_f32_interleaved_gqa_n(q_data, kv_data, h_kv, rk, d, kv_len, scale);
+    }
     let kv_head_stride = 2 * d;
     let kv_seq_stride = h_kv * kv_head_stride;
 
@@ -555,6 +558,112 @@ fn causal_decode_f32_interleaved_gqa2(
             vec_fmadd_scalar(out1, acc1, inv1);
         }
     });
+
+    Tensor::from_vec(out, (h_q, 1usize, d), &Device::Cpu)
+}
+
+/// General GQA-`rk` (`3 <= rk <= 16`) interleaved KV decode: loads K and V once per position
+/// per KV head and updates all `rk` query heads together, cutting KV memory traffic by `rk`x.
+fn causal_decode_f32_interleaved_gqa_n(
+    q_data: &[f32],
+    kv_data: &[f32],
+    h_kv: usize,
+    rk: usize,
+    d: usize,
+    kv_len: usize,
+    scale: f32,
+) -> Result<Tensor> {
+    let h_q = h_kv * rk;
+    let kv_head_stride = 2 * d;
+    let kv_seq_stride = h_kv * kv_head_stride;
+    let mut out = vec![0f32; h_q * d];
+
+    out.par_chunks_mut(rk * d)
+        .enumerate()
+        .for_each(|(kv_h, grp_out)| {
+            let mut accs = vec![0f32; rk * d];
+            let mut ms = [f32::NEG_INFINITY; 16];
+            let mut ss = [0.0f32; 16];
+            let kv_head_off = kv_h * kv_head_stride;
+
+            for kv_pos in 0..kv_len {
+                let kv_base = kv_pos * kv_seq_stride + kv_head_off;
+                let k_row = &kv_data[kv_base..kv_base + d];
+                let v_row = &kv_data[kv_base + d..kv_base + 2 * d];
+                if kv_pos + 1 < kv_len {
+                    prefetch_read(kv_data[kv_base + kv_seq_stride..].as_ptr());
+                }
+                for g in 0..rk {
+                    let h_i = kv_h * rk + g;
+                    let q_row = &q_data[h_i * d..(h_i + 1) * d];
+                    let score =
+                        unsafe { <f32 as VecOps>::vec_dot_f32(q_row.as_ptr(), k_row.as_ptr(), d) }
+                            * scale;
+                    let acc = &mut accs[g * d..(g + 1) * d];
+                    online_softmax_step(score, &mut ms[g], &mut ss[g], acc, |acc, w| {
+                        <f32 as VecOps>::vec_fmadd_to_f32(acc, v_row, w);
+                    });
+                }
+            }
+            for g in 0..rk {
+                let inv = if ss[g] > 0.0 { 1.0 / ss[g] } else { 0.0 };
+                let dst = &mut grp_out[g * d..(g + 1) * d];
+                dst.fill(0.0);
+                vec_fmadd_scalar(dst, &accs[g * d..(g + 1) * d], inv);
+            }
+        });
+
+    Tensor::from_vec(out, (h_q, 1usize, d), &Device::Cpu)
+}
+
+/// F16 / BF16 interleaved KV decode (`kv_data` layout `[S, H_kv, 2*D]`) with full GQA-`rk` KV
+/// reuse across query heads via SIMD `VecOps::vec_dot_f32` and `VecOps::vec_fmadd_to_f32`.
+#[allow(clippy::too_many_arguments)]
+pub fn causal_decode_generic_interleaved<T: WithDType + num_traits::Float>(
+    q_data: &[T],
+    kv_data: &[T],
+    h_q: usize,
+    h_kv: usize,
+    d: usize,
+    kv_len: usize,
+    scale: f32,
+) -> Result<Tensor> {
+    let rk = (h_q / h_kv).max(1);
+    let kv_head_stride = 2 * d;
+    let kv_seq_stride = h_kv * kv_head_stride;
+    let mut out = vec![0f32; h_q * d];
+
+    out.par_chunks_mut(rk * d)
+        .enumerate()
+        .for_each(|(kv_h, grp_out)| {
+            let mut accs = vec![0f32; rk * d];
+            let mut ms = vec![f32::NEG_INFINITY; rk];
+            let mut ss = vec![0.0f32; rk];
+            let kv_head_off = kv_h * kv_head_stride;
+
+            for kv_pos in 0..kv_len {
+                let kv_base = kv_pos * kv_seq_stride + kv_head_off;
+                let k_row = &kv_data[kv_base..kv_base + d];
+                let v_row = &kv_data[kv_base + d..kv_base + 2 * d];
+                for g in 0..rk {
+                    let h_i = kv_h * rk + g;
+                    let q_row = &q_data[h_i * d..(h_i + 1) * d];
+                    let score = dot_f32(q_row, k_row) * scale;
+                    let acc = &mut accs[g * d..(g + 1) * d];
+                    online_softmax_step(score, &mut ms[g], &mut ss[g], acc, |acc, w| {
+                        T::vec_fmadd_to_f32(acc, v_row, w);
+                    });
+                }
+            }
+            for g in 0..rk {
+                let inv = if ss[g] > 0.0 { 1.0 / ss[g] } else { 0.0 };
+                let dst = &mut grp_out[g * d..(g + 1) * d];
+                let src = &accs[g * d..(g + 1) * d];
+                for t in 0..d {
+                    dst[t] = src[t] * inv;
+                }
+            }
+        });
 
     Tensor::from_vec(out, (h_q, 1usize, d), &Device::Cpu)
 }
@@ -815,9 +924,13 @@ fn causal_decode_generic<T: WithDType + num_traits::Float>(
     let mut out = vec![0f32; h_q * d];
 
     // GQA-grouped path: load each K/V row once per KV head and reuse across all `rk` query heads
-    // (cuts KV memory bandwidth by `rk` = 2x..8x for F16/BF16 decode) when `h_kv` is large enough
-    // to saturate the rayon thread pool (`Q6-F03` / `Q6-O04`).
-    if h_kv == h_v && rk > 1 && max_bias == 0.0 && h_kv >= rayon::current_num_threads() {
+    // (cuts KV memory bandwidth by `rk` = 2x..16x for F16/BF16 decode) whenever `h_kv >= 4` or
+    // `kv_len >= 256` (bandwidth-bound long-KV decode).
+    if h_kv == h_v
+        && rk > 1
+        && max_bias == 0.0
+        && (h_kv >= 4 || kv_len >= 256 || h_kv >= rayon::current_num_threads())
+    {
         out.par_chunks_mut(rk * d).enumerate().for_each(|(hk, grp_out)| {
             let mut accs = vec![0f32; rk * d];
             let mut ms = vec![f32::NEG_INFINITY; rk];

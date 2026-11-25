@@ -47,6 +47,9 @@ pub struct FlashAttnParams {
     /// Let the row kernels run the query heads that share a kv head in one workgroup
     /// (`fa_rowg*`, bit-identical results, fewer K/V loads).
     pub gqa_pack: bool,
+    /// Use fixed pairwise binary-tree Log-Sum-Exp combine (`fa_combine_tree_*`) for
+    /// Split-Invariant deterministic reduction across dynamic split counts.
+    pub deterministic: bool,
 }
 
 impl FlashAttnParams {
@@ -61,6 +64,7 @@ impl FlashAttnParams {
             version: FlashAttnVersion::V2,
             split_kv: SplitKv::Auto,
             gqa_pack: true,
+            deterministic: false,
         }
     }
 
@@ -521,6 +525,51 @@ pub fn split_count_grouped(
     }
 }
 
+/// Bandwidth-aware Roofline Split-KV planner for decode & speculative verification.
+///
+/// Accounts for KV element byte-width (e.g. BF16=2.0, FP8=1.0, NVFP4=0.5625, TQ3=0.406) so
+/// `fa_combine` partial-output traffic stays <= 15% of total KV read bytes and avoids
+/// over-splitting short low-bit KV caches.
+pub fn split_count_bandwidth_aware(
+    rows: usize,
+    group: usize,
+    lk: usize,
+    d: usize,
+    kv_bytes_per_elem: f32,
+    policy: SplitKv,
+    compute_units: usize,
+) -> usize {
+    match policy {
+        SplitKv::Off => 1,
+        SplitKv::Fixed(n) => n.clamp(1, FA_MAX_SPLITS),
+        SplitKv::Auto => {
+            let group = group.max(1);
+            let cu = compute_units.max(1);
+            let workgroups = (rows / group).max(1);
+            // Bitwidth-scaled minimum keys per split: BF16=128, FP8=256, NVFP4/TQ=512
+            let min_keys = if kv_bytes_per_elem >= 1.5 {
+                128usize
+            } else if kv_bytes_per_elem >= 0.8 {
+                256usize
+            } else {
+                512usize
+            };
+            let by_keys = lk.div_ceil(min_keys).max(1);
+            // Target 12 workgroups/CU for coalesced warp-per-key decode (down from 64 latency-bound).
+            let by_cu = (12usize * cu).div_ceil(workgroups).max(1);
+            // Roofline cap: fa_combine F32 traffic (4 * S * rows * (d + 1)) <= 0.15 * B_kv
+            let b_kv = 2.0f64 * (workgroups as f64) * (lk as f64) * (d as f64) * (kv_bytes_per_elem as f64);
+            let comb_per_split = 4.0f64 * (rows as f64) * ((d + 1) as f64);
+            let s_bw = if comb_per_split > 0.0 {
+                ((0.15 * b_kv) / comb_per_split).floor().max(1.0) as usize
+            } else {
+                1
+            };
+            by_keys.min(by_cu).min(s_bw).clamp(1, FA_MAX_SPLITS)
+        }
+    }
+}
+
 /// Picks the kernel for a call. `max_smem` is the shared memory a workgroup may use.
 pub fn plan(
     geom: &AttnGeometry,
@@ -537,6 +586,16 @@ pub fn plan(
     for version in [params.version, FlashAttnVersion::V2] {
         let (dmax, br, bc) = tile_config(version, geom.d);
         if tile_smem_bytes(geom.d, br, bc) <= max_smem {
+            // Lift the hard FA_DECODE_MAX_Q = 4 cliff for medium speculative/verify batches
+            // (5 <= lq <= 32) on long KV caches where tiled workgroups under-populate GPU CUs.
+            let tile_wgs = geom.lq.div_ceil(br) * geom.hq * geom.batch;
+            if geom.lq <= 32
+                && geom.lk >= 512
+                && params.split_kv != SplitKv::Off
+                && tile_wgs < 2 * compute_units.max(1)
+            {
+                return row;
+            }
             return FaPlan::Tile {
                 version,
                 dmax,

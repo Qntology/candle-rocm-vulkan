@@ -882,3 +882,124 @@ W_DEV void w8a16_nvfp8_dq(const w_u8 *__restrict__ qdata, const float *__restric
                                     int n) {                                                       \
         w8a16_nvfp8_dq<OT>(qdata, rscale, y, k, n);                                                \
     }
+
+// ---------------------------------------------------------------------------
+// 3-Tier W8A16 On-Chip Fused Tile GEMM (8 < M <= 64, BM = 16, BN = 4/block).
+// Eliminates the 32 MiB HBM dequantization staging buffer for medium batches
+// (chunked prefill tails & speculative verification) while preserving exact
+// F32 accumulation and single rounding on store.
+// Grid: (ceil(n / 4), ceil(rows / 16), 1), Block: (32, 4, 1).
+// ---------------------------------------------------------------------------
+template <typename D, typename XT>
+W_DEV void w8a16_fused_tile16(const w_u8 *__restrict__ wq, const XT *__restrict__ x,
+                              XT *__restrict__ y, const int k, const int n, const int rows,
+                              const w_i64 row_bytes) {
+    const int lane = threadIdx.x;
+    const int rz = threadIdx.y; // 0..3
+    const int col = blockIdx.x * 4 + rz;
+    const int m0 = blockIdx.y * 16;
+    if (col >= n || m0 >= rows) return;
+    const int m_cnt = (rows - m0 < 16) ? (rows - m0) : 16;
+    const int ntasks = (k / D::QK) * D::TASKS;
+    const w_u8 *wrow = wq + (w_i64)col * row_bytes;
+
+    float acc[16];
+#pragma unroll
+    for (int m = 0; m < 16; ++m) acc[m] = 0.0f;
+
+    for (int tk = lane; tk < ntasks; tk += 32) {
+        const int b = tk / D::TASKS, t = tk % D::TASKS;
+        float w[8 * D::RUNS];
+        int xo[D::RUNS];
+        D::decode(wrow + (w_i64)b * D::BYTES, t, w, xo);
+#pragma unroll
+        for (int r = 0; r < D::RUNS; ++r) {
+            const XT *xr = x + (w_i64)m0 * k + b * D::QK + xo[r];
+            for (int m = 0; m < m_cnt; ++m) {
+                float xv[8];
+                WIo<XT>::load8(xr + (w_i64)m * k, xv);
+#pragma unroll
+                for (int i = 0; i < 8; ++i) acc[m] = fmaf(w[8 * r + i], xv[i], acc[m]);
+            }
+        }
+    }
+
+    for (int m = 0; m < m_cnt; ++m) {
+        const float s = w_warp32_sum(acc[m]);
+        if (lane == 0) y[(w_i64)(m0 + m) * n + col] = WIo<XT>::from_f(s);
+    }
+}
+
+#define W8A16_TILE16_KERNEL(name, D, XT)                                                           \
+    extern "C" __global__ void __launch_bounds__(128)                                              \
+        name(const w_u8 *__restrict__ wq, const XT *__restrict__ x, XT *__restrict__ y, int k,     \
+             int n, int rows, w_i64 row_bytes) {                                                   \
+        w8a16_fused_tile16<D, XT>(wq, x, y, k, n, rows, row_bytes);                                \
+    }
+
+// ---------------------------------------------------------------------------
+// Single-Rounding Dual-Projection SwiGLU: y = silu(x @ W_gate^T) * (x @ W_up^T)
+// Loads input vector x ONCE per K-block, accumulates gate and up projections in
+// F32 registers, and evaluates silu(acc_g) * acc_u in F32 before a single store
+// rounding — eliminating intermediate [M, 2*inter] HBM traffic and BF16 double-rounding.
+// Grid: (ceil(n / 4), 1, 1), Block: (32, 4, 1), M <= M_MAX.
+// ---------------------------------------------------------------------------
+template <typename D, typename XT, int M_MAX>
+W_DEV void w8a16_gate_up_silu_mv(const w_u8 *__restrict__ w_gate, const w_u8 *__restrict__ w_up,
+                                 const XT *__restrict__ x, XT *__restrict__ y, const int k,
+                                 const int n, const int rows, const w_i64 row_bytes) {
+    const int lane = threadIdx.x;
+    const int rz = threadIdx.y;
+    const int col = blockIdx.x * 4 + rz;
+    if (col >= n || rows <= 0 || rows > M_MAX) return;
+    const int ntasks = (k / D::QK) * D::TASKS;
+    const w_u8 *wg_row = w_gate + (w_i64)col * row_bytes;
+    const w_u8 *wu_row = w_up   + (w_i64)col * row_bytes;
+
+    float acc_g[M_MAX];
+    float acc_u[M_MAX];
+#pragma unroll
+    for (int m = 0; m < M_MAX; ++m) {
+        acc_g[m] = 0.0f;
+        acc_u[m] = 0.0f;
+    }
+
+    for (int tk = lane; tk < ntasks; tk += 32) {
+        const int b = tk / D::TASKS, t = tk % D::TASKS;
+        float wg[8 * D::RUNS];
+        float wu[8 * D::RUNS];
+        int xo[D::RUNS];
+        D::decode(wg_row + (w_i64)b * D::BYTES, t, wg, xo);
+        D::decode(wu_row + (w_i64)b * D::BYTES, t, wu, xo);
+#pragma unroll
+        for (int r = 0; r < D::RUNS; ++r) {
+            const XT *xr = x + b * D::QK + xo[r];
+            for (int m = 0; m < rows; ++m) {
+                float xv[8];
+                WIo<XT>::load8(xr + (w_i64)m * k, xv);
+#pragma unroll
+                for (int i = 0; i < 8; ++i) {
+                    acc_g[m] = fmaf(wg[8 * r + i], xv[i], acc_g[m]);
+                    acc_u[m] = fmaf(wu[8 * r + i], xv[i], acc_u[m]);
+                }
+            }
+        }
+    }
+
+    for (int m = 0; m < rows; ++m) {
+        const float g = w_warp32_sum(acc_g[m]);
+        const float u = w_warp32_sum(acc_u[m]);
+        if (lane == 0) {
+            const float out = (g / (1.0f + expf(-g))) * u;
+            y[(w_i64)m * n + col] = WIo<XT>::from_f(out);
+        }
+    }
+}
+
+#define W8A16_GATE_UP_SILU_KERNEL(name, D, XT, M_MAX)                                              \
+    extern "C" __global__ void __launch_bounds__(128)                                              \
+        name(const w_u8 *__restrict__ w_gate, const w_u8 *__restrict__ w_up,                       \
+             const XT *__restrict__ x, XT *__restrict__ y, int k, int n, int rows,                 \
+             w_i64 row_bytes) {                                                                    \
+        w8a16_gate_up_silu_mv<D, XT, M_MAX>(w_gate, w_up, x, y, k, n, rows, row_bytes);            \
+    }

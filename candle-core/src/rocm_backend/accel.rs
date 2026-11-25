@@ -9,6 +9,7 @@ use crate::accel::attention::{
     self as att, AttnGeometry, FaExtra, FaPlan, FlashAttnParams, PageTable, PagedKv, FA_THREADS,
     MAX_GRID_X,
 };
+use crate::accel::config::FlashAttnVersion;
 use crate::accel::turbo::{
     tq_attn_group, tq_attn_kernel, tq_tile_launch, TqAttnArgs, TqRowArgs, TQ_THREADS,
 };
@@ -160,14 +161,17 @@ impl RocmStorage {
             .usize(rows);
         self.device
             .launch(func, grid, (FA_THREADS as u32, 1, 1), smem as u32, &mut a)?;
-        if let Some(p) = part {
+        if let Some(pt) = part {
             let sfx = half_sfx(self.dtype, "flash-attn")?;
-            let comb = self
-                .device
-                .get_func(Module::FlashAttn, &format!("fa_combine_{sfx}"))?;
+            let (comb_name, comb_smem) = if p.deterministic {
+                (format!("fa_combine_tree_{sfx}"), 128 * 4)
+            } else {
+                (format!("fa_combine_{sfx}"), splits * 4)
+            };
+            let comb = self.device.get_func(Module::FlashAttn, &comb_name)?;
             let mut a = LaunchArgs::new();
-            a.ptr(p.po)
-                .ptr(p.pl)
+            a.ptr(pt.po)
+                .ptr(pt.pl)
                 .ptr(out.as_ptr())
                 .usize(rows)
                 .u32(d as u32)
@@ -176,9 +180,90 @@ impl RocmStorage {
                 comb,
                 (grid_rows(rows), 1, 1),
                 (FA_THREADS as u32, 1, 1),
-                (splits * 4) as u32,
+                comb_smem as u32,
                 &mut a,
             )?;
+        }
+        Ok(Self::new(out, self.dtype, self.device.clone()))
+    }
+
+    /// O(1) device block-table paged varlen FlashAttention on ROCm (zero D2H sync, zero Tensor::cat).
+    /// Supports arbitrary page counts (no 128-page cap), optional `mm_prefix_ranges`, and `sink_logits`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn flash_attn_paged_block_table(
+        &self,
+        q_off: usize,
+        k_pool: &Self,
+        k_off: usize,
+        v_pool: &Self,
+        v_off: usize,
+        cu_q: &Self,
+        cu_q_off: usize,
+        cu_k: &Self,
+        cu_k_off: usize,
+        block_table: &Self,
+        bt_off: usize,
+        mm_prefix_ranges: Option<(&Self, usize)>,
+        sink_logits: Option<(&Self, usize)>,
+        batch: usize,
+        total_q: usize,
+        max_q: usize,
+        hq: usize,
+        hkv: usize,
+        d: usize,
+        page_size: usize,
+        bt_stride: usize,
+        p: &FlashAttnParams,
+    ) -> Result<Self> {
+        let sfx = half_sfx(self.dtype, "flash-attn-bt")?;
+        if k_pool.dtype != self.dtype || v_pool.dtype != self.dtype {
+            bail!(
+                "flash-attn-bt: q/k/v dtypes must match ({:?}, {:?}, {:?})",
+                self.dtype,
+                k_pool.dtype,
+                v_pool.dtype
+            );
+        }
+        if d > att::FA_MAX_HEAD_DIM {
+            bail!("flash-attn-bt: head dim {d} > {}", att::FA_MAX_HEAD_DIM);
+        }
+        let (dmax, br, bc) = att::tile_config(FlashAttnVersion::V2, d);
+        let smem = att::tile_smem_bytes(d, br, bc);
+        let out = self.device.alloc((total_q * hq * d).max(1) * self.esz())?;
+        if batch > 0 && total_q > 0 && max_q > 0 && hq > 0 && d > 0 {
+            let func = self
+                .device
+                .get_func(Module::FlashAttn, &format!("fa_bt_d{dmax}_{sfx}"))?;
+            let (pfx_ptr, sink_ptr) = (
+                mm_prefix_ranges.map(|(s, o)| s.ptr_at(o)).unwrap_or(null()),
+                sink_logits.map(|(s, o)| s.ptr_at(o)).unwrap_or(null()),
+            );
+            let mut a = LaunchArgs::new();
+            a.ptr(self.ptr_at(q_off))
+                .ptr(k_pool.ptr_at(k_off))
+                .ptr(v_pool.ptr_at(v_off))
+                .ptr(out.as_ptr())
+                .ptr(cu_q.ptr_at(cu_q_off))
+                .ptr(cu_k.ptr_at(cu_k_off))
+                .ptr(block_table.ptr_at(bt_off))
+                .ptr(pfx_ptr)
+                .ptr(sink_ptr)
+                .u32(hq as u32)
+                .u32(hkv as u32)
+                .u32(d as u32)
+                .u32(page_size as u32)
+                .u32(bt_stride as u32)
+                .f32(p.softmax_scale)
+                .f32(p.softcap)
+                .u32(p.window_left as u32)
+                .u32(p.window_right as u32);
+            let grid = (
+                max_q.div_ceil(br).max(1) as u32,
+                hq as u32,
+                batch as u32,
+            );
+            self.device
+                .launch(func, grid, (FA_THREADS as u32, 1, 1), smem as u32, &mut a)?;
         }
         Ok(Self::new(out, self.dtype, self.device.clone()))
     }
@@ -270,14 +355,17 @@ impl RocmStorage {
             .words(table.to_words());
         self.device
             .launch(func, grid, (FA_THREADS as u32, 1, 1), smem as u32, &mut a)?;
-        if let Some(p) = part {
+        if let Some(pt) = part {
             let sfx = half_sfx(self.dtype, "flash-attn")?;
-            let comb = self
-                .device
-                .get_func(Module::FlashAttn, &format!("fa_combine_{sfx}"))?;
+            let (comb_name, comb_smem) = if p.deterministic {
+                (format!("fa_combine_tree_{sfx}"), 128 * 4)
+            } else {
+                (format!("fa_combine_{sfx}"), splits * 4)
+            };
+            let comb = self.device.get_func(Module::FlashAttn, &comb_name)?;
             let mut a = LaunchArgs::new();
-            a.ptr(p.po)
-                .ptr(p.pl)
+            a.ptr(pt.po)
+                .ptr(pt.pl)
                 .ptr(out.as_ptr())
                 .usize(rows)
                 .u32(d as u32)
@@ -286,7 +374,7 @@ impl RocmStorage {
                 comb,
                 (grid_rows(rows), 1, 1),
                 (FA_THREADS as u32, 1, 1),
-                (splits * 4) as u32,
+                comb_smem as u32,
                 &mut a,
             )?;
         }
@@ -405,6 +493,93 @@ impl RocmStorage {
             )?;
         }
         Ok(Self::new(out, DType::F32, self.device.clone()))
+    }
+
+    /// Single-pass zero-HBM-roundtrip FWHT + Quantize on ROCm.
+    pub fn tq_fwht_quant_fused(
+        &self,
+        offset: usize,
+        tab: &Self,
+        tab_off: usize,
+        sign_bits: &Self,
+        sign_off: usize,
+        a: &TqRowArgs,
+    ) -> Result<Self> {
+        let sfx = half_sfx(self.dtype, "tq_fwht_quant")?;
+        let out = self.device.alloc(a.rows * a.row_words * 4)?;
+        if a.rows > 0 && a.dim > 0 {
+            let func = self
+                .device
+                .get_func(Module::TurboQuant, &format!("tq_fwht_quant_{sfx}"))?;
+            let inv_sqrt_d = 1.0f32 / (a.dim as f32).sqrt();
+            let mut l = LaunchArgs::new();
+            l.ptr(self.ptr_at(offset))
+                .ptr(out.as_ptr())
+                .ptr(tab.ptr_at(tab_off))
+                .ptr(sign_bits.ptr_at(sign_off))
+                .usize(a.rows)
+                .u32(a.dim as u32)
+                .usize(a.dim)
+                .f32(inv_sqrt_d)
+                .u32(a.mode)
+                .u32(a.code_bits)
+                .u32(a.code_words as u32)
+                .u32(a.aux_words as u32)
+                .u32(a.row_words as u32);
+            self.device.launch(
+                func,
+                (grid_rows(a.rows), 1, 1),
+                (TQ_THREADS as u32, 1, 1),
+                a.quant_smem_bytes() as u32,
+                &mut l,
+            )?;
+        }
+        Ok(Self::new(out, DType::U32, self.device.clone()))
+    }
+
+    /// Single-pass zero-HBM-roundtrip FWHT + TurboProd (codebook + QJL signs) on ROCm.
+    #[allow(clippy::too_many_arguments)]
+    pub fn tq_fwht_quant_prod_fused(
+        &self,
+        offset: usize,
+        tab: &Self,
+        tab_off: usize,
+        s_mat: &Self,
+        s_off: usize,
+        sign_bits: &Self,
+        sign_off: usize,
+        a: &TqRowArgs,
+    ) -> Result<Self> {
+        let sfx = half_sfx(self.dtype, "tq_fwht_quant_prod")?;
+        let out = self.device.alloc(a.rows * a.row_words * 4)?;
+        if a.rows > 0 && a.dim > 0 {
+            let func = self
+                .device
+                .get_func(Module::TurboQuant, &format!("tq_fwht_quant_prod_{sfx}"))?;
+            let inv_sqrt_d = 1.0f32 / (a.dim as f32).sqrt();
+            let mut l = LaunchArgs::new();
+            l.ptr(self.ptr_at(offset))
+                .ptr(tab.ptr_at(tab_off))
+                .ptr(s_mat.ptr_at(s_off))
+                .ptr(sign_bits.ptr_at(sign_off))
+                .ptr(out.as_ptr())
+                .usize(a.rows)
+                .u32(a.dim as u32)
+                .usize(a.dim)
+                .f32(inv_sqrt_d)
+                .u32(a.code_bits)
+                .u32(a.code_words as u32)
+                .u32(a.row_words as u32);
+            let smem = (2 * a.dim + TQ_THREADS) * 4;
+            self.device.launch(
+                func,
+                (grid_rows(a.rows), 1, 1),
+                (TQ_THREADS as u32, 1, 1),
+                smem as u32,
+                &mut l,
+            )?;
+        }
+        Ok(Self::new(out, DType::U32, self.device.clone()))
     }
 
     /// Residual of the unit vectors to their codebook values (TurboQuant prod), F32 rows.

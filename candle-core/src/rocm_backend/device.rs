@@ -204,14 +204,19 @@ fn pool_keep_bytes() -> u64 {
 }
 
 /// Most bytes of freed buffers kept for reuse per device (`hip_runtime::memory` buffer cache):
-/// `CANDLE_ROCM_ALLOC_CACHE_MB`, default 256 MiB, 0 turns the cache off.
-fn alloc_cache_bytes() -> usize {
-    const DEFAULT_MB: usize = 256;
-    std::env::var("CANDLE_ROCM_ALLOC_CACHE_MB")
-        .ok()
-        .and_then(|v| v.trim().parse::<usize>().ok())
-        .unwrap_or(DEFAULT_MB)
-        .saturating_mul(1 << 20)
+/// `CANDLE_ROCM_ALLOC_CACHE_MB` overrides it (0 turns the cache off); otherwise scales
+/// proportionally with device VRAM (`clamp(total_vram / 16, 64 MiB, 512 MiB)`).
+fn alloc_cache_bytes(total_vram: usize) -> usize {
+    if let Ok(v) = std::env::var("CANDLE_ROCM_ALLOC_CACHE_MB") {
+        if let Ok(mb) = v.trim().parse::<usize>() {
+            return mb.saturating_mul(1 << 20);
+        }
+    }
+    if total_vram > 0 {
+        (total_vram / 16).clamp(64 << 20, 512 << 20)
+    } else {
+        256 << 20
+    }
 }
 
 fn warn_once(flag: &'static std::sync::atomic::AtomicBool, msg: impl FnOnce() -> String) {
@@ -292,7 +297,8 @@ impl RocmDevice {
             let _ = hip_runtime::memory::set_pool_release_threshold(ordinal as i32, keep);
             // hipMallocAsync / hipFreeAsync cost ~45 µs per pair on Windows HIP; freed buffers are
             // reused instead (see hip_runtime::memory). Trims release the cache first.
-            hip_runtime::memory::set_cache_limit(alloc_cache_bytes());
+            let total_vram = hip.mem_info().map(|(_, t)| t).unwrap_or(0);
+            hip_runtime::memory::set_cache_limit(alloc_cache_bytes(total_vram));
         }
         let modules = Module::ALL.iter().map(|_| OnceLock::new()).collect();
         Ok(Self {
@@ -608,8 +614,8 @@ impl RocmDevice {
         args: &mut LaunchArgs,
     ) -> Result<()> {
         self.set_current()?;
-        let mut ptrs = args.pointers();
-        unsafe { HipModule::launch(func, grid, block, shared_mem, &mut ptrs) }.w()
+        args.with_pointers(|ptrs| unsafe { HipModule::launch(func, grid, block, shared_mem, ptrs) })
+            .w()
     }
 
     pub(crate) fn launch_1d(

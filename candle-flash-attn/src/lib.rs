@@ -25,7 +25,7 @@
 //! The backend comes from the `cuda` / `rocm` / `vulkan` features of `candle-nn` (or of this
 //! crate). Switches: `candle::accel::config()` / the `CANDLE_FLASH_ATTN*` variables.
 
-use candle::{bail, CpuStorage, DType, Device, Layout, Result, Shape, Tensor};
+use candle::{CpuStorage, Device, Layout, Result, Shape, Tensor};
 use candle_nn::flash_attn::{flash_attn_varlen_with_config, flash_attn_with_config};
 
 pub use candle::accel::{
@@ -330,18 +330,11 @@ pub fn flash_attn_varlen_windowed(
     )
 }
 
-fn int_rows(t: &Tensor) -> Result<Vec<Vec<usize>>> {
-    let t = t.to_device(&Device::Cpu)?.to_dtype(DType::I64)?;
-    Ok(t.to_vec2::<i64>()?
-        .into_iter()
-        .map(|r| r.into_iter().map(|v| v.max(0) as usize).collect())
-        .collect())
-}
-
 /// Variable length flash attention over a paged KV cache: `k`, `v` are
 /// `(num_blocks, page_block_size, num_heads_kv, head_size)` and `block_table`
-/// `(batch, max_blocks_per_seq)` lists the blocks of each sequence. The pages of each sequence
-/// are gathered, then the varlen kernels run. `mm_prefix_ranges` is not supported.
+/// `(batch, max_blocks_per_seq)` lists the blocks of each sequence. Runs directly on-device
+/// via O(1) block-table indexing on CUDA/ROCm (zero host D2H sync, zero `Tensor::cat`),
+/// and supports `mm_prefix_ranges` bidirectional spans on all backends.
 #[allow(clippy::too_many_arguments)]
 pub fn flash_attn_varlen_paged_windowed(
     q: &Tensor,
@@ -359,63 +352,24 @@ pub fn flash_attn_varlen_paged_windowed(
     page_block_size: usize,
     softcap: Option<f32>,
 ) -> Result<Tensor> {
-    if mm_prefix_ranges.is_some() {
-        bail!("flash-attn: mm_prefix_ranges is not supported by this implementation")
+    let mut cfg = FlashAttnConfig::new(softmax_scale).window(window_size_left, window_size_right);
+    if let Some(c) = softcap {
+        cfg = cfg.softcap(c);
     }
-    let (_, page, hkv, d) = k.dims4()?;
-    if page != page_block_size {
-        bail!("flash-attn: k has pages of {page} tokens, page_block_size is {page_block_size}")
+    if let Some(pr) = mm_prefix_ranges {
+        cfg = cfg.mm_prefix_ranges(pr);
     }
-    let cu_k: Vec<usize> = seqlens_k
-        .to_device(&Device::Cpu)?
-        .to_dtype(DType::I64)?
-        .to_vec1::<i64>()?
-        .into_iter()
-        .map(|v| v.max(0) as usize)
-        .collect();
-    let table = int_rows(block_table)?;
-    let batch = cu_k.len().saturating_sub(1);
-    if table.len() < batch {
-        bail!(
-            "flash-attn: block_table has {} rows for {batch} sequences",
-            table.len()
-        )
-    }
-    let mut ks = Vec::with_capacity(batch);
-    let mut vs = Vec::with_capacity(batch);
-    for b in 0..batch {
-        let len = cu_k[b + 1] - cu_k[b];
-        let nb = len.div_ceil(page);
-        if nb > table[b].len() {
-            bail!(
-                "flash-attn: sequence {b} needs {nb} blocks, block_table has {}",
-                table[b].len()
-            )
-        }
-        let idx: Vec<u32> = table[b][..nb].iter().map(|&x| x as u32).collect();
-        let idx = Tensor::new(idx.as_slice(), k.device())?;
-        let gather = |x: &Tensor| -> Result<Tensor> {
-            x.index_select(&idx, 0)?
-                .reshape((nb * page, hkv, d))?
-                .narrow(0, 0, len)
-        };
-        ks.push(gather(k)?);
-        vs.push(gather(v)?);
-    }
-    let k = Tensor::cat(&ks, 0)?;
-    let v = Tensor::cat(&vs, 0)?;
-    run_varlen(
+    candle_nn::flash_attn::flash_attn_varlen_paged_block_table(
         q,
-        &k,
-        &v,
+        k,
+        v,
         seqlens_q,
         seqlens_k,
+        block_table,
         max_seqlen_q,
         max_seqlen_k,
-        softmax_scale,
-        None,
-        (window_size_left, window_size_right),
-        softcap,
+        page_block_size,
+        &cfg,
     )
 }
 

@@ -471,3 +471,98 @@ pub fn conv_transpose2d_no_bias(
     )?;
     Ok(ConvTranspose2d::new(ws, None, cfg))
 }
+
+/// Folds a 5D Conv3d patch-embed kernel `[C_out, C_in, T_p, K_h, K_w]` along the temporal axis
+/// `dim = 2` for static-image inputs where the single frame is duplicated `T_p` times:
+///
+/// `W_static[co, ci, kh, kw] = sum_{t=0}^{T_p - 1} W[co, ci, t, kh, kw]`
+///
+/// Accumulated in FP64 with a single rounding back to the original dtype, cutting static-image
+/// vision stem FLOPs and input bandwidth by `T_p`x (typically 2x for `T_p = 2` in Qwen2.5-VL /
+/// Qwen3-VL / Qwen3.5) with zero accuracy loss.
+pub fn fold_conv3d_temporal_weight(weight_5d: &Tensor) -> Result<Tensor> {
+    let (c_out, c_in, t_p, k_h, k_w) = weight_5d.dims5()?;
+    let orig_dtype = weight_5d.dtype();
+    let dev = weight_5d.device().clone();
+    let data = weight_5d
+        .to_device(&candle::Device::Cpu)?
+        .to_dtype(candle::DType::F64)?
+        .flatten_all()?
+        .to_vec1::<f64>()?;
+    let spatial = k_h * k_w;
+    let mut folded = vec![0.0f64; c_out * c_in * spatial];
+    for co in 0..c_out {
+        for ci in 0..c_in {
+            let dst = (co * c_in + ci) * spatial;
+            for t in 0..t_p {
+                let src = ((co * c_in + ci) * t_p + t) * spatial;
+                for s in 0..spatial {
+                    folded[dst + s] += data[src + s];
+                }
+            }
+        }
+    }
+    Tensor::from_vec(folded, (c_out, c_in, k_h, k_w), &candle::Device::Cpu)?
+        .to_dtype(orig_dtype)?
+        .to_device(&dev)
+}
+
+/// Folds a flattened patch-embed projection weight `[D_out, C_in * T_p * P_h * P_w]` into
+/// `[D_out, C_in * P_h * P_w]` for static images (exact FP64 sum over the `T_p` axis).
+pub fn fold_conv3d_patch_linear_weight(
+    weight_2d: &Tensor,
+    c_in: usize,
+    t_p: usize,
+    p_h: usize,
+    p_w: usize,
+) -> Result<Tensor> {
+    let (d_out, in_dim) = weight_2d.dims2()?;
+    let expected = c_in * t_p * p_h * p_w;
+    if in_dim != expected {
+        candle::bail!(
+            "fold_conv3d_patch_linear_weight: in_dim {in_dim} != c_in({c_in})*t_p({t_p})*p_h({p_h})*p_w({p_w})"
+        )
+    }
+    let w5 = weight_2d.reshape((d_out, c_in, t_p, p_h, p_w))?;
+    fold_conv3d_temporal_weight(&w5)?.reshape((d_out, c_in * p_h * p_w))
+}
+
+#[cfg(test)]
+mod conv3d_fold_tests {
+    use super::*;
+    use candle::{DType, Device};
+
+    #[test]
+    fn fold_conv3d_temporal_weight_matches_duplicated_frame_exact() -> Result<()> {
+        let dev = Device::Cpu;
+        let (co, ci, tp, kh, kw) = (8usize, 3usize, 2usize, 4usize, 4usize);
+        let w5 = Tensor::randn(0f32, 0.5, (co, ci, tp, kh, kw), &dev)?;
+        let w2d = fold_conv3d_temporal_weight(&w5)?;
+        assert_eq!(w2d.dims(), &[co, ci, kh, kw]);
+
+        // Single static patch [1, ci, kh, kw] duplicated along T_p = 2:
+        let x_single = Tensor::randn(0f32, 1.0, (1, ci, kh, kw), &dev)?;
+        let x_flat_single = x_single.reshape((1, ci * kh * kw))?;
+        let x_dup = Tensor::cat(&[&x_single, &x_single], 1)? // wait: match [ci, tp, kh, kw] layout
+            ;
+        let _ = x_dup;
+        // Exact layout check: reshape x_single as [1, ci, 1, kh, kw], repeat along dim 2 -> [1, ci, tp, kh, kw]
+        let x_t2 = x_single
+            .unsqueeze(2)?
+            .repeat((1, 1, tp, 1, 1))?
+            .reshape((1, ci * tp * kh * kw))?;
+        let w_full_2d = w5.reshape((co, ci * tp * kh * kw))?;
+        let y_full = x_t2.matmul(&w_full_2d.t()?)?;
+
+        let w_folded_lin = fold_conv3d_patch_linear_weight(&w_full_2d, ci, tp, kh, kw)?;
+        let y_folded = x_flat_single.matmul(&w_folded_lin.t()?)?;
+
+        let diff = (&y_full - &y_folded)?
+            .abs()?
+            .max_all()?
+            .to_dtype(DType::F32)?
+            .to_scalar::<f32>()?;
+        assert!(diff < 1e-5, "Conv3d temporal fold mismatch: {diff}");
+        Ok(())
+    }
+}

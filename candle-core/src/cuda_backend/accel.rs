@@ -9,6 +9,7 @@ use crate::accel::attention::{
     self as att, AttnGeometry, FaExtra, FaPlan, FlashAttnParams, PageTable, PagedKv, FA_THREADS,
     MAX_GRID_X,
 };
+use crate::accel::config::FlashAttnVersion;
 use crate::accel::profile::AccelProfile;
 use crate::accel::sources;
 use crate::accel::turbo::{
@@ -124,6 +125,7 @@ fn half_sfx(dtype: DType, op: &str) -> Result<&'static str> {
     }
 }
 
+#[allow(dead_code)]
 fn fa_combine_name(dtype: DType) -> Result<&'static str> {
     match dtype {
         DType::F32 => Ok("fa_combine_f32"),
@@ -200,8 +202,13 @@ fn launch_combine(
     for x in dd.iter() {
         b.arg(x);
     }
-    // SAFETY: arguments match fa_combine / tq_combine; shared memory: one weight per split.
-    unsafe { b.launch(cfg((grid_rows(rows), 1, 1), splits * 4)) }.w()?;
+    let smem = if name.starts_with("fa_combine_tree_") {
+        128 * 4
+    } else {
+        splits * 4
+    };
+    // SAFETY: arguments match fa_combine[_tree] / tq_combine.
+    unsafe { b.launch(cfg((grid_rows(rows), 1, 1), smem)) }.w()?;
     Ok(())
 }
 
@@ -339,8 +346,13 @@ impl CudaStorage {
                 // SAFETY: arguments match the kernel signature (FA_PARAMS).
                 unsafe { b.launch(cfg(grid, smem)) }.w()?;
             }
-            let comb = fa_combine_name(self.dtype())?;
-            launch_combine(dev, comb, part, &mut out, rows, d, splits)?;
+            let sfx = half_sfx(self.dtype(), "flash-attn")?;
+            let comb = if p.deterministic {
+                format!("fa_combine_tree_{sfx}")
+            } else {
+                format!("fa_combine_{sfx}")
+            };
+            launch_combine(dev, &comb, part, &mut out, rows, d, splits)?;
         }
         Ok(CudaStorage {
             slice: out,
@@ -463,8 +475,125 @@ impl CudaStorage {
                 // SAFETY: arguments match FA_ROWP_KERNEL (FA_PARAMS + the block table).
                 unsafe { b.launch(cfg(grid, smem)) }.w()?;
             }
-            let comb = fa_combine_name(self.dtype())?;
-            launch_combine(dev, comb, part, &mut out, rows, d, splits)?;
+            let sfx = half_sfx(self.dtype(), "flash-attn")?;
+            let comb = if p.deterministic {
+                format!("fa_combine_tree_{sfx}")
+            } else {
+                format!("fa_combine_{sfx}")
+            };
+            launch_combine(dev, &comb, part, &mut out, rows, d, splits)?;
+        }
+        Ok(CudaStorage {
+            slice: out,
+            device: dev.clone(),
+        })
+    }
+
+    /// O(1) device block-table paged varlen FlashAttention on CUDA (zero D2H sync, zero Tensor::cat).
+    #[allow(clippy::too_many_arguments)]
+    pub fn flash_attn_paged_block_table(
+        &self,
+        q_off: usize,
+        k_pool: &Self,
+        k_off: usize,
+        v_pool: &Self,
+        v_off: usize,
+        cu_q: &Self,
+        cu_q_off: usize,
+        cu_k: &Self,
+        cu_k_off: usize,
+        block_table: &Self,
+        bt_off: usize,
+        mm_prefix_ranges: Option<(&Self, usize)>,
+        sink_logits: Option<(&Self, usize)>,
+        batch: usize,
+        total_q: usize,
+        max_q: usize,
+        hq: usize,
+        hkv: usize,
+        d: usize,
+        page_size: usize,
+        bt_stride: usize,
+        p: &FlashAttnParams,
+    ) -> Result<Self> {
+        use crate::backend::BackendStorage;
+        let sfx = half_sfx(self.dtype(), "flash-attn-bt")?;
+        if k_pool.dtype() != self.dtype() || v_pool.dtype() != self.dtype() {
+            bail!(
+                "flash-attn-bt: q/k/v dtypes must match ({:?}, {:?}, {:?})",
+                self.dtype(),
+                k_pool.dtype(),
+                v_pool.dtype()
+            );
+        }
+        if d > att::FA_MAX_HEAD_DIM {
+            bail!("flash-attn-bt: head dim {d} > {}", att::FA_MAX_HEAD_DIM);
+        }
+        let dev = &self.device;
+        let (dmax, br, bc) = att::tile_config(FlashAttnVersion::V2, d);
+        let smem = att::tile_smem_bytes(d, br, bc);
+        let mut out = alloc(dev, self.dtype(), (total_q * hq * d).max(1))?;
+        if batch > 0 && total_q > 0 && max_q > 0 && hq > 0 && d > 0 {
+            let kname = format!("fa_bt_d{dmax}_{sfx}");
+            let func = dev.accel_func(&kname)?;
+            dev.ensure_func_max_smem(&kname, &func, smem)?;
+            let stream = dev.cuda_stream();
+            let (q_p, _gq) = dptr(self, q_off, &stream);
+            let (k_p, _gk) = dptr(k_pool, k_off, &stream);
+            let (v_p, _gv) = dptr(v_pool, v_off, &stream);
+            let (o_p, _go) = dptr_mut(&mut out, &stream);
+            let (cq_p, _gcq) = dptr(cu_q, cu_q_off, &stream);
+            let (ck_p, _gck) = dptr(cu_k, cu_k_off, &stream);
+            let (bt_p, _gbt) = dptr(block_table, bt_off, &stream);
+            let (pfx_p, _gpfx) = match mm_prefix_ranges {
+                Some((s, off)) => {
+                    let (ptr, g) = dptr(s, off, &stream);
+                    (ptr, Some(g))
+                }
+                None => (0u64, None),
+            };
+            let (sink_p, _gsink) = match sink_logits {
+                Some((s, off)) => {
+                    let (ptr, g) = dptr(s, off, &stream);
+                    (ptr, Some(g))
+                }
+                None => (0u64, None),
+            };
+            let hq32 = hq as u32;
+            let hkv32 = hkv as u32;
+            let d32 = d as u32;
+            let ps32 = page_size as u32;
+            let bts32 = bt_stride as u32;
+            let scale = p.softmax_scale;
+            let softcap = p.softcap;
+            let wl = p.window_left;
+            let wr = p.window_right;
+            let mut b = func.builder();
+            b.arg(&q_p)
+                .arg(&k_p)
+                .arg(&v_p)
+                .arg(&o_p)
+                .arg(&cq_p)
+                .arg(&ck_p)
+                .arg(&bt_p)
+                .arg(&pfx_p)
+                .arg(&sink_p)
+                .arg(&hq32)
+                .arg(&hkv32)
+                .arg(&d32)
+                .arg(&ps32)
+                .arg(&bts32)
+                .arg(&scale)
+                .arg(&softcap)
+                .arg(&wl)
+                .arg(&wr);
+            let grid = (
+                max_q.div_ceil(br).max(1) as u32,
+                hq as u32,
+                batch as u32,
+            );
+            // SAFETY: arguments match FA_TILE_BT_KERNEL.
+            unsafe { b.launch(cfg(grid, smem)) }.w()?;
         }
         Ok(CudaStorage {
             slice: out,
@@ -554,6 +683,112 @@ impl CudaStorage {
                 .arg(&inv_sqrt_d)
                 .arg(&fwd32);
             unsafe { b.launch(cfg((grid_rows(rows), 1, 1), dim * 4)) }.w()?;
+        }
+        Ok(CudaStorage {
+            slice: out,
+            device: dev.clone(),
+        })
+    }
+
+    /// Single-pass zero-HBM-roundtrip FWHT + Quantize on CUDA.
+    pub fn tq_fwht_quant_fused(
+        &self,
+        offset: usize,
+        tab: &Self,
+        tab_off: usize,
+        sign_bits: &Self,
+        sign_off: usize,
+        a: &TqRowArgs,
+    ) -> Result<Self> {
+        use crate::backend::BackendStorage;
+        let sfx = half_sfx(self.dtype(), "tq_fwht_quant")?;
+        let dev = &self.device;
+        let mut out = alloc(dev, DType::U32, a.rows * a.row_words)?;
+        if a.rows > 0 && a.dim > 0 {
+            let func = dev.accel_func(&format!("tq_fwht_quant_{sfx}"))?;
+            let stream = dev.cuda_stream();
+            let (s_p, _g1) = dptr(self, offset, &stream);
+            let (o_p, _g2) = dptr_mut(&mut out, &stream);
+            let (t_p, _g3) = dptr(tab, tab_off, &stream);
+            let (sb_p, _g4) = dptr(sign_bits, sign_off, &stream);
+            let rows64 = a.rows as u64;
+            let dim32 = a.dim as u32;
+            let stride64 = a.dim as u64;
+            let inv_sqrt_d = 1.0f32 / (a.dim as f32).sqrt();
+            let mode32 = a.mode;
+            let cb32 = a.code_bits;
+            let cw32 = a.code_words as u32;
+            let aw32 = a.aux_words as u32;
+            let rw32 = a.row_words as u32;
+            let mut b = func.builder();
+            b.arg(&s_p)
+                .arg(&o_p)
+                .arg(&t_p)
+                .arg(&sb_p)
+                .arg(&rows64)
+                .arg(&dim32)
+                .arg(&stride64)
+                .arg(&inv_sqrt_d)
+                .arg(&mode32)
+                .arg(&cb32)
+                .arg(&cw32)
+                .arg(&aw32)
+                .arg(&rw32);
+            unsafe { b.launch(cfg((grid_rows(a.rows), 1, 1), a.quant_smem_bytes())) }.w()?;
+        }
+        Ok(CudaStorage {
+            slice: out,
+            device: dev.clone(),
+        })
+    }
+
+    /// Single-pass zero-HBM-roundtrip FWHT + TurboProd (codebook + QJL signs) on CUDA.
+    #[allow(clippy::too_many_arguments)]
+    pub fn tq_fwht_quant_prod_fused(
+        &self,
+        offset: usize,
+        tab: &Self,
+        tab_off: usize,
+        s_mat: &Self,
+        s_off: usize,
+        sign_bits: &Self,
+        sign_off: usize,
+        a: &TqRowArgs,
+    ) -> Result<Self> {
+        use crate::backend::BackendStorage;
+        let sfx = half_sfx(self.dtype(), "tq_fwht_quant_prod")?;
+        let dev = &self.device;
+        let mut out = alloc(dev, DType::U32, a.rows * a.row_words)?;
+        if a.rows > 0 && a.dim > 0 {
+            let func = dev.accel_func(&format!("tq_fwht_quant_prod_{sfx}"))?;
+            let stream = dev.cuda_stream();
+            let (s_p, _g1) = dptr(self, offset, &stream);
+            let (t_p, _g2) = dptr(tab, tab_off, &stream);
+            let (sm_p, _g3) = dptr(s_mat, s_off, &stream);
+            let (sb_p, _g4) = dptr(sign_bits, sign_off, &stream);
+            let (o_p, _g5) = dptr_mut(&mut out, &stream);
+            let rows64 = a.rows as u64;
+            let dim32 = a.dim as u32;
+            let stride64 = a.dim as u64;
+            let inv_sqrt_d = 1.0f32 / (a.dim as f32).sqrt();
+            let cb32 = a.code_bits;
+            let cw32 = a.code_words as u32;
+            let rw32 = a.row_words as u32;
+            let mut b = func.builder();
+            b.arg(&s_p)
+                .arg(&t_p)
+                .arg(&sm_p)
+                .arg(&sb_p)
+                .arg(&o_p)
+                .arg(&rows64)
+                .arg(&dim32)
+                .arg(&stride64)
+                .arg(&inv_sqrt_d)
+                .arg(&cb32)
+                .arg(&cw32)
+                .arg(&rw32);
+            let smem = (2 * a.dim + TQ_THREADS) * 4;
+            unsafe { b.launch(cfg((grid_rows(a.rows), 1, 1), smem)) }.w()?;
         }
         Ok(CudaStorage {
             slice: out,

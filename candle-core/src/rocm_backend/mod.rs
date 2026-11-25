@@ -11,6 +11,7 @@ mod lm_head;
 pub mod offload;
 mod storage;
 pub mod utils;
+mod vis_ops;
 
 pub(crate) use device::{GemmCall, GemmOutcome};
 pub use device::{GemmBackend, RocmDevice, RocmRuntimeInfo};

@@ -315,6 +315,218 @@ AX_DEV void tq_fwht_impl(const T *src, float *dst, const ax_u32 *sign_bits, ax_u
     }
 }
 
+// Single-pass zero-HBM-roundtrip FWHT + Quantize (bit-identical to 2-step tq_fwht + tq_quant).
+// Shared memory: (2 * D + TQ_NT + D / 16) * sizeof(float).
+template <typename T>
+AX_DEV void tq_fwht_quant_fused_impl(const T *src, ax_u32 *out, const float *tab,
+                                     const ax_u32 *sign_bits, ax_u64 rows, ax_u32 D,
+                                     ax_u64 src_stride, float inv_sqrt_d, ax_u32 mode, ax_u32 cb,
+                                     ax_u32 code_words, ax_u32 aux_words, ax_u32 row_words) {
+    float *y = ax_smem();
+    ax_u32 *codes = reinterpret_cast<ax_u32 *>(y + D);
+    float *red = y + 2 * D;
+    ax_u32 *sc = reinterpret_cast<ax_u32 *>(red + TQ_NT);
+    const ax_u32 t = AX_TID;
+    for (ax_u64 row = AX_BID_X; row < rows; row += AX_NBLK_X) {
+        AX_SYNC();
+        const T *x = src + row * src_stride;
+        for (ax_u32 j = t; j < D; j += TQ_NT) y[j] = ax_load(x, j);
+        ax_fwht_inplace<TQ_NT>(y, D, sign_bits, inv_sqrt_d, true);
+
+        float ss = 0.0f, am = 0.0f;
+        for (ax_u32 j = t; j < D; j += TQ_NT) {
+            const float v = y[j];
+            ss += v * v;
+            am = fmaxf(am, fabsf(v));
+        }
+        if (mode <= TQ_PROD) ss = ax_block_sum<TQ_NT>(ss, red);
+        else if (mode == TQ_NVFP4 || mode == TQ_FP8) am = ax_block_max<TQ_NT>(am, red);
+        else AX_SYNC();
+
+        float rsc0 = 1.0f;
+        if (mode <= TQ_PROD) {
+            const float norm = sqrtf(ss);
+            const float inv = norm > 0.0f ? 1.0f / norm : 0.0f;
+            const ax_u32 nb = (1u << cb) - 1u;
+            rsc0 = norm;
+            for (ax_u32 j = t; j < D; j += TQ_NT) {
+                const float u = y[j] * inv;
+                ax_u32 idx = 0;
+                for (ax_u32 bi = 0; bi < nb; ++bi) idx += u >= tab[16 + bi] ? 1u : 0u;
+                codes[j] = idx;
+            }
+        } else if (mode == TQ_MXFP4 || mode == TQ_MXFP8) {
+            const int emax = mode == TQ_MXFP4 ? 2 : 8;
+            for (ax_u32 bk = t; bk < (D >> 5); bk += TQ_NT) {
+                float bm = 0.0f;
+                for (ax_u32 e = 0; e < 32u; ++e) bm = fmaxf(bm, fabsf(y[bk * 32u + e]));
+                sc[bk] = ax_mx_scale_code(bm, emax);
+            }
+            AX_SYNC();
+            for (ax_u32 j = t; j < D; j += TQ_NT) {
+                const ax_u32 code = sc[j >> 5];
+                const float s = ax_e8m0_to_f(code);
+                codes[j] = code == 0 ? 0u : (mode == TQ_MXFP4 ? ax_f_to_fp4(y[j] / s) : ax_f_to_e4m3(y[j] / s));
+            }
+        } else if (mode == TQ_NVFP4) {
+            const float g = am > 0.0f ? am / 2688.0f : 1.0f;
+            rsc0 = g;
+            for (ax_u32 bk = t; bk < (D >> 4); bk += TQ_NT) {
+                float bm = 0.0f;
+                for (ax_u32 e = 0; e < 16u; ++e) bm = fmaxf(bm, fabsf(y[bk * 16u + e]));
+                sc[bk] = ax_f_to_e4m3(bm / 6.0f / g);
+            }
+            AX_SYNC();
+            for (ax_u32 j = t; j < D; j += TQ_NT) {
+                const float eff = ax_e4m3_to_f(sc[j >> 4]) * g;
+                codes[j] = eff > 0.0f ? ax_f_to_fp4(y[j] / eff) : 0u;
+            }
+        } else {
+            const float s = am > 0.0f ? am / 448.0f : 1.0f;
+            rsc0 = s;
+            for (ax_u32 j = t; j < D; j += TQ_NT) codes[j] = ax_f_to_e4m3(y[j] / s);
+        }
+        AX_SYNC();
+        ax_u32 *orow = out + row * row_words;
+        for (ax_u32 w = t; w < code_words; w += TQ_NT) orow[w] = tq_pack_word(codes, w, cb, D);
+        const ax_u32 nblk = mode == TQ_NVFP4 ? (D >> 4) : (D >> 5);
+        const bool scales = mode == TQ_MXFP4 || mode == TQ_MXFP8 || mode == TQ_NVFP4;
+        for (ax_u32 w = t; w < aux_words; w += TQ_NT) {
+            ax_u32 word = 0;
+            if (scales)
+                for (ax_u32 e = 0; e < 4u; ++e)
+                    if (w * 4u + e < nblk) word |= (sc[w * 4u + e] & 0xffu) << (8u * e);
+            orow[code_words + w] = word;
+        }
+        if (t == 0) {
+            orow[code_words + aux_words] = ax_f2u(rsc0);
+            orow[code_words + aux_words + 1] = 0u;
+        }
+    }
+}
+
+// Single-pass zero-HBM-roundtrip FWHT + TurboProd (codebook + QJL sign sketch + rsc0/rsc1).
+// Bit-identical to 2-step tq_fwht + tq_quant_prod_fused.
+// Shared memory: (2 * D + TQ_NT) * sizeof(float).
+template <typename T>
+AX_DEV void tq_fwht_quant_prod_fused_impl(const T *src, const float *tab, const float *s_t,
+                                          const ax_u32 *sign_bits, ax_u32 *out, ax_u64 rows,
+                                          ax_u32 D, ax_u64 src_stride, float inv_sqrt_d, ax_u32 cb,
+                                          ax_u32 code_words, ax_u32 row_words) {
+    float *y = ax_smem();
+    ax_u32 *codes = reinterpret_cast<ax_u32 *>(y + D);
+    float *red = y + 2 * D;
+    const ax_u32 t = AX_TID;
+    const ax_u32 nb = (1u << cb) - 1u;
+    const ax_u32 sign_words = (D + 31u) / 32u;
+    for (ax_u64 row = AX_BID_X; row < rows; row += AX_NBLK_X) {
+        AX_SYNC();
+        const T *x = src + row * src_stride;
+        for (ax_u32 j = t; j < D; j += TQ_NT) y[j] = ax_load(x, j);
+        ax_fwht_inplace<TQ_NT>(y, D, sign_bits, inv_sqrt_d, true);
+
+        float ss = 0.0f;
+        for (ax_u32 j = t; j < D; j += TQ_NT) ss += y[j] * y[j];
+        ss = ax_block_sum<TQ_NT>(ss, red);
+        const float norm = sqrtf(ss);
+        const float inv = norm > 0.0f ? 1.0f / norm : 0.0f;
+        float ss_r = 0.0f;
+        for (ax_u32 j = t; j < D; j += TQ_NT) {
+            const float u = y[j] * inv;
+            ax_u32 idx = 0;
+            for (ax_u32 bi = 0; bi < nb; ++bi) idx += u >= tab[16 + bi] ? 1u : 0u;
+            codes[j] = idx;
+            const float r = u - tab[idx];
+            y[j] = r;
+            ss_r += r * r;
+        }
+        ss_r = ax_block_sum<TQ_NT>(ss_r, red);
+        ax_u32 *orow = out + row * row_words;
+        for (ax_u32 w = t; w < code_words; w += TQ_NT) orow[w] = tq_pack_word(codes, w, cb, D);
+        AX_SYNC();
+        for (ax_u32 i = t; i < D; i += TQ_NT) {
+            float dot = 0.0f;
+            for (ax_u32 j = 0; j < D; ++j) dot += y[j] * s_t[(ax_u64)j * (ax_u64)D + i];
+            codes[i] = dot >= 0.0f ? 1u : 0u;
+        }
+        AX_SYNC();
+        for (ax_u32 w = t; w < sign_words; w += TQ_NT) {
+            ax_u32 word = 0;
+            const ax_u32 base = w * 32u;
+            for (ax_u32 e = 0; e < 32u && base + e < D; ++e) {
+                if (codes[base + e]) word |= 1u << e;
+            }
+            orow[code_words + w] = word;
+        }
+        if (t == 0) {
+            orow[code_words + sign_words] = ax_f2u(norm);
+            orow[code_words + sign_words + 1u] = ax_f2u(sqrtf(ss_r));
+        }
+    }
+}
+
+// Micro-page (P_v = 16 packed vision keys) channel bounding box (k_min, k_max) builder
+// for Part 5 lossless Query-Aware Bounding-Box Sparse Vision KV attention.
+// Grid: (n_pages, Hkv, B), Block: (TQ_NT, 1, 1).
+AX_DEV void tq_vis_page_bounds_impl(const ax_u32 *kd, const float *tab, float *k_min_out,
+                                    float *k_max_out, ax_u32 Lk, ax_u32 Hkv, ax_u32 D,
+                                    ax_u32 page_size, ax_u64 k_sb, ax_u64 k_sh, ax_u64 k_ss,
+                                    ax_u32 k_mode, ax_u32 k_cb, ax_u32 k_cw, ax_u32 k_rsc) {
+    const ax_u32 p = AX_BID_X;
+    const ax_u32 h = AX_BID_Y;
+    const ax_u32 b = AX_BID_Z;
+    const ax_u32 n_pages = (Lk + page_size - 1u) / page_size;
+    if (p >= n_pages || h >= Hkv) return;
+    const ax_u32 j_lo = p * page_size;
+    const ax_u32 j_hi = (j_lo + page_size < Lk) ? (j_lo + page_size) : Lk;
+    const ax_u32 *kbase = kd + (ax_u64)b * k_sb + (ax_u64)h * k_sh;
+    const ax_u64 out_off = (((ax_u64)b * Hkv + h) * n_pages + p) * D;
+
+    for (ax_u32 d = AX_TID; d < D; d += TQ_NT) {
+        float mn = AX_INF;
+        float mx = -AX_INF;
+        for (ax_u32 j = j_lo; j < j_hi; ++j) {
+            const ax_u32 *kr = kbase + (ax_u64)j * k_ss;
+            const float elem = (k_mode == TQ_FP8)
+                                   ? tq_fp8_elem(kr, d)
+                                   : ((k_mode == TQ_NVFP4)
+                                          ? tq_nvfp4_elem(kr, d, k_cw)
+                                          : tq_elem(kr, d, k_mode, k_cb, k_cw, tab));
+            const float v = ax_u2f(kr[k_rsc]) * elem;
+            mn = fminf(mn, v);
+            mx = fmaxf(mx, v);
+        }
+        k_min_out[out_off + d] = mn;
+        k_max_out[out_off + d] = mx;
+    }
+}
+
+// Exact upper-bound dot product U_p(q) = sum_d max(q_d * k_min[p,d], q_d * k_max[p,d])
+// over micro-pages for Query-Aware Bounding-Box Sparse Vision KV filtering.
+// Grid: (n_pages, Hq, B), Block: (TQ_NT, 1, 1), smem: TQ_NT * sizeof(float).
+AX_DEV void tq_vis_page_upper_bound_impl(const float *q_rot, const float *k_min, const float *k_max,
+                                         float *upper_out, ax_u32 n_pages, ax_u32 Hq, ax_u32 Hkv,
+                                         ax_u32 D, float scale) {
+    const ax_u32 p = AX_BID_X;
+    const ax_u32 h = AX_BID_Y;
+    const ax_u32 b = AX_BID_Z;
+    if (p >= n_pages || h >= Hq) return;
+    const ax_u32 hk = h / (Hq / Hkv);
+    const float *qr = q_rot + ((ax_u64)b * Hq + h) * D;
+    const ax_u64 koff = (((ax_u64)b * Hkv + hk) * n_pages + p) * D;
+    const float *kmn = k_min + koff;
+    const float *kmx = k_max + koff;
+    float acc = 0.0f;
+    for (ax_u32 d = AX_TID; d < D; d += TQ_NT) {
+        const float qv = qr[d];
+        acc += fmaxf(qv * kmn[d], qv * kmx[d]);
+    }
+    const float total = ax_block_sum<TQ_NT>(acc, ax_smem());
+    if (AX_TID == 0u) {
+        upper_out[((ax_u64)b * Hq + h) * n_pages + p] = total * scale;
+    }
+}
+
 // Dot product of a packed key row with the rotated query, without the rsc0 factor.
 // The FP8 and NVFP4 specializations read whole words and reuse block scales while preserving
 // the exact product and summation order of the generic path (bit-identical).
@@ -847,6 +1059,19 @@ AX_DEV void tq_tile_core(const float *qx, const ax_u32 *kd, const ax_u32 *vd, co
                     const float *kr_row = KVs + c * DP;
                     float dot = 0.0f;
                     for (ax_u32 d = 0; d < D; ++d) dot += qr_row[d] * kr_row[d];
+                    if (sd.k_mode == TQ_PROD) {
+                        const ax_u32 *kr = PAGED
+                                               ? tq_paged_row(pg, bi_start, j0_start, j, bh, k_ss, false)
+                                               : (kbase + (ax_u64)j * k_ss);
+                        const float *qs_row = qb + (ax_u64)ii * q_ss + D;
+                        float sdot = 0.0f;
+                        for (ax_u32 d = 0; d < D; ++d) {
+                            sdot += ((kr[sd.k_cw + (d >> 5)] >> (d & 31u)) & 1u) ? qs_row[d] : -qs_row[d];
+                        }
+                        dot += (scale * ax_u2f(kr[sd.k_rsc]) * ax_u2f(kr[sd.k_rsc + 1]) * TQ_QJL /
+                                (float)D) *
+                               sdot;
+                    }
                     s = tq_logit(dot, softcap, slope, p2 - j);
                 }
                 S[idx] = s;
@@ -1022,6 +1247,22 @@ AX_DEV void tq_combine_impl(const float *part_o, const float *part_lse, float *o
         tq_fwht_##SFX(const T *src, float *dst, const ax_u32 *sign_bits, ax_u64 rows, ax_u32 D,    \
                       ax_u64 src_stride, float inv_sqrt_d, ax_u32 forward) {                       \
         tq_fwht_impl<T>(src, dst, sign_bits, rows, D, src_stride, inv_sqrt_d, forward);            \
+    }                                                                                              \
+    AX_KERNEL void AX_BOUNDS(TQ_NT)                                                                \
+        tq_fwht_quant_##SFX(const T *src, ax_u32 *out, const float *tab, const ax_u32 *sign_bits,  \
+                            ax_u64 rows, ax_u32 D, ax_u64 src_stride, float inv_sqrt_d,            \
+                            ax_u32 mode, ax_u32 cb, ax_u32 code_words, ax_u32 aux_words,           \
+                            ax_u32 row_words) {                                                    \
+        tq_fwht_quant_fused_impl<T>(src, out, tab, sign_bits, rows, D, src_stride, inv_sqrt_d,     \
+                                    mode, cb, code_words, aux_words, row_words);                   \
+    }                                                                                              \
+    AX_KERNEL void AX_BOUNDS(TQ_NT)                                                                \
+        tq_fwht_quant_prod_##SFX(const T *src, const float *tab, const float *s_t,                 \
+                                 const ax_u32 *sign_bits, ax_u32 *out, ax_u64 rows, ax_u32 D,      \
+                                 ax_u64 src_stride, float inv_sqrt_d, ax_u32 cb,                   \
+                                 ax_u32 code_words, ax_u32 row_words) {                            \
+        tq_fwht_quant_prod_fused_impl<T>(src, tab, s_t, sign_bits, out, rows, D, src_stride,       \
+                                         inv_sqrt_d, cb, code_words, row_words);                   \
     }
 
 #define TQ_ATTN_GROUP_SET(SFX, KM, VM)                                                             \
@@ -1085,4 +1326,18 @@ AX_DEV void tq_combine_impl(const float *part_o, const float *part_lse, float *o
     AX_KERNEL void AX_BOUNDS(TQ_NT) tq_combine(const float *part_o, const float *part_lse,         \
                                                float *o, ax_u64 rows, ax_u32 D, ax_u32 n_splits) { \
         tq_combine_impl(part_o, part_lse, o, rows, D, n_splits);                                   \
+    }                                                                                              \
+    AX_KERNEL void AX_BOUNDS(TQ_NT)                                                                \
+        tq_vis_page_bounds(const ax_u32 *kd, const float *tab, float *k_min_out, float *k_max_out, \
+                           ax_u32 Lk, ax_u32 Hkv, ax_u32 D, ax_u32 page_size, ax_u64 k_sb,         \
+                           ax_u64 k_sh, ax_u64 k_ss, ax_u32 k_mode, ax_u32 k_cb, ax_u32 k_cw,      \
+                           ax_u32 k_rsc) {                                                         \
+        tq_vis_page_bounds_impl(kd, tab, k_min_out, k_max_out, Lk, Hkv, D, page_size, k_sb, k_sh,  \
+                                k_ss, k_mode, k_cb, k_cw, k_rsc);                                  \
+    }                                                                                              \
+    AX_KERNEL void AX_BOUNDS(TQ_NT)                                                                \
+        tq_vis_page_upper_bound(const float *q_rot, const float *k_min, const float *k_max,        \
+                                float *upper_out, ax_u32 n_pages, ax_u32 Hq, ax_u32 Hkv, ax_u32 D, \
+                                float scale) {                                                     \
+        tq_vis_page_upper_bound_impl(q_rot, k_min, k_max, upper_out, n_pages, Hq, Hkv, D, scale);  \
     }

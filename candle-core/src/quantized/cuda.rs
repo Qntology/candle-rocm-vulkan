@@ -897,6 +897,19 @@ impl QCudaStorage {
             )?;
             return Ok((out, out_shape));
         }
+        if rows <= w8a16::TILE16_MAX_ROWS && aligned && w8a16::mv_supported(self.dtype) {
+            let out = w8a16::tile16(
+                &self.device,
+                &self.data.inner,
+                self.dtype,
+                n,
+                k,
+                x,
+                o1,
+                rows,
+            )?;
+            return Ok((out, out_shape));
+        }
         let compute = if rows <= w8a16::MV_MAX_ROWS {
             DType::F32
         } else {
@@ -924,6 +937,59 @@ impl QCudaStorage {
             out.to_dtype(&crate::Layout::contiguous((rows, n)), in_dtype)?
         };
         Ok((out, out_shape))
+    }
+
+    /// Single-rounding fused dual-projection SwiGLU `silu(x @ W_gate^T) * (x @ W_up^T)` on CUDA
+    /// for decode / speculative batches (`rows <= 8`). Returns `Ok(None)` when unsupported.
+    pub fn fwd_gate_up_silu(
+        &self,
+        self_shape: &crate::Shape,
+        up: &Self,
+        up_shape: &crate::Shape,
+        x: &CudaStorage,
+        x_l: &crate::Layout,
+    ) -> Result<Option<(CudaStorage, crate::Shape)>> {
+        use super::w8a16;
+        use crate::backend::BackendStorage;
+        use crate::DType;
+        if self.dtype != up.dtype || self_shape != up_shape || !w8a16::mv_supported(self.dtype) {
+            return Ok(None);
+        }
+        let (n, k) = self_shape.dims2()?;
+        let dims = x_l.shape().dims();
+        if dims.is_empty() || dims[dims.len() - 1] != k || !k.is_multiple_of(self.dtype.block_size()) {
+            return Ok(None);
+        }
+        let in_dtype = x.dtype();
+        if !matches!(in_dtype, DType::F32 | DType::F16 | DType::BF16) {
+            return Ok(None);
+        }
+        let Some((o1, _)) = x_l.contiguous_offsets() else {
+            return Ok(None);
+        };
+        if !(o1 * in_dtype.size_in_bytes()).is_multiple_of(16) {
+            return Ok(None);
+        }
+        let rows = x_l.shape().elem_count() / k.max(1);
+        if rows == 0 || rows > w8a16::MV_MAX_ROWS || n == 0 || k == 0 {
+            return Ok(None);
+        }
+        let mut out_dims = dims.to_vec();
+        out_dims.pop();
+        out_dims.push(n);
+        let out_shape = crate::Shape::from(out_dims);
+        let out = w8a16::gate_up_silu_mv(
+            &self.device,
+            &self.data.inner,
+            &up.data.inner,
+            self.dtype,
+            n,
+            k,
+            x,
+            o1,
+            rows,
+        )?;
+        Ok(Some((out, out_shape)))
     }
 
     pub fn quantize(&mut self, src: &CudaStorage) -> Result<()> {
